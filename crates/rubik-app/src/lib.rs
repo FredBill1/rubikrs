@@ -31,6 +31,12 @@ thread_local! {
 #[derive(Component)]
 struct CubeVisual;
 
+#[derive(Component)]
+struct CubeVisualRoot;
+
+#[derive(Component)]
+struct TurnAnimationPivot;
+
 #[derive(Resource, Clone)]
 struct ShellConfig {
     base_path: String,
@@ -43,6 +49,9 @@ struct OrbitRig {
     pitch: f32,
     radius: f32,
     auto_spin: bool,
+    mouse_drag_active: bool,
+    touch_drag_active: bool,
+    snap_target: Option<Vec2>,
     previous_touch_center: Option<Vec2>,
     previous_pinch_distance: Option<f32>,
 }
@@ -50,6 +59,8 @@ struct OrbitRig {
 #[derive(Resource, Default)]
 struct VisualSyncState {
     rendered_revision: u64,
+    active_animation: Option<ActiveTurnAnimation>,
+    completed_animation_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +69,8 @@ struct RuntimeBridge {
     scene_revision: u64,
     last_message: String,
     timer: RuntimeTimer,
+    last_transition: Option<RuntimeTransition>,
+    animation_active: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,6 +86,7 @@ struct RuntimeStatus {
     redo_depth: usize,
     is_solved: bool,
     timing_active: bool,
+    animation_active: bool,
     elapsed_millis: u64,
     scene_revision: u64,
     last_message: String,
@@ -83,6 +97,24 @@ struct RuntimeStatus {
 struct RuntimeSnapshot {
     state: CubeState,
     scene_revision: u64,
+    transition: Option<RuntimeTransition>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeTransition {
+    scene_revision: u64,
+    from_state: CubeState,
+    animation: Option<TurnCommand>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTurnAnimation {
+    scene_revision: u64,
+    pivot_entity: Entity,
+    angle_radians: f32,
+    axis: Vec3,
+    elapsed_secs: f32,
+    duration_secs: f32,
 }
 
 impl Default for OrbitRig {
@@ -92,6 +124,9 @@ impl Default for OrbitRig {
             pitch: 0.26,
             radius: 7.2,
             auto_spin: false,
+            mouse_drag_active: false,
+            touch_drag_active: false,
+            snap_target: None,
             previous_touch_center: None,
             previous_pinch_distance: None,
         }
@@ -105,6 +140,8 @@ impl RuntimeBridge {
             scene_revision: 1,
             last_message: format!("Booted {}x{} runtime.", order.get(), order.get()),
             timer: RuntimeTimer::default(),
+            last_transition: None,
+            animation_active: false,
         }
     }
 
@@ -112,6 +149,7 @@ impl RuntimeBridge {
         RuntimeSnapshot {
             state: self.engine.state().clone(),
             scene_revision: self.scene_revision,
+            transition: self.last_transition.clone(),
         }
     }
 
@@ -122,6 +160,7 @@ impl RuntimeBridge {
             redo_depth: self.engine.redo_depth(),
             is_solved: self.engine.is_solved(),
             timing_active: self.timer.is_active(),
+            animation_active: self.animation_active,
             elapsed_millis: self.timer.elapsed_millis(),
             scene_revision: self.scene_revision,
             last_message: self.last_message.clone(),
@@ -144,52 +183,77 @@ impl RuntimeBridge {
         self.last_message = message.into();
     }
 
+    fn set_animation_active(&mut self, active: bool) {
+        self.animation_active = active;
+    }
+
     fn bump_scene(&mut self) {
         self.scene_revision += 1;
         self.timer.sync(self.engine.move_count(), self.engine.is_solved());
     }
 
+    fn record_transition(&mut self, from_state: CubeState, animation: Option<TurnCommand>) {
+        self.last_transition = Some(RuntimeTransition {
+            scene_revision: self.scene_revision,
+            from_state,
+            animation,
+        });
+        self.animation_active = false;
+    }
+
     fn set_order(&mut self, order: CubeOrder) {
+        let from_state = self.engine.state().clone();
         self.engine = CubeEngine::new(order);
         self.timer.reset();
         self.bump_scene();
+        self.record_transition(from_state, None);
         self.set_message(format!("Switched to {}x{}.", order.get(), order.get()));
     }
 
     fn reset(&mut self) {
+        let from_state = self.engine.state().clone();
         self.engine.reset();
         self.timer.reset();
         self.bump_scene();
+        self.record_transition(from_state, None);
         self.set_message("Reset cube to solved state.");
     }
 
     fn apply_turn(&mut self, turn: TurnCommand) -> Result<(), String> {
+        let from_state = self.engine.state().clone();
         self.engine.apply_turn(turn).map_err(|error| error.to_string())?;
         self.bump_scene();
+        self.record_transition(from_state, Some(turn));
         self.set_message(format!("Applied {}.", format_turn(turn)));
         Ok(())
     }
 
     fn undo(&mut self) -> Result<(), String> {
+        let from_state = self.engine.state().clone();
         let turn = self.engine.undo().map_err(|error| error.to_string())?;
         self.bump_scene();
+        self.record_transition(from_state, Some(turn.inverse()));
         self.set_message(format!("Undid {}.", format_turn(turn)));
         Ok(())
     }
 
     fn redo(&mut self) -> Result<(), String> {
+        let from_state = self.engine.state().clone();
         let turn = self.engine.redo().map_err(|error| error.to_string())?;
         self.bump_scene();
+        self.record_transition(from_state, Some(turn));
         self.set_message(format!("Redid {}.", format_turn(turn)));
         Ok(())
     }
 
     fn scramble(&mut self, length: usize, seed: u64) -> Result<(), String> {
+        let from_state = self.engine.state().clone();
         let scramble = self
             .engine
             .scramble_with_seed(length.max(1), seed)
             .map_err(|error| error.to_string())?;
         self.bump_scene();
+        self.record_transition(from_state, None);
         self.set_message(format!(
             "Applied scramble ({} turns, seed {}).",
             scramble.len(),
@@ -199,10 +263,12 @@ impl RuntimeBridge {
     }
 
     fn import_state(&mut self, json: &str) -> Result<(), String> {
+        let from_state = self.engine.state().clone();
         let state = CubeState::from_json(json).map_err(|error| error.to_string())?;
         self.engine = CubeEngine::from_state(state).map_err(|error| error.to_string())?;
         self.timer.reset();
         self.bump_scene();
+        self.record_transition(from_state, None);
         self.set_message(format!(
             "Imported {}x{} sticker state.",
             self.engine.order().get(),
@@ -307,11 +373,13 @@ pub fn start_app(canvas_id: &str, base_path: &str) {
         .add_systems(
             Update,
             (
-                sync_cube_visuals,
                 orbit_camera_input,
                 keyboard_turn_shortcuts,
+                animate_turn_visuals,
+                sync_cube_visuals,
                 apply_camera_transform,
-            ),
+            )
+                .chain(),
         )
         .run();
 }
@@ -439,15 +507,132 @@ fn sync_cube_visuals(
 ) {
     let snapshot = with_runtime(|runtime| runtime.snapshot());
 
+    if let Some(active) = &sync_state.active_animation {
+        if snapshot.scene_revision == active.scene_revision {
+            with_runtime_mut(|runtime| runtime.set_animation_active(true));
+            return;
+        }
+
+        clear_cube_visuals(&mut commands, &existing_visuals);
+        sync_state.active_animation = None;
+        sync_state.rendered_revision = 0;
+        sync_state.completed_animation_revision = None;
+        with_runtime_mut(|runtime| runtime.set_animation_active(false));
+    }
+
     if snapshot.scene_revision == sync_state.rendered_revision {
+        with_runtime_mut(|runtime| runtime.set_animation_active(false));
         return;
     }
 
-    for entity in &existing_visuals {
-        commands.entity(entity).despawn();
+    clear_cube_visuals(&mut commands, &existing_visuals);
+
+    if let Some(transition) = snapshot
+        .transition
+        .filter(|transition| transition.scene_revision == snapshot.scene_revision)
+        .filter(|transition| transition.animation.is_some())
+        .filter(|_| sync_state.completed_animation_revision != Some(snapshot.scene_revision))
+    {
+        let (root, stickers) = spawn_cube_visuals(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &transition.from_state,
+        );
+        let turn = transition.animation.expect("filtered animation transition");
+        let pivot = commands
+            .spawn((
+                CubeVisual,
+                TurnAnimationPivot,
+                Name::new("turn-animation-pivot"),
+                Transform::default(),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+                ViewVisibility::default(),
+                ChildOf(root),
+            ))
+            .id();
+
+        for (entity, cubie) in stickers {
+            if cubie_matches_turn(snapshot.state.order.get(), turn, cubie) {
+                commands.entity(entity).insert(ChildOf(pivot));
+            }
+        }
+
+        sync_state.active_animation = Some(ActiveTurnAnimation {
+            scene_revision: snapshot.scene_revision,
+            pivot_entity: pivot,
+            angle_radians: turn_rotation_angle(turn),
+            axis: turn_rotation_axis(turn.face),
+            elapsed_secs: 0.0,
+            duration_secs: turn_animation_duration_secs(turn),
+        });
+        sync_state.completed_animation_revision = None;
+        with_runtime_mut(|runtime| runtime.set_animation_active(true));
+        return;
     }
 
-    let order = usize::from(snapshot.state.order.get());
+    spawn_cube_visuals(&mut commands, &mut meshes, &mut materials, &snapshot.state);
+    sync_state.rendered_revision = snapshot.scene_revision;
+    sync_state.completed_animation_revision = None;
+    with_runtime_mut(|runtime| runtime.set_animation_active(false));
+}
+
+fn animate_turn_visuals(
+    time: Res<'_, Time>,
+    mut commands: Commands<'_, '_>,
+    mut sync_state: ResMut<'_, VisualSyncState>,
+    existing_visuals: Query<'_, '_, Entity, With<CubeVisual>>,
+    mut pivots: Query<'_, '_, &mut Transform, With<TurnAnimationPivot>>,
+) {
+    let Some(animation) = sync_state.active_animation.as_mut() else {
+        return;
+    };
+
+    let Ok(mut pivot_transform) = pivots.get_mut(animation.pivot_entity) else {
+        sync_state.active_animation = None;
+        sync_state.rendered_revision = 0;
+        sync_state.completed_animation_revision = None;
+        with_runtime_mut(|runtime| runtime.set_animation_active(false));
+        return;
+    };
+
+    animation.elapsed_secs = (animation.elapsed_secs + time.delta_secs()).min(animation.duration_secs);
+    let progress = if animation.duration_secs <= f32::EPSILON {
+        1.0
+    } else {
+        animation.elapsed_secs / animation.duration_secs
+    };
+    let eased = ease_out_cubic(progress);
+    pivot_transform.rotation = Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
+
+    if progress >= 1.0 {
+        let scene_revision = animation.scene_revision;
+        clear_cube_visuals(&mut commands, &existing_visuals);
+        sync_state.rendered_revision = 0;
+        sync_state.active_animation = None;
+        sync_state.completed_animation_revision = Some(scene_revision);
+        with_runtime_mut(|runtime| runtime.set_animation_active(false));
+    }
+}
+
+fn clear_cube_visuals(
+    commands: &mut Commands<'_, '_>,
+    existing_visuals: &Query<'_, '_, Entity, With<CubeVisual>>,
+) {
+    for entity in existing_visuals.iter() {
+        commands.entity(entity).despawn();
+    }
+}
+
+fn spawn_cube_visuals(
+    commands: &mut Commands<'_, '_>,
+    meshes: &mut ResMut<'_, Assets<Mesh>>,
+    materials: &mut ResMut<'_, Assets<StandardMaterial>>,
+    state: &CubeState,
+) -> (Entity, Vec<(Entity, UVec3)>) {
+    let order = usize::from(state.order.get());
     let face_span = 1.9_f32;
     let step = face_span / order as f32;
     let sticker_size = step * 0.84;
@@ -458,11 +643,8 @@ fn sync_cube_visuals(
     let root = commands
         .spawn((
             CubeVisual,
-            Name::new(format!(
-                "cube-visual-{}x{}",
-                snapshot.state.order.get(),
-                snapshot.state.order.get()
-            )),
+            CubeVisualRoot,
+            Name::new(format!("cube-visual-{}x{}", state.order.get(), state.order.get())),
             Transform::default(),
             GlobalTransform::default(),
             Visibility::Visible,
@@ -489,6 +671,7 @@ fn sync_cube_visuals(
     let sticker_mesh_front = meshes.add(Cuboid::new(sticker_size, sticker_size, sticker_depth));
     let sticker_mesh_side = meshes.add(Cuboid::new(sticker_depth, sticker_size, sticker_size));
     let sticker_mesh_top = meshes.add(Cuboid::new(sticker_size, sticker_depth, sticker_size));
+    let mut sticker_entities = Vec::with_capacity(Face::ALL.len() * order * order);
 
     commands.entity(root).with_children(|parent| {
         parent.spawn((
@@ -515,7 +698,8 @@ fn sync_cube_visuals(
             let face = Face::ALL[face_index];
             for row in 0..order {
                 for col in 0..order {
-                    let color = snapshot.state.stickers[(face_index * order * order) + (row * order) + col];
+                    let color = state.stickers[(face_index * order * order) + (row * order) + col];
+                    let cubie = sticker_cubie_coord(face, row, col, order);
                     let (translation, rotation, mesh) = sticker_transform(
                         face,
                         row,
@@ -535,19 +719,22 @@ fn sync_cube_visuals(
                         ..default()
                     });
 
-                    parent.spawn((
-                        CubeVisual,
-                        Mesh3d(mesh.clone()),
-                        MeshMaterial3d(material),
-                        Transform::from_translation(translation).with_rotation(rotation),
-                        Name::new(format!("sticker-{face_index}-{row}-{col}")),
-                    ));
+                    let entity = parent
+                        .spawn((
+                            CubeVisual,
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(material),
+                            Transform::from_translation(translation).with_rotation(rotation),
+                            Name::new(format!("sticker-{face_index}-{row}-{col}")),
+                        ))
+                        .id();
+                    sticker_entities.push((entity, cubie));
                 }
             }
         }
     });
 
-    sync_state.rendered_revision = snapshot.scene_revision;
+    (root, sticker_entities)
 }
 
 fn orbit_camera_input(
@@ -561,6 +748,7 @@ fn orbit_camera_input(
 ) {
     if keys.just_pressed(KeyCode::Space) {
         orbit.auto_spin = !orbit.auto_spin;
+        orbit.snap_target = None;
     }
 
     if orbit.auto_spin {
@@ -568,11 +756,18 @@ fn orbit_camera_input(
     }
 
     if buttons.pressed(MouseButton::Left) {
+        orbit.mouse_drag_active = true;
+        orbit.snap_target = None;
+        orbit.auto_spin = false;
         for event in mouse_motion.read() {
             orbit.yaw -= event.delta.x * 0.008;
             orbit.pitch = (orbit.pitch - event.delta.y * 0.006).clamp(-1.15, 1.15);
         }
     } else {
+        if orbit.mouse_drag_active {
+            orbit.mouse_drag_active = false;
+            orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
+        }
         mouse_motion.clear();
     }
 
@@ -587,11 +782,17 @@ fn orbit_camera_input(
 
     match active_touches.as_slice() {
         [] => {
+            if orbit.touch_drag_active {
+                orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
+            }
+            orbit.touch_drag_active = false;
             orbit.previous_touch_center = None;
             orbit.previous_pinch_distance = None;
         }
         [position] => {
             orbit.auto_spin = false;
+            orbit.touch_drag_active = true;
+            orbit.snap_target = None;
 
             if let Some(previous_center) = orbit.previous_touch_center {
                 let delta = *position - previous_center;
@@ -604,6 +805,8 @@ fn orbit_camera_input(
         }
         [first, second, ..] => {
             orbit.auto_spin = false;
+            orbit.touch_drag_active = true;
+            orbit.snap_target = None;
 
             let center = (*first + *second) * 0.5;
             if let Some(previous_center) = orbit.previous_touch_center {
@@ -620,6 +823,22 @@ fn orbit_camera_input(
 
             orbit.previous_touch_center = Some(center);
             orbit.previous_pinch_distance = Some(pinch_distance);
+        }
+    }
+
+    if !orbit.auto_spin && !orbit.mouse_drag_active && !orbit.touch_drag_active {
+        if let Some(target) = orbit.snap_target {
+            let yaw_delta = shortest_angle_delta(orbit.yaw, target.x);
+            let pitch_delta = target.y - orbit.pitch;
+            let step = (time.delta_secs() * 14.0).clamp(0.0, 1.0);
+            orbit.yaw += yaw_delta * step;
+            orbit.pitch += pitch_delta * step;
+
+            if yaw_delta.abs() < 0.01 && pitch_delta.abs() < 0.01 {
+                orbit.yaw = normalize_angle(target.x);
+                orbit.pitch = target.y;
+                orbit.snap_target = None;
+            }
         }
     }
 }
@@ -684,6 +903,135 @@ fn apply_camera_transform(
     *transform = Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y);
 }
 
+fn ease_out_cubic(progress: f32) -> f32 {
+    let inverse = 1.0 - progress.clamp(0.0, 1.0);
+    1.0 - inverse * inverse * inverse
+}
+
+fn normalize_angle(angle: f32) -> f32 {
+    let tau = std::f32::consts::TAU;
+    (angle + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI
+}
+
+fn shortest_angle_delta(current: f32, target: f32) -> f32 {
+    normalize_angle(target - current)
+}
+
+fn nearest_orbit_snap(yaw: f32, pitch: f32) -> Option<Vec2> {
+    const SNAP_PITCHES: [f32; 2] = [0.26, -0.26];
+    const SNAP_THRESHOLD: f32 = 0.2;
+    let snap_yaws = [
+        std::f32::consts::FRAC_PI_4,
+        std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_2,
+        std::f32::consts::FRAC_PI_4 + std::f32::consts::PI,
+        std::f32::consts::FRAC_PI_4 + (3.0 * std::f32::consts::FRAC_PI_2),
+    ];
+
+    let mut best: Option<(f32, Vec2)> = None;
+    for snap_yaw in snap_yaws {
+        for snap_pitch in SNAP_PITCHES {
+            let delta = shortest_angle_delta(yaw, snap_yaw).abs() + (pitch - snap_pitch).abs();
+            if delta > SNAP_THRESHOLD {
+                continue;
+            }
+
+            match best {
+                Some((best_delta, _)) if delta >= best_delta => {}
+                _ => best = Some((delta, Vec2::new(normalize_angle(snap_yaw), snap_pitch))),
+            }
+        }
+    }
+
+    best.map(|(_, target)| target)
+}
+
+fn turn_animation_duration_secs(turn: TurnCommand) -> f32 {
+    match turn.rotation {
+        RotationAmount::HalfTurn => 0.2,
+        RotationAmount::Clockwise | RotationAmount::CounterClockwise => 0.14,
+    }
+}
+
+fn turn_rotation_axis(face: Face) -> Vec3 {
+    match face {
+        Face::Up => Vec3::Y,
+        Face::Right => Vec3::X,
+        Face::Front => Vec3::Z,
+        Face::Down => -Vec3::Y,
+        Face::Left => -Vec3::X,
+        Face::Back => -Vec3::Z,
+    }
+}
+
+fn turn_rotation_angle(turn: TurnCommand) -> f32 {
+    let quarter_turns = match turn.rotation {
+        RotationAmount::Clockwise => 1.0,
+        RotationAmount::HalfTurn => 2.0,
+        RotationAmount::CounterClockwise => -1.0,
+    };
+    -quarter_turns * std::f32::consts::FRAC_PI_2
+}
+
+fn cubie_matches_turn(order: u8, turn: TurnCommand, cubie: UVec3) -> bool {
+    let (axis_value, min_layer, max_layer) = match turn.face {
+        Face::Up => {
+            let max = u32::from(order.saturating_sub(1));
+            let min_layer = max
+                .saturating_sub(u32::from(turn.start_layer))
+                .saturating_sub(u32::from(turn.width.saturating_sub(1)));
+            let max_layer = max.saturating_sub(u32::from(turn.start_layer));
+            (cubie.y, min_layer, max_layer)
+        }
+        Face::Right => {
+            let max = u32::from(order.saturating_sub(1));
+            let min_layer = max
+                .saturating_sub(u32::from(turn.start_layer))
+                .saturating_sub(u32::from(turn.width.saturating_sub(1)));
+            let max_layer = max.saturating_sub(u32::from(turn.start_layer));
+            (cubie.x, min_layer, max_layer)
+        }
+        Face::Front => {
+            let max = u32::from(order.saturating_sub(1));
+            let min_layer = max
+                .saturating_sub(u32::from(turn.start_layer))
+                .saturating_sub(u32::from(turn.width.saturating_sub(1)));
+            let max_layer = max.saturating_sub(u32::from(turn.start_layer));
+            (cubie.z, min_layer, max_layer)
+        }
+        Face::Down => {
+            let min_layer = u32::from(turn.start_layer);
+            let max_layer = min_layer.saturating_add(u32::from(turn.width.saturating_sub(1)));
+            (cubie.y, min_layer, max_layer)
+        }
+        Face::Left => {
+            let min_layer = u32::from(turn.start_layer);
+            let max_layer = min_layer.saturating_add(u32::from(turn.width.saturating_sub(1)));
+            (cubie.x, min_layer, max_layer)
+        }
+        Face::Back => {
+            let min_layer = u32::from(turn.start_layer);
+            let max_layer = min_layer.saturating_add(u32::from(turn.width.saturating_sub(1)));
+            (cubie.z, min_layer, max_layer)
+        }
+    };
+
+    axis_value >= min_layer && axis_value <= max_layer
+}
+
+fn sticker_cubie_coord(face: Face, row: usize, col: usize, order: usize) -> UVec3 {
+    let max = order.saturating_sub(1);
+    let (x, y, z) = match face {
+        Face::Up => (col, max, row),
+        Face::Right => (max, max - row, max - col),
+        Face::Front => (col, max - row, max),
+        Face::Down => (col, 0, max - row),
+        Face::Left => (0, max - row, col),
+        Face::Back => (max - col, max - row, 0),
+    };
+
+    UVec3::new(x as u32, y as u32, z as u32)
+}
+
 fn sticker_transform(
     face: Face,
     row: usize,
@@ -695,15 +1043,10 @@ fn sticker_transform(
     side_mesh: &Handle<Mesh>,
     top_mesh: &Handle<Mesh>,
 ) -> (Vec3, Quat, Handle<Mesh>) {
-    let max = order.saturating_sub(1);
-    let (x, y, z) = match face {
-        Face::Up => (col, max, row),
-        Face::Right => (max, max - row, max - col),
-        Face::Front => (col, max - row, max),
-        Face::Down => (col, 0, max - row),
-        Face::Left => (0, max - row, col),
-        Face::Back => (max - col, max - row, 0),
-    };
+    let cubie = sticker_cubie_coord(face, row, col, order);
+    let x = cubie.x as usize;
+    let y = cubie.y as usize;
+    let z = cubie.z as usize;
 
     let axis = |index: usize| -> f32 {
         if order <= 1 {
@@ -851,10 +1194,12 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_face, decode_rotation, format_turn, normalize_base_path, normalize_canvas_selector,
-        reset_cube,
+        RuntimeBridge, cubie_matches_turn, decode_face, decode_rotation, format_turn,
+        nearest_orbit_snap, normalize_base_path, normalize_canvas_selector, reset_cube,
+        turn_rotation_angle,
     };
-    use rubik_core::{Face, RotationAmount, TurnCommand};
+    use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
+    use bevy::prelude::UVec3;
 
     #[test]
     fn normalizes_empty_base_path_to_root() {
@@ -895,5 +1240,68 @@ mod tests {
     #[test]
     fn reset_export_is_callable_in_native_tests() {
         assert!(reset_cube());
+    }
+
+    #[test]
+    fn apply_turn_records_animating_transition_from_previous_state() {
+        let mut runtime = RuntimeBridge::new(CubeOrder::standard());
+        let previous = runtime.engine.state().clone();
+        let turn = TurnCommand::outer(Face::Front, RotationAmount::Clockwise);
+
+        runtime.apply_turn(turn).expect("turn should apply");
+
+        let transition = runtime.last_transition.expect("transition should exist");
+        assert_eq!(transition.scene_revision, runtime.scene_revision);
+        assert_eq!(transition.from_state, previous);
+        assert_eq!(transition.animation, Some(turn));
+    }
+
+    #[test]
+    fn undo_records_the_inverse_turn_for_animation() {
+        let mut runtime = RuntimeBridge::new(CubeOrder::standard());
+        let turn = TurnCommand::outer(Face::Right, RotationAmount::Clockwise);
+        runtime.apply_turn(turn).expect("turn should apply");
+        let scrambled = runtime.engine.state().clone();
+
+        runtime.undo().expect("undo should apply");
+
+        let transition = runtime.last_transition.expect("transition should exist");
+        assert_eq!(transition.from_state, scrambled);
+        assert_eq!(transition.animation, Some(turn.inverse()));
+    }
+
+    #[test]
+    fn layer_selection_matches_named_face_depths() {
+        let turn = TurnCommand {
+            face: Face::Right,
+            start_layer: 1,
+            width: 2,
+            rotation: RotationAmount::CounterClockwise,
+        };
+
+        assert!(cubie_matches_turn(5, turn, UVec3::new(3, 1, 2)));
+        assert!(cubie_matches_turn(5, turn, UVec3::new(2, 4, 0)));
+        assert!(!cubie_matches_turn(5, turn, UVec3::new(4, 1, 2)));
+        assert!(!cubie_matches_turn(5, turn, UVec3::new(1, 1, 2)));
+    }
+
+    #[test]
+    fn turn_rotation_angle_respects_face_clockwise_view() {
+        assert_eq!(
+            turn_rotation_angle(TurnCommand::outer(Face::Front, RotationAmount::Clockwise)),
+            -std::f32::consts::FRAC_PI_2
+        );
+        assert_eq!(
+            turn_rotation_angle(TurnCommand::outer(Face::Back, RotationAmount::CounterClockwise)),
+            std::f32::consts::FRAC_PI_2
+        );
+    }
+
+    #[test]
+    fn orbit_snap_targets_nearby_isometric_views() {
+        let target = nearest_orbit_snap(0.81, 0.24).expect("should snap to a nearby view");
+        assert!((target.x - std::f32::consts::FRAC_PI_4).abs() < 0.05);
+        assert!((target.y - 0.26).abs() < 0.05);
+        assert!(nearest_orbit_snap(1.7, 0.24).is_none());
     }
 }

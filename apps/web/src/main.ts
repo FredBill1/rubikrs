@@ -8,6 +8,7 @@ type RuntimeStatus = {
   redo_depth: number
   is_solved: boolean
   timing_active: boolean
+  animation_active: boolean
   elapsed_millis: number
   scene_revision: number
   last_message: string
@@ -141,6 +142,10 @@ app.innerHTML = `
               <dd data-status-timer>00:00.0</dd>
             </div>
             <div>
+              <dt>animating</dt>
+              <dd data-status-animation>no</dd>
+            </div>
+            <div>
               <dt>solved</dt>
               <dd data-status-solved>yes</dd>
             </div>
@@ -262,6 +267,7 @@ const statusOrder = document.querySelector<HTMLElement>('[data-status-order]')
 const statusMoves = document.querySelector<HTMLElement>('[data-status-moves]')
 const statusRedo = document.querySelector<HTMLElement>('[data-status-redo]')
 const statusTimer = document.querySelector<HTMLElement>('[data-status-timer]')
+const statusAnimation = document.querySelector<HTMLElement>('[data-status-animation]')
 const statusSolved = document.querySelector<HTMLElement>('[data-status-solved]')
 const statusHistory = document.querySelector<HTMLElement>('[data-status-history]')
 const solverStatus = document.querySelector<HTMLElement>('[data-solver-status]')
@@ -295,6 +301,7 @@ function renderRuntimeStatus(status: RuntimeStatus | null): void {
   statusMoves!.textContent = String(status.move_count)
   statusRedo!.textContent = String(status.redo_depth)
   statusTimer!.textContent = formatTimer(status.elapsed_millis)
+  statusAnimation!.textContent = status.animation_active ? 'yes' : 'no'
   statusSolved!.textContent = status.is_solved ? 'yes' : 'no'
   statusHistory!.textContent = status.recent_turns.length > 0 ? status.recent_turns.join('  ·  ') : '—'
 
@@ -701,7 +708,7 @@ async function bootstrapRuntime(): Promise<void> {
 
     statusPollHandle = window.setInterval(() => {
       syncStatus()
-    }, 250)
+    }, 100)
 
     updateBootState(
       'ready',
