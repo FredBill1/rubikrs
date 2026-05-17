@@ -14,6 +14,31 @@ type RuntimeStatus = {
   recent_turns: string[]
 }
 
+type SolveTurn = {
+  faceCode: number
+  rotationCode: number
+  startLayer: number
+  width: number
+  notation: string
+}
+
+type SolveWorkerRequest = {
+  kind: 'solve'
+  requestId: number
+  order: number
+  stateJson: string
+  maxDepth: number
+}
+
+type SolveWorkerResponse = {
+  kind: 'solved' | 'unsolved' | 'error'
+  requestId: number
+  turns: SolveTurn[]
+  explored: number
+  depthLimit: number
+  message: string
+}
+
 type RubikWasmModule = {
   default: () => Promise<unknown>
   start_app: (canvasId: string, basePath: string) => void
@@ -38,6 +63,10 @@ const basePath = import.meta.env.BASE_URL
 const parallelLanes = Math.max(1, Math.min(8, Math.floor((navigator.hardwareConcurrency ?? 4) / 2)))
 let runtime: RubikWasmModule | null = null
 let statusPollHandle: number | null = null
+let solverWorker: Worker | null = null
+let activeSolveRequestId: number | null = null
+let activeSolveSceneRevision: number | null = null
+let nextSolveRequestId = 0
 
 app.innerHTML = `
   <div class="shell">
@@ -59,7 +88,7 @@ app.innerHTML = `
         <div class="stage-caption">
           <p class="stage-label">orbit / inspect / zoom</p>
           <p class="stage-hint">
-            Drag to orbit, scroll to zoom, press Space to toggle auto-spin.
+            Drag or single-finger swipe to orbit, scroll or pinch to zoom, press Space to toggle auto-spin.
             Keyboard turns: U R F D L B, Shift for inverse, Ctrl for 180, Backspace undo, Enter redo.
           </p>
         </div>
@@ -185,6 +214,26 @@ app.innerHTML = `
         </section>
 
         <section class="panel">
+          <p class="panel-kicker">solver worker</p>
+          <div class="control-cluster">
+            <div class="action-row action-row--stacked">
+              <label class="field">
+                <span>search depth</span>
+                <input data-solve-depth type="number" min="1" max="8" value="5" />
+              </label>
+              <div class="action-row">
+                <button type="button" data-action="solve">solve</button>
+                <button type="button" data-action="cancel-solve">cancel</button>
+              </div>
+            </div>
+            <p class="history-line" data-solver-status>idle</p>
+            <p class="body-copy" data-solver-detail>
+              No solve request in flight. The first slice uses a dedicated Rust wasm worker with depth-limited search.
+            </p>
+          </div>
+        </section>
+
+        <section class="panel">
           <p class="panel-kicker">recent turns</p>
           <p class="history-line" data-status-history>—</p>
           <p class="body-copy" data-boot-detail>
@@ -202,6 +251,7 @@ const bootDetail = document.querySelector<HTMLElement>('[data-boot-detail]')
 const orderSelect = document.querySelector<HTMLSelectElement>('[data-order-select]')
 const scrambleLength = document.querySelector<HTMLInputElement>('[data-scramble-length]')
 const scrambleSeed = document.querySelector<HTMLInputElement>('[data-scramble-seed]')
+const solveDepth = document.querySelector<HTMLInputElement>('[data-solve-depth]')
 const importArea = document.querySelector<HTMLTextAreaElement>('[data-import-area]')
 const importFile = document.querySelector<HTMLInputElement>('[data-import-file]')
 const statusOrder = document.querySelector<HTMLElement>('[data-status-order]')
@@ -210,6 +260,8 @@ const statusRedo = document.querySelector<HTMLElement>('[data-status-redo]')
 const statusTimer = document.querySelector<HTMLElement>('[data-status-timer]')
 const statusSolved = document.querySelector<HTMLElement>('[data-status-solved]')
 const statusHistory = document.querySelector<HTMLElement>('[data-status-history]')
+const solverStatus = document.querySelector<HTMLElement>('[data-solver-status]')
+const solverDetail = document.querySelector<HTMLElement>('[data-solver-detail]')
 
 function formatTimer(elapsedMillis: number): string {
   const totalTenths = Math.floor(elapsedMillis / 100)
@@ -270,20 +322,142 @@ function updateBootState(tone: BootTone, label: string, detail: string): void {
   }
 }
 
+function updateSolverState(label: string, detail: string): void {
+  if (solverStatus) {
+    solverStatus.textContent = label
+  }
+  if (solverDetail) {
+    solverDetail.textContent = detail
+  }
+}
+
+function currentSceneRevision(): number | null {
+  if (!runtime) {
+    return null
+  }
+
+  return parseRuntimeStatus(runtime.runtime_status_json())?.scene_revision ?? null
+}
+
+function ensureSolverWorker(): Worker {
+  if (solverWorker) {
+    return solverWorker
+  }
+
+  solverWorker = new Worker(new URL('./solver.worker.ts', import.meta.url), { type: 'module' })
+  solverWorker.addEventListener('message', (event: MessageEvent<SolveWorkerResponse>) => {
+    if (!runtime || activeSolveRequestId === null || event.data.requestId !== activeSolveRequestId) {
+      return
+    }
+
+    const sceneRevision = currentSceneRevision()
+    activeSolveRequestId = null
+
+    if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
+      updateSolverState(
+        'stale result discarded',
+        'The cube state changed while the worker was searching, so the returned solution was ignored.'
+      )
+      activeSolveSceneRevision = null
+      return
+    }
+
+    activeSolveSceneRevision = null
+
+    if (event.data.kind === 'solved') {
+      const notation = event.data.turns.map((turn) => turn.notation).join(' ')
+      for (const turn of event.data.turns) {
+        runtime.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
+      }
+      syncStatus()
+
+      const suffix =
+        event.data.turns.length > 0
+          ? ` Applied ${event.data.turns.length} turn(s) from the worker${notation ? `: ${notation}.` : '.'}`
+          : ' No turns were needed.'
+      updateSolverState('solved', `${event.data.message}.${suffix}`)
+      return
+    }
+
+    if (event.data.kind === 'unsolved') {
+      updateSolverState(
+        'depth limit reached',
+        `${event.data.message} Explored ${event.data.explored.toLocaleString()} nodes.`
+      )
+      return
+    }
+
+    updateSolverState('worker error', event.data.message)
+  })
+
+  solverWorker.addEventListener('error', () => {
+    activeSolveRequestId = null
+    activeSolveSceneRevision = null
+    updateSolverState('worker fault', 'The solver worker crashed and will be recreated on the next request.')
+    solverWorker?.terminate()
+    solverWorker = null
+  })
+
+  return solverWorker
+}
+
+function cancelActiveSolve(detail: string): void {
+  if (activeSolveRequestId === null) {
+    return
+  }
+
+  activeSolveRequestId = null
+  activeSolveSceneRevision = null
+  solverWorker?.terminate()
+  solverWorker = null
+  updateSolverState('cancelled', detail)
+}
+
+function startSolve(module: RubikWasmModule): void {
+  if (activeSolveRequestId !== null) {
+    updateSolverState('busy', 'A solve request is already running. Cancel it before starting another one.')
+    return
+  }
+
+  const maxDepth = Math.min(8, Math.max(1, Number.parseInt(solveDepth?.value ?? '5', 10) || 5))
+  if (solveDepth) {
+    solveDepth.value = String(maxDepth)
+  }
+
+  const requestId = ++nextSolveRequestId
+  activeSolveRequestId = requestId
+  activeSolveSceneRevision = currentSceneRevision()
+  updateSolverState('solving', `Searching up to depth ${maxDepth} in a dedicated Rust wasm worker.`)
+
+  const request: SolveWorkerRequest = {
+    kind: 'solve',
+    requestId,
+    order: Number.parseInt(orderSelect?.value ?? '3', 10) || 3,
+    stateJson: module.export_cube_state(),
+    maxDepth,
+  }
+
+  ensureSolverWorker().postMessage(request)
+}
+
 function bindShellControls(module: RubikWasmModule): void {
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-action]')) {
     button.addEventListener('click', () => {
       switch (button.dataset.action) {
         case 'reset':
+          cancelActiveSolve('Reset cancelled the in-flight solve request.')
           module.reset_cube()
           break
         case 'undo':
+          cancelActiveSolve('Undo cancelled the in-flight solve request.')
           module.undo_turn()
           break
         case 'redo':
+          cancelActiveSolve('Redo cancelled the in-flight solve request.')
           module.redo_turn()
           break
         case 'scramble': {
+          cancelActiveSolve('Scrambling cancelled the in-flight solve request.')
           const length = Number.parseInt(scrambleLength?.value ?? '20', 10) || 20
           const seed = Number.parseInt(scrambleSeed?.value ?? String(Date.now()), 10) || Date.now()
           module.scramble_cube(length, seed)
@@ -305,11 +479,18 @@ function bindShellControls(module: RubikWasmModule): void {
         }
         case 'import':
           if (importArea?.value.trim()) {
+            cancelActiveSolve('Importing a new state cancelled the in-flight solve request.')
             module.import_cube_state(importArea.value.trim())
           }
           break
         case 'import-file':
           importFile?.click()
+          break
+        case 'solve':
+          startSolve(module)
+          break
+        case 'cancel-solve':
+          cancelActiveSolve('Solve request cancelled. A fresh worker will be created next time.')
           break
       }
 
@@ -325,12 +506,14 @@ function bindShellControls(module: RubikWasmModule): void {
       }
 
       const [faceCode, rotationCode] = encoded.split(':').map((value) => Number.parseInt(value, 10))
+      cancelActiveSolve('Manual turns cancelled the in-flight solve request.')
       module.apply_turn(faceCode, rotationCode, 0, 1)
       syncStatus()
     })
   }
 
   orderSelect?.addEventListener('change', () => {
+    cancelActiveSolve('Changing the cube order cancelled the in-flight solve request.')
     const nextOrder = Number.parseInt(orderSelect.value, 10)
     module.set_cube_order(nextOrder)
     syncStatus()
@@ -347,6 +530,7 @@ function bindShellControls(module: RubikWasmModule): void {
       importArea.value = text
     }
 
+    cancelActiveSolve('Importing a state file cancelled the in-flight solve request.')
     module.import_cube_state(text)
     importFile.value = ''
     syncStatus()
@@ -363,6 +547,7 @@ async function bootstrapRuntime(): Promise<void> {
     updateBootState('booting', 'starting bevy', 'Binding the runtime to #rubik-canvas.')
     runtime.start_app('rubik-canvas', basePath)
     bindShellControls(runtime)
+    ensureSolverWorker()
     syncStatus()
 
     if (statusPollHandle !== null) {
@@ -385,5 +570,9 @@ async function bootstrapRuntime(): Promise<void> {
     updateBootState('fault', 'boot fault', detail)
   }
 }
+
+window.addEventListener('beforeunload', () => {
+  solverWorker?.terminate()
+})
 
 void bootstrapRuntime()

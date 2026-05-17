@@ -8,6 +8,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rubik-core = { path = "../rubik-core" }
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook.workspace = true
 wasm-bindgen.workspace = true

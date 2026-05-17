@@ -2,7 +2,6 @@
 
 use std::{
     cell::RefCell,
-    time::{Duration, Instant},
 };
 
 use bevy::{
@@ -18,6 +17,9 @@ use rubik_core::{
     CubeEngine, CubeOrder, CubeState, Face, RotationAmount, StickerColor, TurnCommand,
 };
 use serde::Serialize;
+
+#[cfg(target_arch = "wasm32")]
+use js_sys::Date;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -60,8 +62,8 @@ struct RuntimeBridge {
 
 #[derive(Debug, Clone, Default)]
 struct RuntimeTimer {
-    elapsed_before: Duration,
-    started_at: Option<Instant>,
+    elapsed_before_millis: u64,
+    started_at_millis: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,8 +214,8 @@ impl RuntimeBridge {
 
 impl RuntimeTimer {
     fn reset(&mut self) {
-        self.elapsed_before = Duration::ZERO;
-        self.started_at = None;
+        self.elapsed_before_millis = 0;
+        self.started_at_millis = None;
     }
 
     fn sync(&mut self, move_count: usize, solved: bool) {
@@ -222,8 +224,8 @@ impl RuntimeTimer {
             return;
         }
 
-        if !solved && self.started_at.is_none() {
-            self.started_at = Some(Instant::now());
+        if !solved && self.started_at_millis.is_none() {
+            self.started_at_millis = Some(now_millis());
         }
 
         if solved {
@@ -232,21 +234,42 @@ impl RuntimeTimer {
     }
 
     fn stop(&mut self) {
-        if let Some(started_at) = self.started_at.take() {
-            self.elapsed_before += started_at.elapsed();
+        if let Some(started_at_millis) = self.started_at_millis.take() {
+            self.elapsed_before_millis = self
+                .elapsed_before_millis
+                .saturating_add(now_millis().saturating_sub(started_at_millis));
         }
     }
 
     fn elapsed_millis(&self) -> u64 {
-        let elapsed = self
-            .started_at
-            .map(|started_at| self.elapsed_before + started_at.elapsed())
-            .unwrap_or(self.elapsed_before);
-        elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+        self.started_at_millis
+            .map(|started_at_millis| {
+                self.elapsed_before_millis
+                    .saturating_add(now_millis().saturating_sub(started_at_millis))
+            })
+            .unwrap_or(self.elapsed_before_millis)
     }
 
     fn is_active(&self) -> bool {
-        self.started_at.is_some()
+        self.started_at_millis.is_some()
+    }
+}
+
+fn now_millis() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return Date::now().max(0.0) as u64;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        return SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
     }
 }
 

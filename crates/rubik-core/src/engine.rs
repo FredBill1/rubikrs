@@ -2,7 +2,7 @@ use core::fmt;
 
 use crate::{
     CubeOrder, CubeState, CubeStateValidationError, Face, RotationAmount, TurnCommand,
-    TurnCommandValidationError,
+    StickerColor, TurnCommandValidationError,
 };
 
 #[derive(Debug, Clone)]
@@ -134,12 +134,20 @@ pub fn generate_scramble(_order: CubeOrder, length: usize, seed: u64) -> Vec<Tur
 }
 
 pub fn apply_turn_to_state(state: &mut CubeState, turn: TurnCommand) -> Result<(), CubeEngineError> {
-    turn.validate_for(state.order)
-        .map_err(CubeEngineError::InvalidTurn)?;
-
-    let order = usize::from(state.order.get());
-    apply_turn_to_items(&mut state.stickers, order, turn);
+    let mut scratch = state.stickers.clone();
+    apply_turn_to_state_unchecked(state, turn, &mut scratch).map_err(CubeEngineError::InvalidTurn)?;
     state.validate().map_err(CubeEngineError::InvalidState)?;
+    Ok(())
+}
+
+pub fn apply_turn_to_state_unchecked(
+    state: &mut CubeState,
+    turn: TurnCommand,
+    scratch: &mut [StickerColor],
+) -> Result<(), TurnCommandValidationError> {
+    turn.validate_for(state.order)?;
+    let order = usize::from(state.order.get());
+    apply_turn_to_items_with_scratch(&mut state.stickers, scratch, order, turn);
     Ok(())
 }
 
@@ -411,10 +419,20 @@ impl DeterministicRng {
     }
 }
 
-fn apply_turn_to_items<T: Copy>(items: &mut [T], order: usize, turn: TurnCommand) {
-    let previous = items.to_vec();
+fn apply_turn_to_items_with_scratch<T: Copy>(
+    items: &mut [T],
+    scratch: &mut [T],
+    order: usize,
+    turn: TurnCommand,
+) {
+    assert_eq!(
+        items.len(),
+        scratch.len(),
+        "scratch buffer must match the number of stickers"
+    );
+    scratch.copy_from_slice(items);
 
-    for (index, item) in previous.into_iter().enumerate() {
+    for (index, item) in scratch.iter().copied().enumerate() {
         let sticker = StickerPosition::from_index(order, index);
         let moved = if is_affected(sticker, turn, order) {
             rotate_sticker(sticker, turn, order)
@@ -427,7 +445,10 @@ fn apply_turn_to_items<T: Copy>(items: &mut [T], order: usize, turn: TurnCommand
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_turn_to_items, apply_turn_to_state, generate_scramble, CubeEngine, HistoryError};
+    use super::{
+        CubeEngine, HistoryError, apply_turn_to_items_with_scratch, apply_turn_to_state,
+        generate_scramble,
+    };
     use crate::{CubeOrder, CubeState, Face, RotationAmount, TurnCommand};
 
     #[test]
@@ -456,8 +477,10 @@ mod tests {
     #[test]
     fn front_turn_moves_the_left_strip_to_the_up_face_in_view_order() {
         let mut labels: Vec<usize> = (0..54).collect();
-        apply_turn_to_items(
+        let mut scratch = labels.clone();
+        apply_turn_to_items_with_scratch(
             &mut labels,
+            &mut scratch,
             3,
             TurnCommand::outer(Face::Front, RotationAmount::Clockwise),
         );
