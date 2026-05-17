@@ -8,6 +8,7 @@
     "build:wasm": "node ./scripts/build-wasm.mjs",
     "build:wasm:dev": "node ./scripts/build-wasm.mjs --dev",
     "build": "npm run build:wasm && tsc && vite build",
+    "build:dev": "npm run build:wasm:dev && tsc && vite build",
     "check": "tsc --noEmit",
     "preview": "vite preview"
   },
