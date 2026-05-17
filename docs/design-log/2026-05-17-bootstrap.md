@@ -22,6 +22,9 @@
 - For non-3x3 states generated inside the current session, expose the full Rust turn history to the solver worker and let the worker replay the inverse history as a feasible async solve path; this preserves the canonical state schema while giving NxN a deterministic fallback before a real reduction solver lands.
 - Keep keyboard cube turns Rust-native and scale them with simple modifiers instead of duplicating NxN turn logic in TypeScript: digit keys select the starting layer, `Alt` widens the turn to two layers, `Shift` flips direction, and `Ctrl` keeps the half-turn override.
 - Reuse the same `start_layer` / `width` turn contract in the DOM button shell so touch users can still reach inner and wide NxN turns even before direct canvas picking exists.
+- Add a Rust-native `kewb` two-phase 3x3 fallback behind the existing shallow exact-depth worker search so the browser can escalate deeper 3x3 solves without blocking the UI; this is explicitly an interim usability slice, not the final strict-optimal solver promised for 3x3.
+- Build the worker wasm with `getrandom`'s `wasm_js` backend enabled so `kewb`'s dependency chain works on `wasm32-unknown-unknown` in both local builds and Pages-style CI.
+- Lock `U/D` turn semantics to standard cubing notation and compare every exported single-move facelet state against `kewb`'s own move tables; this catches geometry / notation drift before it turns async solver results into incorrect runtime replays.
 
 ## Next risks to validate
 

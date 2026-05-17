@@ -364,17 +364,17 @@ fn rotate_face_clockwise(face: Face, axis_face: Face) -> Face {
             other => other,
         },
         Face::Up => match face {
-            Face::Front => Face::Right,
-            Face::Right => Face::Back,
-            Face::Back => Face::Left,
-            Face::Left => Face::Front,
-            other => other,
-        },
-        Face::Down => match face {
             Face::Front => Face::Left,
             Face::Left => Face::Back,
             Face::Back => Face::Right,
             Face::Right => Face::Front,
+            other => other,
+        },
+        Face::Down => match face {
+            Face::Front => Face::Right,
+            Face::Right => Face::Back,
+            Face::Back => Face::Left,
+            Face::Left => Face::Front,
             other => other,
         },
     }
@@ -489,6 +489,34 @@ mod tests {
     }
 
     #[test]
+    fn up_turn_moves_the_front_strip_to_the_left_face_in_view_order() {
+        let mut labels: Vec<usize> = (0..54).collect();
+        let mut scratch = labels.clone();
+        apply_turn_to_items_with_scratch(
+            &mut labels,
+            &mut scratch,
+            3,
+            TurnCommand::outer(Face::Up, RotationAmount::Clockwise),
+        );
+
+        assert_eq!(&labels[36..39], &[18, 19, 20]);
+    }
+
+    #[test]
+    fn down_turn_moves_the_front_strip_to_the_right_face_in_view_order() {
+        let mut labels: Vec<usize> = (0..54).collect();
+        let mut scratch = labels.clone();
+        apply_turn_to_items_with_scratch(
+            &mut labels,
+            &mut scratch,
+            3,
+            TurnCommand::outer(Face::Down, RotationAmount::Clockwise),
+        );
+
+        assert_eq!(&labels[15..18], &[24, 25, 26]);
+    }
+
+    #[test]
     fn wide_turns_are_supported_for_larger_orders() {
         let order = CubeOrder::new(4).expect("4x4 should be valid");
         let mut state = CubeState::solved(order);
@@ -543,6 +571,25 @@ mod tests {
 
         assert_eq!(a, b);
         assert_eq!(a.len(), 12);
+    }
+
+    #[test]
+    fn sexy_move_six_times_cycles_back_to_solved() {
+        let mut state = CubeState::solved(CubeOrder::standard());
+        let algorithm = [
+            TurnCommand::outer(Face::Right, RotationAmount::Clockwise),
+            TurnCommand::outer(Face::Up, RotationAmount::Clockwise),
+            TurnCommand::outer(Face::Right, RotationAmount::CounterClockwise),
+            TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise),
+        ];
+
+        for _ in 0..6 {
+            for turn in algorithm {
+                apply_turn_to_state(&mut state, turn).expect("turn should be valid");
+            }
+        }
+
+        assert_eq!(state, CubeState::solved(CubeOrder::standard()));
     }
 
     #[test]

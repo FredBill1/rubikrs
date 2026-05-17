@@ -7,6 +7,8 @@ edition.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+kewb = "0.4.3"
 rubik-core = { path = "../rubik-core" }
 serde.workspace = true
 serde_json.workspace = true

@@ -309,6 +309,20 @@ function parseTurnHistoryLength(raw: string): number {
   }
 }
 
+function parseScrambleSeed(raw: string | undefined): bigint {
+  const trimmed = raw?.trim()
+  if (!trimmed) {
+    return BigInt(Date.now())
+  }
+
+  try {
+    return BigInt(trimmed)
+  } catch (error) {
+    console.error(error)
+    return BigInt(Date.now())
+  }
+}
+
 function parseRuntimeStatus(raw: string): RuntimeStatus | null {
   try {
     return JSON.parse(raw) as RuntimeStatus
@@ -715,6 +729,73 @@ async function startSolve(module: RubikWasmModule): Promise<void> {
     return
   }
 
+  if (order === 3) {
+    updateSolverState(
+      'fallback solving',
+      `Depth ${maxDepth} search finished unsolved. Escalating to a Rust two-phase 3x3 fallback in a dedicated worker.`
+    )
+
+    let fallbackResult: SolveWorkerResponse
+    try {
+      fallbackResult = await runSolveLane(ensureSolverWorkers(1)[0], {
+        kind: 'solve',
+        requestId,
+        laneId: 0,
+        order,
+        stateJson,
+        targetDepth: 0,
+        allowedFaces: [],
+      })
+    } catch (error) {
+      if (activeSolveRequestId !== requestId) {
+        return
+      }
+
+      finishSolveSession()
+      terminateSolverWorkers()
+      updateSolverState('worker fault', error instanceof Error ? error.message : 'unknown 3x3 fallback failure')
+      return
+    }
+
+    if (activeSolveRequestId !== requestId) {
+      return
+    }
+
+    const sceneRevision = currentSceneRevision()
+    if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
+      finishSolveSession()
+      updateSolverState(
+        'stale result discarded',
+        'The cube state changed while the 3x3 fallback worker was searching, so the returned solution was ignored.'
+      )
+      return
+    }
+
+    if (fallbackResult.kind === 'solved') {
+      finishSolveSession()
+
+      const notation = fallbackResult.turns.map((turn) => turn.notation).join(' ')
+      for (const turn of fallbackResult.turns) {
+        module.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
+      }
+      syncStatus()
+
+      const suffix =
+        fallbackResult.turns.length > 0
+          ? ` Applied ${fallbackResult.turns.length} fallback turn(s)${notation ? `: ${notation}.` : '.'}`
+          : ' No turns were needed.'
+      updateSolverState('solved', `${fallbackResult.message}.${suffix}`)
+      return
+    }
+
+    if (fallbackResult.kind === 'error') {
+      finishSolveSession()
+      terminateSolverWorkers()
+      updateSolverState('worker error', fallbackResult.message)
+      return
+    }
+  }
+
   finishSolveSession()
   updateSolverState(
     'depth limit reached',
@@ -741,7 +822,7 @@ function bindShellControls(module: RubikWasmModule): void {
         case 'scramble': {
           cancelActiveSolve('Scrambling cancelled the in-flight solve request.')
           const length = Number.parseInt(scrambleLength?.value ?? '20', 10) || 20
-          const seed = Number.parseInt(scrambleSeed?.value ?? String(Date.now()), 10) || Date.now()
+          const seed = parseScrambleSeed(scrambleSeed?.value)
           module.scramble_cube(length, seed)
           break
         }

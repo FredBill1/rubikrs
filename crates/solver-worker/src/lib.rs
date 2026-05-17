@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::sync::OnceLock;
+
+use kewb::{CubieCube as KewbCubieCube, DataTable as KewbDataTable, FaceCube as KewbFaceCube, Move as KewbMove, Solver as KewbSolver};
 use rubik_core::{CubeState, Face, RotationAmount, StickerColor, TurnCommand, apply_turn_to_state_unchecked};
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +14,8 @@ use wasm_bindgen::prelude::wasm_bindgen;
 
 #[cfg(target_arch = "wasm32")]
 static PANIC_HOOK: Once = Once::new();
+
+static KEWB_DATA_TABLE: OnceLock<KewbDataTable> = OnceLock::new();
 
 const ROTATIONS: [RotationAmount; 3] = [
     RotationAmount::Clockwise,
@@ -124,6 +129,13 @@ fn solve_iterative(state_json: &str, max_depth: u8) -> SolveResponse {
         }
     }
 
+    if state.order.get() == 3 {
+        if let Some(mut response) = solve_three_phase_fallback(&state) {
+            response.explored = explored.saturating_add(response.explored);
+            return response;
+        }
+    }
+
     SolveResponse {
         kind: SolveOutcomeKind::Unsolved,
         turns: Vec::new(),
@@ -162,6 +174,16 @@ fn solve_request_str(request_json: &str) -> SolveResponse {
         }
     };
 
+    if request.target_depth == 0 && state.order.get() == 3 {
+        return solve_three_phase_fallback(&state).unwrap_or(SolveResponse {
+            kind: SolveOutcomeKind::Unsolved,
+            turns: Vec::new(),
+            explored: 0,
+            depth_limit: 0,
+            message: "two-phase fallback could not solve the current 3x3 state".to_string(),
+        });
+    }
+
     if let Some(response) = solve_with_recorded_history(
         &state,
         request.target_depth,
@@ -171,6 +193,84 @@ fn solve_request_str(request_json: &str) -> SolveResponse {
     }
 
     solve_exact_request(&state, request.target_depth, &request.allowed_faces)
+}
+
+fn solve_three_phase_fallback(state: &CubeState) -> Option<SolveResponse> {
+    if state.order.get() != 3 {
+        return None;
+    }
+
+    let facelet_string = cube_state_to_facelet_string(state)?;
+    let face_cube = KewbFaceCube::try_from(facelet_string.as_str()).ok()?;
+    let cubie = KewbCubieCube::try_from(&face_cube).ok()?;
+    let mut solver = KewbSolver::new(kewb_data_table(), 23, None);
+    let solution = solver.solve(cubie)?;
+    let moves = solution.get_all_moves();
+
+    Some(SolveResponse {
+        kind: SolveOutcomeKind::Solved,
+        turns: moves
+            .iter()
+            .copied()
+            .filter_map(kewb_move_to_turn)
+            .map(encode_turn)
+            .collect(),
+        explored: 0,
+        depth_limit: 23,
+        message: format!(
+            "two-phase fallback found a {}-move 3x3 solution",
+            moves.len()
+        ),
+    })
+}
+
+fn kewb_data_table() -> &'static KewbDataTable {
+    KEWB_DATA_TABLE.get_or_init(KewbDataTable::default)
+}
+
+fn cube_state_to_facelet_string(state: &CubeState) -> Option<String> {
+    if state.order.get() != 3 || state.stickers.len() != 54 {
+        return None;
+    }
+
+    let mut output = String::with_capacity(54);
+    for color in &state.stickers {
+        output.push(match color {
+            StickerColor::White => 'U',
+            StickerColor::Red => 'R',
+            StickerColor::Green => 'F',
+            StickerColor::Yellow => 'D',
+            StickerColor::Orange => 'L',
+            StickerColor::Blue => 'B',
+        });
+    }
+
+    Some(output)
+}
+
+fn kewb_move_to_turn(m: KewbMove) -> Option<TurnCommand> {
+    let turn = match m {
+        KewbMove::U => TurnCommand::outer(Face::Up, RotationAmount::Clockwise),
+        KewbMove::U2 => TurnCommand::outer(Face::Up, RotationAmount::HalfTurn),
+        KewbMove::U3 => TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise),
+        KewbMove::D => TurnCommand::outer(Face::Down, RotationAmount::Clockwise),
+        KewbMove::D2 => TurnCommand::outer(Face::Down, RotationAmount::HalfTurn),
+        KewbMove::D3 => TurnCommand::outer(Face::Down, RotationAmount::CounterClockwise),
+        KewbMove::R => TurnCommand::outer(Face::Right, RotationAmount::Clockwise),
+        KewbMove::R2 => TurnCommand::outer(Face::Right, RotationAmount::HalfTurn),
+        KewbMove::R3 => TurnCommand::outer(Face::Right, RotationAmount::CounterClockwise),
+        KewbMove::L => TurnCommand::outer(Face::Left, RotationAmount::Clockwise),
+        KewbMove::L2 => TurnCommand::outer(Face::Left, RotationAmount::HalfTurn),
+        KewbMove::L3 => TurnCommand::outer(Face::Left, RotationAmount::CounterClockwise),
+        KewbMove::F => TurnCommand::outer(Face::Front, RotationAmount::Clockwise),
+        KewbMove::F2 => TurnCommand::outer(Face::Front, RotationAmount::HalfTurn),
+        KewbMove::F3 => TurnCommand::outer(Face::Front, RotationAmount::CounterClockwise),
+        KewbMove::B => TurnCommand::outer(Face::Back, RotationAmount::Clockwise),
+        KewbMove::B2 => TurnCommand::outer(Face::Back, RotationAmount::HalfTurn),
+        KewbMove::B3 => TurnCommand::outer(Face::Back, RotationAmount::CounterClockwise),
+    };
+
+    Some(turn)
 }
 
 fn solve_with_recorded_history(
@@ -484,7 +584,11 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
-    use super::{SolveOutcomeKind, SolveRequest, SolveResponse, solve_request_json, solve_state_json};
+    use super::{
+        KewbCubieCube, KewbFaceCube, KewbMove, ROTATIONS, SolveOutcomeKind, SolveRequest,
+        SolveResponse, cube_state_to_facelet_string, kewb_move_to_turn, solve_request_json,
+        solve_request_str, solve_state_json,
+    };
     use rubik_core::{Face, RotationAmount, TurnCommand, apply_turn_to_state};
 
     #[test]
@@ -597,6 +701,174 @@ mod tests {
         assert_eq!(response.turns[0].rotation_code, 0);
         assert_eq!(response.turns[1].notation, "U2");
         assert_eq!(response.turns[2].notation, "F'");
+    }
+
+    #[test]
+    fn target_depth_zero_uses_two_phase_fallback_for_3x3() {
+        let mut state = rubik_core::CubeState::solved(rubik_core::CubeOrder::standard());
+        for turn in [
+            TurnCommand::outer(Face::Front, RotationAmount::Clockwise),
+            TurnCommand::outer(Face::Right, RotationAmount::HalfTurn),
+            TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise),
+            TurnCommand::outer(Face::Left, RotationAmount::Clockwise),
+            TurnCommand::outer(Face::Down, RotationAmount::HalfTurn),
+            TurnCommand::outer(Face::Back, RotationAmount::CounterClockwise),
+            TurnCommand::outer(Face::Front, RotationAmount::HalfTurn),
+            TurnCommand::outer(Face::Right, RotationAmount::Clockwise),
+        ] {
+            apply_turn_to_state(&mut state, turn).expect("turn should be valid");
+        }
+
+        let request = SolveRequest {
+            state_json: state.to_json().expect("state json"),
+            target_depth: 0,
+            allowed_faces: vec![],
+            turn_history_json: None,
+        };
+        let response: SolveResponse =
+            serde_json::from_str(&solve_request_json(&serde_json::to_string(&request).unwrap()))
+                .expect("response json");
+
+        assert!(matches!(response.kind, SolveOutcomeKind::Solved));
+        assert!(!response.turns.is_empty());
+        assert!(response.message.contains("two-phase"));
+    }
+
+    #[test]
+    fn multi_turn_three_by_three_state_still_maps_to_a_solvable_kewb_cubie() {
+        let mut state = rubik_core::CubeState::solved(rubik_core::CubeOrder::standard());
+        for turn in [
+            TurnCommand::outer(Face::Front, RotationAmount::Clockwise),
+            TurnCommand::outer(Face::Right, RotationAmount::HalfTurn),
+            TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise),
+            TurnCommand::outer(Face::Left, RotationAmount::Clockwise),
+            TurnCommand::outer(Face::Down, RotationAmount::HalfTurn),
+            TurnCommand::outer(Face::Back, RotationAmount::CounterClockwise),
+            TurnCommand::outer(Face::Front, RotationAmount::HalfTurn),
+            TurnCommand::outer(Face::Right, RotationAmount::Clockwise),
+        ] {
+            apply_turn_to_state(&mut state, turn).expect("turn should be valid");
+        }
+
+        let facelet_string = cube_state_to_facelet_string(&state).expect("3x3 export should succeed");
+        let face_cube =
+            KewbFaceCube::try_from(facelet_string.as_str()).expect("facelet string should parse");
+        let cubie = KewbCubieCube::try_from(&face_cube)
+            .expect("multi-turn exported state should stay solvable as a cubie");
+
+        assert!(cubie.is_solvable());
+    }
+
+    #[test]
+    fn every_two_turn_three_by_three_state_maps_to_a_solvable_kewb_cubie() {
+        for first_face in Face::ALL {
+            for first_rotation in ROTATIONS {
+                for second_face in Face::ALL {
+                    for second_rotation in ROTATIONS {
+                        let mut state =
+                            rubik_core::CubeState::solved(rubik_core::CubeOrder::standard());
+                        let turns = [
+                            TurnCommand::outer(first_face, first_rotation),
+                            TurnCommand::outer(second_face, second_rotation),
+                        ];
+
+                        for turn in turns {
+                            apply_turn_to_state(&mut state, turn).expect("turn should be valid");
+                        }
+
+                        let facelet_string =
+                            cube_state_to_facelet_string(&state).expect("3x3 export should succeed");
+                        let face_cube = KewbFaceCube::try_from(facelet_string.as_str())
+                            .expect("facelet string should parse");
+                        let cubie = KewbCubieCube::try_from(&face_cube).unwrap_or_else(|error| {
+                            panic!(
+                                "two-turn sequence {:?} {:?} then {:?} {:?} became invalid: {error:?}",
+                                first_face, first_rotation, second_face, second_rotation
+                            )
+                        });
+
+                        assert!(
+                            cubie.is_solvable(),
+                            "two-turn sequence {:?} {:?} then {:?} {:?} became unsolvable",
+                            first_face,
+                            first_rotation,
+                            second_face,
+                            second_rotation
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kewb_moves_match_rubik_core_facelet_exports() {
+        let moves = [
+            KewbMove::U,
+            KewbMove::U2,
+            KewbMove::U3,
+            KewbMove::D,
+            KewbMove::D2,
+            KewbMove::D3,
+            KewbMove::R,
+            KewbMove::R2,
+            KewbMove::R3,
+            KewbMove::L,
+            KewbMove::L2,
+            KewbMove::L3,
+            KewbMove::F,
+            KewbMove::F2,
+            KewbMove::F3,
+            KewbMove::B,
+            KewbMove::B2,
+            KewbMove::B3,
+        ];
+
+        for move_name in moves {
+            let expected = KewbFaceCube::try_from(&KewbCubieCube::default().apply_move(move_name))
+                .expect("kewb move should stay valid")
+                .to_string();
+            let mut actual_state = rubik_core::CubeState::solved(rubik_core::CubeOrder::standard());
+            let mapped_turn = kewb_move_to_turn(move_name).expect("move should map to a turn");
+            apply_turn_to_state(&mut actual_state, mapped_turn).expect("mapped turn should apply");
+            let actual =
+                cube_state_to_facelet_string(&actual_state).expect("3x3 export should succeed");
+
+            assert_eq!(
+                actual, expected,
+                "kewb move {move_name:?} did not match the exported facelet string"
+            );
+        }
+    }
+
+    #[test]
+    fn two_phase_fallback_accepts_single_turn_states_on_every_face() {
+        for face in Face::ALL {
+            let mut state = rubik_core::CubeState::solved(rubik_core::CubeOrder::standard());
+            apply_turn_to_state(
+                &mut state,
+                TurnCommand::outer(face, RotationAmount::Clockwise),
+            )
+            .expect("turn should be valid");
+
+            let response = solve_request_str(
+                &serde_json::to_string(&SolveRequest {
+                    state_json: state.to_json().expect("state should serialize"),
+                    target_depth: 0,
+                    allowed_faces: Vec::new(),
+                    turn_history_json: None,
+                })
+                .expect("request should serialize"),
+            );
+
+            assert!(
+                matches!(response.kind, SolveOutcomeKind::Solved),
+                "expected {face:?} single-turn state to be solvable via fallback, got {:?}: {}",
+                response.kind,
+                response.message
+            );
+            assert!(!response.turns.is_empty(), "{face:?} should produce at least one turn");
+        }
     }
 
     #[test]

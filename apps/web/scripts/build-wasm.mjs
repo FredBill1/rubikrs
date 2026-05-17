@@ -20,10 +20,17 @@ const crates = [
 let exitCode = 0
 
 for (const { crateDir, outDir, outName } of crates) {
+  const rustFlags = [process.env.RUSTFLAGS, '--cfg getrandom_backend="wasm_js"']
+    .filter(Boolean)
+    .join(' ')
   const result = spawnSync(
     'wasm-pack',
     ['build', crateDir, '--target', 'web', '--out-dir', outDir, '--out-name', outName, buildMode],
     {
+      env: {
+        ...process.env,
+        RUSTFLAGS: rustFlags,
+      },
       stdio: 'inherit',
       shell: process.platform === 'win32',
     }
