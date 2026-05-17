@@ -365,7 +365,20 @@ function syncStatus(): void {
     return
   }
 
-  renderRuntimeStatus(parseRuntimeStatus(runtime.runtime_status_json()))
+  const status = parseRuntimeStatus(runtime.runtime_status_json())
+  if (!status) {
+    return
+  }
+
+  if (
+    activeSolveRequestId !== null &&
+    activeSolveSceneRevision !== null &&
+    status.scene_revision !== activeSolveSceneRevision
+  ) {
+    cancelActiveSolve('Direct runtime input changed the cube state and cancelled the in-flight solve request.')
+  }
+
+  renderRuntimeStatus(status)
 }
 
 function updateBootState(tone: BootTone, label: string, detail: string): void {
