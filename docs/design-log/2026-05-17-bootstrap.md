@@ -21,6 +21,7 @@
 - Use a tiny set of curated isometric orbit snap targets rather than full free-camera quantization; this keeps mouse/touch orbit feeling loose during drag but still lets release settle back onto readable three-face compositions.
 - For non-3x3 states generated inside the current session, expose the full Rust turn history to the solver worker and let the worker replay the inverse history as a feasible async solve path; this preserves the canonical state schema while giving NxN a deterministic fallback before a real reduction solver lands.
 - Keep keyboard cube turns Rust-native and scale them with simple modifiers instead of duplicating NxN turn logic in TypeScript: digit keys select the starting layer, `Alt` widens the turn to two layers, `Shift` flips direction, and `Ctrl` keeps the half-turn override.
+- Reuse the same `start_layer` / `width` turn contract in the DOM button shell so touch users can still reach inner and wide NxN turns even before direct canvas picking exists.
 
 ## Next risks to validate
 

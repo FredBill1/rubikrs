@@ -188,6 +188,17 @@ app.innerHTML = `
               <button type="button" data-action="scramble">scramble</button>
             </div>
 
+            <div class="action-row action-row--stacked">
+              <label class="field">
+                <span>turn layer</span>
+                <input data-turn-layer type="number" min="1" max="17" value="1" />
+              </label>
+              <label class="field">
+                <span>wide x2</span>
+                <input data-turn-wide type="checkbox" />
+              </label>
+            </div>
+
             <div class="turn-grid">
               <button type="button" data-turn="0:0">U</button>
               <button type="button" data-turn="1:0">R</button>
@@ -263,6 +274,8 @@ const bootDetail = document.querySelector<HTMLElement>('[data-boot-detail]')
 const orderSelect = document.querySelector<HTMLSelectElement>('[data-order-select]')
 const scrambleLength = document.querySelector<HTMLInputElement>('[data-scramble-length]')
 const scrambleSeed = document.querySelector<HTMLInputElement>('[data-scramble-seed]')
+const turnLayer = document.querySelector<HTMLInputElement>('[data-turn-layer]')
+const turnWide = document.querySelector<HTMLInputElement>('[data-turn-wide]')
 const solveDepth = document.querySelector<HTMLInputElement>('[data-solve-depth]')
 const importArea = document.querySelector<HTMLTextAreaElement>('[data-import-area]')
 const importFile = document.querySelector<HTMLInputElement>('[data-import-file]')
@@ -370,6 +383,32 @@ function solveDepthCap(order: number): number {
   return 4
 }
 
+function currentTurnSelection(order: number): { startLayer: number; width: number } {
+  const requestedLayer = Math.min(order, Math.max(1, Number.parseInt(turnLayer?.value ?? '1', 10) || 1))
+  if (turnLayer) {
+    turnLayer.value = String(requestedLayer)
+  }
+
+  const startLayer = requestedLayer - 1
+  const width = turnWide?.checked && requestedLayer < order ? 2 : 1
+  return { startLayer, width }
+}
+
+function syncTurnControls(order: number): void {
+  if (turnLayer) {
+    turnLayer.max = String(order)
+    const requestedLayer = Math.min(order, Math.max(1, Number.parseInt(turnLayer.value || '1', 10) || 1))
+    turnLayer.value = String(requestedLayer)
+  }
+
+  if (turnWide) {
+    turnWide.disabled = order < 3
+    if (order < 3) {
+      turnWide.checked = false
+    }
+  }
+}
+
 function syncSolveControls(): void {
   const order = Number.parseInt(orderSelect?.value ?? '3', 10) || 3
   const cap = solveDepthCap(order)
@@ -389,6 +428,8 @@ function syncSolveControls(): void {
   if (cancelSolveButton) {
     cancelSolveButton.disabled = !busy
   }
+
+  syncTurnControls(order)
 }
 
 function currentSceneRevision(): number | null {
@@ -747,8 +788,10 @@ function bindShellControls(module: RubikWasmModule): void {
       }
 
       const [faceCode, rotationCode] = encoded.split(':').map((value) => Number.parseInt(value, 10))
+      const order = Number.parseInt(orderSelect?.value ?? '3', 10) || 3
+      const { startLayer, width } = currentTurnSelection(order)
       cancelActiveSolve('Manual turns cancelled the in-flight solve request.')
-      module.apply_turn(faceCode, rotationCode, 0, 1)
+      module.apply_turn(faceCode, rotationCode, startLayer, width)
       syncStatus()
     })
   }
