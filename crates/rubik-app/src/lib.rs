@@ -156,11 +156,16 @@ struct ScreenStickerCandidate {
     corners: [Vec2; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CubeSurfaceHit {
+    face: Face,
+    point: Vec3,
+}
+
 const CUBE_FACE_SPAN: f32 = 1.9;
 const POINTER_TAP_MAX_DRAG_PX: f32 = 8.0;
-const FACE_TAP_VISIBILITY_THRESHOLD: f32 = 0.18;
 const FACE_TAP_RADIUS_SCALE: f32 = 0.7;
-const STICKER_GAP_HIT_TOLERANCE_PX: f32 = 4.0;
+const VIRTUAL_SURFACE_INSET: f32 = 0.03;
 
 impl Default for OrbitRig {
     fn default() -> Self {
@@ -1075,144 +1080,14 @@ fn apply_camera_transform(
     *transform = Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y);
 }
 
-fn projected_sticker_candidates(
-    camera: &Camera,
-    camera_transform: &GlobalTransform,
-    order: u8,
-) -> Vec<ScreenStickerCandidate> {
-    let face_offset = cube_face_offset(order);
-    let camera_forward = camera_transform.forward().as_vec3();
-    let face_span = CUBE_FACE_SPAN;
-    let step = face_span / order.max(1) as f32;
-    let half_sticker = step * 0.42;
-    let mut candidates = Vec::with_capacity(Face::ALL.len() * usize::from(order) * usize::from(order));
-
-    for face in Face::ALL {
-        let visibility = face_outward_normal(face).dot(-camera_forward);
-        if visibility <= FACE_TAP_VISIBILITY_THRESHOLD {
-            continue;
-        }
-
-        for row in 0..usize::from(order) {
-            for col in 0..usize::from(order) {
-                let cubie = sticker_cubie_coord(face, row, col, usize::from(order));
-                let col_axis = sticker_col_direction(face);
-                let row_axis = sticker_row_direction(face);
-                let (world_center, _) =
-                    sticker_world_transform(face, row, col, usize::from(order), face_span, face_offset);
-                let projected_center = match camera.world_to_viewport(camera_transform, world_center) {
-                    Ok(position) => position,
-                    Err(_) => continue,
-                };
-                let projected_col_axis = match camera.world_to_viewport(
-                    camera_transform,
-                    world_center + col_axis * half_sticker,
-                ) {
-                    Ok(position) => position - projected_center,
-                    Err(_) => continue,
-                };
-                let projected_row_axis = match camera.world_to_viewport(
-                    camera_transform,
-                    world_center + row_axis * half_sticker,
-                ) {
-                    Ok(position) => position - projected_center,
-                    Err(_) => continue,
-                };
-                if projected_col_axis.length_squared() <= f32::EPSILON
-                    || projected_row_axis.length_squared() <= f32::EPSILON
-                {
-                    continue;
-                }
-
-                let projected_corners = [
-                    camera
-                        .world_to_viewport(
-                            camera_transform,
-                            world_center - (col_axis * half_sticker) - (row_axis * half_sticker),
-                        )
-                        .ok(),
-                    camera
-                        .world_to_viewport(
-                            camera_transform,
-                            world_center + (col_axis * half_sticker) - (row_axis * half_sticker),
-                        )
-                        .ok(),
-                    camera
-                        .world_to_viewport(
-                            camera_transform,
-                            world_center + (col_axis * half_sticker) + (row_axis * half_sticker),
-                        )
-                        .ok(),
-                    camera
-                        .world_to_viewport(
-                            camera_transform,
-                            world_center - (col_axis * half_sticker) + (row_axis * half_sticker),
-                        )
-                        .ok(),
-                ];
-                if projected_corners.iter().any(Option::is_none) {
-                    continue;
-                }
-
-                let projected_corners =
-                    projected_corners.map(|corner| corner.expect("checked sticker corner projection"));
-                let radius = projected_center.distance(projected_corners[0]) * FACE_TAP_RADIUS_SCALE;
-                if radius <= f32::EPSILON {
-                    continue;
-                }
-
-                candidates.push(ScreenStickerCandidate {
-                    face,
-                    row,
-                    col,
-                    cubie,
-                    world_center,
-                    center: projected_center,
-                    radius,
-                    projected_col_axis: projected_col_axis.normalize(),
-                    projected_row_axis: projected_row_axis.normalize(),
-                    col_axis,
-                    row_axis,
-                    corners: projected_corners,
-                });
-            }
-        }
-    }
-
-    candidates
-}
-
 fn projected_sticker_hit(
     camera: &Camera,
     camera_transform: &GlobalTransform,
     order: u8,
     pointer_position: Vec2,
 ) -> Option<ScreenStickerCandidate> {
-    let candidates = projected_sticker_candidates(camera, camera_transform, order);
-    pick_sticker_candidate(pointer_position, &candidates)
-}
-
-fn pick_sticker_candidate(
-    pointer_position: Vec2,
-    candidates: &[ScreenStickerCandidate],
-) -> Option<ScreenStickerCandidate> {
-    candidates
-        .iter()
-        .filter_map(|candidate| {
-            let distance = candidate.center.distance(pointer_position);
-            let gap_distance = if sticker_candidate_contains_point(*candidate, pointer_position) {
-                0.0
-            } else {
-                sticker_candidate_gap_distance(*candidate, pointer_position)
-            };
-            (gap_distance <= STICKER_GAP_HIT_TOLERANCE_PX).then_some((gap_distance, distance, *candidate))
-        })
-        .min_by(|left, right| {
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.total_cmp(&right.1))
-        })
-        .map(|(_, _, candidate)| candidate)
+    let surface_hit = cube_surface_hit(camera, camera_transform, order, pointer_position)?;
+    surface_hit_candidate(camera, camera_transform, order, surface_hit)
 }
 
 fn slice_turn_from_sticker_drag(
@@ -1273,48 +1148,186 @@ fn slice_face_from_sticker_drag(candidate: ScreenStickerCandidate, drag: Vec2) -
     axis_face(selected_axis)
 }
 
-fn sticker_candidate_contains_point(candidate: ScreenStickerCandidate, point: Vec2) -> bool {
-    let mut winding_sign = 0.0_f32;
-    for index in 0..candidate.corners.len() {
-        let current = candidate.corners[index];
-        let next = candidate.corners[(index + 1) % candidate.corners.len()];
-        let edge = next - current;
-        let offset = point - current;
-        let cross = edge.x * offset.y - edge.y * offset.x;
-        if cross.abs() <= 0.5 {
+fn cube_surface_hit(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    order: u8,
+    pointer_position: Vec2,
+) -> Option<CubeSurfaceHit> {
+    let ray = camera.viewport_to_world(camera_transform, pointer_position).ok()?;
+    cube_surface_hit_from_ray(
+        ray.origin,
+        ray.direction.as_vec3(),
+        virtual_cube_half_extent(order),
+    )
+}
+
+fn cube_surface_hit_from_ray(origin: Vec3, direction: Vec3, half_extent: f32) -> Option<CubeSurfaceHit> {
+    let axes = [
+        (origin.x, direction.x, Vec3::X),
+        (origin.y, direction.y, Vec3::Y),
+        (origin.z, direction.z, Vec3::Z),
+    ];
+    let mut near = f32::NEG_INFINITY;
+    let mut far = f32::INFINITY;
+    let mut hit_normal = None;
+
+    for (axis_origin, axis_direction, axis_vector) in axes {
+        if axis_direction.abs() <= f32::EPSILON {
+            if axis_origin.abs() > half_extent {
+                return None;
+            }
             continue;
         }
 
-        if winding_sign == 0.0 {
-            winding_sign = cross.signum();
-        } else if cross.signum() != winding_sign {
-            return false;
+        let inverse_direction = 1.0 / axis_direction;
+        let mut enter = (-half_extent - axis_origin) * inverse_direction;
+        let mut exit = (half_extent - axis_origin) * inverse_direction;
+        let mut enter_normal = -axis_vector;
+        if enter > exit {
+            std::mem::swap(&mut enter, &mut exit);
+            enter_normal = axis_vector;
+        }
+
+        if enter > near {
+            near = enter;
+            hit_normal = Some(enter_normal);
+        }
+        far = far.min(exit);
+        if near > far {
+            return None;
         }
     }
 
-    true
-}
-
-fn sticker_candidate_gap_distance(candidate: ScreenStickerCandidate, point: Vec2) -> f32 {
-    (0..candidate.corners.len())
-        .map(|index| {
-            let current = candidate.corners[index];
-            let next = candidate.corners[(index + 1) % candidate.corners.len()];
-            point_segment_distance(point, current, next)
-        })
-        .fold(f32::INFINITY, f32::min)
-}
-
-fn point_segment_distance(point: Vec2, start: Vec2, end: Vec2) -> f32 {
-    let segment = end - start;
-    let segment_length_squared = segment.length_squared();
-    if segment_length_squared <= f32::EPSILON {
-        return point.distance(start);
+    if far < 0.0 {
+        return None;
     }
 
-    let projection = ((point - start).dot(segment) / segment_length_squared).clamp(0.0, 1.0);
-    let closest = start + (segment * projection);
-    point.distance(closest)
+    let distance = if near >= 0.0 { near } else { far };
+    let point = origin + (direction * distance);
+    let face = axis_face(hit_normal?)?;
+    Some(CubeSurfaceHit { face, point })
+}
+
+fn surface_hit_candidate(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    order: u8,
+    surface_hit: CubeSurfaceHit,
+) -> Option<ScreenStickerCandidate> {
+    let order_usize = usize::from(order);
+    let half_extent = virtual_cube_half_extent(order);
+    let surface_span = half_extent * 2.0;
+    let row = surface_axis_index(surface_hit.face, surface_hit.point, order_usize, surface_span, true);
+    let col = surface_axis_index(surface_hit.face, surface_hit.point, order_usize, surface_span, false);
+    let cubie = sticker_cubie_coord(surface_hit.face, row, col, order_usize);
+    let world_center = virtual_surface_center(surface_hit.face, row, col, order_usize, surface_span, half_extent);
+    let projected_center = camera.world_to_viewport(camera_transform, world_center).ok()?;
+    let half_cell = surface_span / order.max(1) as f32 * 0.5;
+    let col_axis = sticker_col_direction(surface_hit.face);
+    let row_axis = sticker_row_direction(surface_hit.face);
+    let projected_col_axis = camera
+        .world_to_viewport(camera_transform, world_center + col_axis * half_cell)
+        .ok()?
+        - projected_center;
+    let projected_row_axis = camera
+        .world_to_viewport(camera_transform, world_center + row_axis * half_cell)
+        .ok()?
+        - projected_center;
+    if projected_col_axis.length_squared() <= f32::EPSILON
+        || projected_row_axis.length_squared() <= f32::EPSILON
+    {
+        return None;
+    }
+
+    let projected_corners = [
+        camera
+            .world_to_viewport(
+                camera_transform,
+                world_center - (col_axis * half_cell) - (row_axis * half_cell),
+            )
+            .ok(),
+        camera
+            .world_to_viewport(
+                camera_transform,
+                world_center + (col_axis * half_cell) - (row_axis * half_cell),
+            )
+            .ok(),
+        camera
+            .world_to_viewport(
+                camera_transform,
+                world_center + (col_axis * half_cell) + (row_axis * half_cell),
+            )
+            .ok(),
+        camera
+            .world_to_viewport(
+                camera_transform,
+                world_center - (col_axis * half_cell) + (row_axis * half_cell),
+            )
+            .ok(),
+    ];
+    if projected_corners.iter().any(Option::is_none) {
+        return None;
+    }
+
+    let projected_corners = projected_corners.map(|corner| corner.expect("checked projected surface corner"));
+    let radius = projected_center.distance(projected_corners[0]) * FACE_TAP_RADIUS_SCALE;
+    if radius <= f32::EPSILON {
+        return None;
+    }
+
+    Some(ScreenStickerCandidate {
+        face: surface_hit.face,
+        row,
+        col,
+        cubie,
+        world_center,
+        center: projected_center,
+        radius,
+        projected_col_axis: projected_col_axis.normalize(),
+        projected_row_axis: projected_row_axis.normalize(),
+        col_axis,
+        row_axis,
+        corners: projected_corners,
+    })
+}
+
+fn virtual_cube_half_extent(order: u8) -> f32 {
+    cube_face_offset(order) - VIRTUAL_SURFACE_INSET
+}
+
+fn surface_axis_index(face: Face, point: Vec3, order: usize, surface_span: f32, is_row: bool) -> usize {
+    let axis = if is_row {
+        sticker_row_direction(face)
+    } else {
+        sticker_col_direction(face)
+    };
+    let step = surface_span / order.max(1) as f32;
+    let local = (point.dot(axis) + (surface_span * 0.5)) / step;
+    local.floor().clamp(0.0, order.saturating_sub(1) as f32) as usize
+}
+
+fn virtual_surface_center(
+    face: Face,
+    row: usize,
+    col: usize,
+    order: usize,
+    surface_span: f32,
+    half_extent: f32,
+) -> Vec3 {
+    let cubie = sticker_cubie_coord(face, row, col, order);
+    let mut center = cubie_body_translation(cubie, order, surface_span);
+
+    match face {
+        Face::Front => center.z = half_extent,
+        Face::Back => center.z = -half_extent,
+        Face::Up => center.y = half_extent,
+        Face::Down => center.y = -half_extent,
+        Face::Right => center.x = half_extent,
+        Face::Left => center.x = -half_extent,
+    }
+
+    center
 }
 
 fn axis_face(axis: Vec3) -> Option<Face> {
@@ -1375,6 +1388,7 @@ fn cube_face_offset(order: u8) -> f32 {
     cube_size / 2.0 + 0.03
 }
 
+#[cfg(test)]
 fn face_outward_normal(face: Face) -> Vec3 {
     match face {
         Face::Up => Vec3::Y,
@@ -1789,11 +1803,11 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeBridge, ScreenStickerCandidate, cubie_matches_turn, decode_face, decode_rotation,
-        face_outward_normal, format_turn, keyboard_shortcut_turn, nearest_orbit_snap,
-        normalize_base_path, normalize_canvas_selector, pick_sticker_candidate, reset_cube,
-        slice_face_from_sticker_drag, slice_start_layer, sticker_candidate_contains_point,
-        sticker_rotation, turn_rotation_angle,
+        RuntimeBridge, ScreenStickerCandidate, cube_surface_hit_from_ray, cubie_matches_turn,
+        decode_face, decode_rotation, face_outward_normal, format_turn, keyboard_shortcut_turn,
+        nearest_orbit_snap, normalize_base_path, normalize_canvas_selector, reset_cube,
+        slice_face_from_sticker_drag, slice_start_layer, sticker_rotation, surface_axis_index,
+        turn_rotation_angle, virtual_cube_half_extent, virtual_surface_center,
     };
     use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
     use bevy::prelude::{UVec3, Vec2, Vec3};
@@ -1971,185 +1985,47 @@ mod tests {
     }
 
     #[test]
-    fn pick_sticker_candidate_prefers_the_closest_matching_face() {
-        let selected = pick_sticker_candidate(
-            Vec2::new(104.0, 96.0),
-            &[
-                ScreenStickerCandidate {
-                    face: Face::Front,
-                    row: 0,
-                    col: 0,
-                    cubie: UVec3::new(1, 1, 2),
-                    world_center: Vec3::new(0.0, 0.0, 1.0),
-                    center: Vec2::new(100.0, 100.0),
-                    radius: 18.0,
-                    projected_col_axis: Vec2::X,
-                    projected_row_axis: Vec2::NEG_Y,
-                    col_axis: Vec3::X,
-                    row_axis: -Vec3::Y,
-                    corners: [
-                        Vec2::new(82.0, 82.0),
-                        Vec2::new(118.0, 82.0),
-                        Vec2::new(118.0, 118.0),
-                        Vec2::new(82.0, 118.0),
-                    ],
-                },
-                ScreenStickerCandidate {
-                    face: Face::Right,
-                    row: 0,
-                    col: 0,
-                    cubie: UVec3::new(2, 1, 1),
-                    world_center: Vec3::new(1.0, 0.0, 0.0),
-                    center: Vec2::new(126.0, 98.0),
-                    radius: 18.0,
-                    projected_col_axis: Vec2::NEG_Y,
-                    projected_row_axis: Vec2::NEG_X,
-                    col_axis: -Vec3::Z,
-                    row_axis: -Vec3::Y,
-                    corners: [
-                        Vec2::new(108.0, 80.0),
-                        Vec2::new(144.0, 80.0),
-                        Vec2::new(144.0, 116.0),
-                        Vec2::new(108.0, 116.0),
-                    ],
-                },
-            ],
-        );
+    fn cube_surface_hit_reaches_the_front_face() {
+        let half_extent = virtual_cube_half_extent(3);
+        let hit = cube_surface_hit_from_ray(Vec3::new(0.0, 0.0, 6.0), Vec3::NEG_Z, half_extent)
+            .expect("front-facing ray should hit the virtual cube");
 
-        assert_eq!(selected.map(|candidate| candidate.face), Some(Face::Front));
+        assert_eq!(hit.face, Face::Front);
+        assert!((hit.point.z - half_extent).abs() < 0.0001);
     }
 
     #[test]
-    fn pick_sticker_candidate_rejects_pointers_outside_face_radius() {
-        let selected = pick_sticker_candidate(
-            Vec2::new(140.0, 140.0),
-            &[ScreenStickerCandidate {
-                face: Face::Front,
-                row: 0,
-                col: 0,
-                cubie: UVec3::new(1, 1, 2),
-                world_center: Vec3::new(0.0, 0.0, 1.0),
-                center: Vec2::new(100.0, 100.0),
-                radius: 16.0,
-                projected_col_axis: Vec2::X,
-                projected_row_axis: Vec2::NEG_Y,
-                col_axis: Vec3::X,
-                row_axis: -Vec3::Y,
-                corners: [
-                    Vec2::new(84.0, 84.0),
-                    Vec2::new(116.0, 84.0),
-                    Vec2::new(116.0, 116.0),
-                    Vec2::new(84.0, 116.0),
-                ],
-            }],
-        );
+    fn cube_surface_hit_rejects_blank_space_outside_the_cube_silhouette() {
+        let half_extent = virtual_cube_half_extent(3);
+        let hit = cube_surface_hit_from_ray(Vec3::new(3.0, 3.0, 6.0), Vec3::NEG_Z, half_extent);
 
-        assert_eq!(selected, None);
+        assert_eq!(hit, None);
     }
 
     #[test]
-    fn pick_sticker_candidate_uses_small_gap_tolerance_between_adjacent_stickers() {
-        let selected = pick_sticker_candidate(
-            Vec2::new(121.0, 100.0),
-            &[
-                ScreenStickerCandidate {
-                    face: Face::Front,
-                    row: 0,
-                    col: 0,
-                    cubie: UVec3::new(0, 1, 2),
-                    world_center: Vec3::new(-1.0, 0.0, 1.0),
-                    center: Vec2::new(100.0, 100.0),
-                    radius: 18.0,
-                    projected_col_axis: Vec2::X,
-                    projected_row_axis: Vec2::NEG_Y,
-                    col_axis: Vec3::X,
-                    row_axis: -Vec3::Y,
-                    corners: [
-                        Vec2::new(82.0, 82.0),
-                        Vec2::new(118.0, 82.0),
-                        Vec2::new(118.0, 118.0),
-                        Vec2::new(82.0, 118.0),
-                    ],
-                },
-                ScreenStickerCandidate {
-                    face: Face::Front,
-                    row: 0,
-                    col: 1,
-                    cubie: UVec3::new(1, 1, 2),
-                    world_center: Vec3::new(0.0, 0.0, 1.0),
-                    center: Vec2::new(140.0, 100.0),
-                    radius: 18.0,
-                    projected_col_axis: Vec2::X,
-                    projected_row_axis: Vec2::NEG_Y,
-                    col_axis: Vec3::X,
-                    row_axis: -Vec3::Y,
-                    corners: [
-                        Vec2::new(122.0, 82.0),
-                        Vec2::new(158.0, 82.0),
-                        Vec2::new(158.0, 118.0),
-                        Vec2::new(122.0, 118.0),
-                    ],
-                },
-            ],
-        );
+    fn virtual_surface_maps_front_face_seams_to_a_real_cubie() {
+        let half_extent = virtual_cube_half_extent(3);
+        let surface_span = half_extent * 2.0;
+        let point = Vec3::new(0.0, 0.0, half_extent);
 
-        assert_eq!(selected.map(|candidate| (candidate.face, candidate.col)), Some((Face::Front, 1)));
+        let row = surface_axis_index(Face::Front, point, 3, surface_span, true);
+        let col = surface_axis_index(Face::Front, point, 3, surface_span, false);
+        let center = virtual_surface_center(Face::Front, row, col, 3, surface_span, half_extent);
+
+        assert_eq!((row, col), (1, 1));
+        assert!(center.abs_diff_eq(Vec3::new(0.0, 0.0, half_extent), 0.0001));
     }
 
     #[test]
-    fn pick_sticker_candidate_keeps_orbit_space_outside_gap_tolerance() {
-        let selected = pick_sticker_candidate(
-            Vec2::new(122.0, 100.0),
-            &[ScreenStickerCandidate {
-                face: Face::Front,
-                row: 0,
-                col: 0,
-                cubie: UVec3::new(1, 1, 2),
-                world_center: Vec3::new(0.0, 0.0, 1.0),
-                center: Vec2::new(100.0, 100.0),
-                radius: 18.0,
-                projected_col_axis: Vec2::X,
-                projected_row_axis: Vec2::NEG_Y,
-                col_axis: Vec3::X,
-                row_axis: -Vec3::Y,
-                corners: [
-                    Vec2::new(84.0, 84.0),
-                    Vec2::new(116.0, 84.0),
-                    Vec2::new(116.0, 116.0),
-                    Vec2::new(84.0, 116.0),
-                ],
-            }],
-        );
+    fn virtual_surface_clamps_front_face_edges_to_outer_cubies() {
+        let half_extent = virtual_cube_half_extent(3);
+        let surface_span = half_extent * 2.0;
+        let point = Vec3::new(-half_extent + 0.001, half_extent - 0.001, half_extent);
 
-        assert_eq!(selected, None);
-    }
+        let row = surface_axis_index(Face::Front, point, 3, surface_span, true);
+        let col = surface_axis_index(Face::Front, point, 3, surface_span, false);
 
-    #[test]
-    fn projected_quad_rejects_points_that_only_match_the_old_circle_hitbox() {
-        let candidate = ScreenStickerCandidate {
-            face: Face::Up,
-            row: 0,
-            col: 0,
-            cubie: UVec3::new(1, 2, 1),
-            world_center: Vec3::new(0.0, 1.0, 0.0),
-            center: Vec2::new(100.0, 100.0),
-            radius: 28.0,
-            projected_col_axis: Vec2::X,
-            projected_row_axis: Vec2::Y,
-            col_axis: Vec3::X,
-            row_axis: Vec3::Z,
-            corners: [
-                Vec2::new(100.0, 70.0),
-                Vec2::new(130.0, 100.0),
-                Vec2::new(100.0, 130.0),
-                Vec2::new(70.0, 100.0),
-            ],
-        };
-        let off_corner_point = Vec2::new(118.0, 82.0);
-
-        assert!(candidate.center.distance(off_corner_point) < candidate.radius);
-        assert!(!sticker_candidate_contains_point(candidate, off_corner_point));
-        assert_eq!(pick_sticker_candidate(off_corner_point, &[candidate]), None);
+        assert_eq!((row, col), (0, 0));
     }
 
 }
