@@ -2,12 +2,13 @@
 
 use std::{
     cell::RefCell,
+    collections::BTreeSet,
 };
 
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     input::{
-        mouse::{MouseMotion, MouseWheel},
+        mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
         touch::Touches,
     },
     prelude::*,
@@ -58,9 +59,8 @@ struct OrbitRig {
 
 #[derive(Resource, Default)]
 struct DirectTurnInputState {
-    mouse_candidate: Option<PointerTapCandidate>,
-    touch_candidate: Option<TouchTapCandidate>,
-    queued_tap: Option<QueuedFaceTap>,
+    mouse_candidate: Option<PointerGestureCandidate>,
+    touch_candidate: Option<TouchGestureCandidate>,
     queued_turn: Option<TurnCommand>,
 }
 
@@ -126,32 +126,33 @@ struct ActiveTurnAnimation {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PointerTapCandidate {
+struct PointerGestureCandidate {
     start_position: Vec2,
     max_distance: f32,
-    face_candidate: Option<ScreenFaceCandidate>,
+    sticker_candidate: Option<ScreenStickerCandidate>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct TouchTapCandidate {
+struct TouchGestureCandidate {
     id: u64,
     start_position: Vec2,
     max_distance: f32,
-    face_candidate: Option<ScreenFaceCandidate>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct QueuedFaceTap {
-    position: Vec2,
-    inverse: bool,
+    sticker_candidate: Option<ScreenStickerCandidate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct ScreenFaceCandidate {
+struct ScreenStickerCandidate {
     face: Face,
+    row: usize,
+    col: usize,
+    cubie: UVec3,
+    world_center: Vec3,
     center: Vec2,
     radius: f32,
-    drag_basis: Vec2,
+    projected_col_axis: Vec2,
+    projected_row_axis: Vec2,
+    col_axis: Vec3,
+    row_axis: Vec3,
     corners: [Vec2; 4],
 }
 
@@ -689,7 +690,7 @@ fn spawn_cube_visuals(
     let step = face_span / order as f32;
     let sticker_size = step * 0.84;
     let sticker_depth = 0.06_f32;
-    let cube_size = face_span + (step * 0.12);
+    let cubie_body_size = step * 0.92;
     let face_offset = cube_face_offset(state.order.get());
 
     let root = commands
@@ -713,36 +714,34 @@ fn spawn_cube_visuals(
         ..default()
     });
 
-    let accent_material = materials.add(StandardMaterial {
-        base_color: Color::srgb_u8(13, 15, 23),
-        metallic: 0.55,
-        perceptual_roughness: 0.22,
-        ..default()
-    });
-
+    let cubie_body_mesh = meshes.add(Cuboid::new(cubie_body_size, cubie_body_size, cubie_body_size));
     let sticker_mesh = meshes.add(Cuboid::new(sticker_size, sticker_size, sticker_depth));
-    let mut sticker_entities = Vec::with_capacity(Face::ALL.len() * order * order);
+    let mut animated_entities = Vec::with_capacity((Face::ALL.len() * order * order) + (order * order * 6));
+    let mut surface_cubies = BTreeSet::new();
+
+    for face in Face::ALL {
+        for row in 0..order {
+            for col in 0..order {
+                let cubie = sticker_cubie_coord(face, row, col, order);
+                surface_cubies.insert((cubie.x, cubie.y, cubie.z));
+            }
+        }
+    }
 
     commands.entity(root).with_children(|parent| {
-        parent.spawn((
-            CubeVisual,
-            Mesh3d(meshes.add(Cuboid::new(cube_size, cube_size, cube_size))),
-            MeshMaterial3d(shell_material.clone()),
-            Transform::default(),
-            Name::new("cube-core"),
-        ));
-
-        parent.spawn((
-            CubeVisual,
-            Mesh3d(meshes.add(Cuboid::new(
-                cube_size * 1.02,
-                cube_size * 1.02,
-                cube_size * 1.02,
-            ))),
-            MeshMaterial3d(accent_material.clone()),
-            Transform::from_scale(Vec3::splat(1.0)),
-            Name::new("cube-hull"),
-        ));
+        for (x, y, z) in &surface_cubies {
+            let cubie = UVec3::new(*x, *y, *z);
+            let entity = parent
+                .spawn((
+                    CubeVisual,
+                    Mesh3d(cubie_body_mesh.clone()),
+                    MeshMaterial3d(shell_material.clone()),
+                    Transform::from_translation(cubie_body_translation(cubie, order, face_span)),
+                    Name::new(format!("cubie-body-{x}-{y}-{z}")),
+                ))
+                .id();
+            animated_entities.push((entity, cubie));
+        }
 
         for face_index in 0..Face::ALL.len() {
             let face = Face::ALL[face_index];
@@ -750,15 +749,8 @@ fn spawn_cube_visuals(
                 for col in 0..order {
                     let color = state.stickers[(face_index * order * order) + (row * order) + col];
                     let cubie = sticker_cubie_coord(face, row, col, order);
-                    let (translation, rotation, mesh) = sticker_transform(
-                        face,
-                        row,
-                        col,
-                        order,
-                        face_span,
-                        face_offset,
-                        &sticker_mesh,
-                    );
+                    let (translation, rotation, mesh) =
+                        sticker_transform(face, row, col, order, face_span, face_offset, &sticker_mesh);
 
                     let material = materials.add(StandardMaterial {
                         base_color: color_for_sticker(color),
@@ -776,13 +768,13 @@ fn spawn_cube_visuals(
                             Name::new(format!("sticker-{face_index}-{row}-{col}")),
                         ))
                         .id();
-                    sticker_entities.push((entity, cubie));
+                    animated_entities.push((entity, cubie));
                 }
             }
         }
     });
 
-    (root, sticker_entities)
+    (root, animated_entities)
 }
 
 fn orbit_camera_input(
@@ -797,7 +789,6 @@ fn orbit_camera_input(
     mut orbit: ResMut<'_, OrbitRig>,
     mut direct_turn_input: ResMut<'_, DirectTurnInputState>,
 ) {
-    let shift_pressed = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let camera_context = cameras.single().ok();
     let order = with_runtime(|runtime| runtime.engine.order().get());
 
@@ -816,11 +807,12 @@ fn orbit_camera_input(
         .fold(Vec2::ZERO, |total, event| total + event.delta);
 
     if buttons.just_pressed(MouseButton::Left) {
-        direct_turn_input.mouse_candidate = cursor_position.map(|position| PointerTapCandidate {
+        direct_turn_input.mouse_candidate = cursor_position.map(|position| PointerGestureCandidate {
             start_position: position,
             max_distance: 0.0,
-            face_candidate: camera_context
-                .and_then(|(camera, camera_transform)| projected_face_hit(camera, camera_transform, order, position)),
+            sticker_candidate: camera_context.and_then(|(camera, camera_transform)| {
+                projected_sticker_hit(camera, camera_transform, order, position)
+            }),
         });
         orbit.mouse_drag_active = false;
         orbit.auto_spin = false;
@@ -836,7 +828,7 @@ fn orbit_camera_input(
             }
 
             if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                if candidate.face_candidate.is_none() {
+                if candidate.sticker_candidate.is_none() {
                     direct_turn_input.mouse_candidate = None;
                     orbit.mouse_drag_active = true;
                     orbit.snap_target = None;
@@ -847,8 +839,8 @@ fn orbit_camera_input(
         if orbit.mouse_drag_active {
             orbit.snap_target = None;
             orbit.auto_spin = false;
-            orbit.yaw -= mouse_delta.x * 0.008;
-            orbit.pitch = (orbit.pitch - mouse_delta.y * 0.006).clamp(-1.15, 1.15);
+            orbit.yaw += mouse_delta.x * 0.008;
+            orbit.pitch = (orbit.pitch + mouse_delta.y * 0.006).clamp(-1.15, 1.15);
         }
     }
 
@@ -858,76 +850,55 @@ fn orbit_camera_input(
             orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
         } else if let Some(candidate) = direct_turn_input.mouse_candidate.take() {
             let position = cursor_position.unwrap_or(candidate.start_position);
-            if let Some(face_candidate) = candidate.face_candidate {
+            if let (Some(sticker_candidate), Some((camera, camera_transform))) =
+                (candidate.sticker_candidate, camera_context)
+            {
                 if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                    if let Some(turn) =
-                        drag_turn_from_face_gesture(face_candidate, candidate.start_position, position)
-                    {
+                    if let Some(turn) = slice_turn_from_sticker_drag(
+                        camera,
+                        camera_transform,
+                        order,
+                        sticker_candidate,
+                        candidate.start_position,
+                        position,
+                    ) {
                         direct_turn_input.queued_turn = Some(turn);
                     }
-                } else if position.distance(candidate.start_position) <= POINTER_TAP_MAX_DRAG_PX {
-                    direct_turn_input.queued_tap = Some(QueuedFaceTap {
-                        position,
-                        inverse: shift_pressed,
-                    });
                 }
-            } else if position.distance(candidate.start_position) <= POINTER_TAP_MAX_DRAG_PX {
-                direct_turn_input.queued_tap = Some(QueuedFaceTap {
-                    position,
-                    inverse: shift_pressed,
-                });
             }
         }
     }
 
-    if buttons.just_released(MouseButton::Right) {
-        if let Some(position) = cursor_position {
-            direct_turn_input.queued_tap = Some(QueuedFaceTap {
-                position,
-                inverse: true,
-            });
-        }
-    }
-
     for event in mouse_wheel.read() {
-        orbit.radius = (orbit.radius - event.y * 0.18).clamp(2.9, 9.4);
+        let zoom_delta = match event.unit {
+            MouseScrollUnit::Line => event.y * 0.065,
+            MouseScrollUnit::Pixel => event.y * 0.0022,
+        };
+        orbit.radius = (orbit.radius * (-zoom_delta).exp()).clamp(2.9, 9.4);
     }
 
     if let Some(candidate) = direct_turn_input.touch_candidate {
         if let Some(released_touch) = touches.get_released(candidate.id) {
-            if let Some(face_candidate) = candidate.face_candidate {
+            if let (Some(sticker_candidate), Some((camera, camera_transform))) =
+                (candidate.sticker_candidate, camera_context)
+            {
                 if !orbit.touch_drag_active && candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                    if let Some(turn) = drag_turn_from_face_gesture(
-                        face_candidate,
+                    if let Some(turn) = slice_turn_from_sticker_drag(
+                        camera,
+                        camera_transform,
+                        order,
+                        sticker_candidate,
                         candidate.start_position,
                         released_touch.position(),
                     ) {
                         direct_turn_input.queued_turn = Some(turn);
                     }
-                } else if !orbit.touch_drag_active && candidate.max_distance <= POINTER_TAP_MAX_DRAG_PX {
-                    direct_turn_input.queued_tap = Some(QueuedFaceTap {
-                        position: released_touch.position(),
-                        inverse: false,
-                    });
                 }
-            } else if !orbit.touch_drag_active && candidate.max_distance <= POINTER_TAP_MAX_DRAG_PX {
-                direct_turn_input.queued_tap = Some(QueuedFaceTap {
-                    position: released_touch.position(),
-                    inverse: false,
-                });
             }
             direct_turn_input.touch_candidate = None;
         } else if touches.just_canceled(candidate.id) {
             direct_turn_input.touch_candidate = None;
         }
-    } else if let Some(one_frame_tap) = touches
-        .iter_just_released()
-        .find(|touch| touches.just_pressed(touch.id()))
-    {
-        direct_turn_input.queued_tap = Some(QueuedFaceTap {
-            position: one_frame_tap.position(),
-            inverse: false,
-        });
     }
 
     let active_touches = touches.iter().copied().collect::<Vec<_>>();
@@ -945,12 +916,12 @@ fn orbit_camera_input(
             orbit.auto_spin = false;
 
             if touches.just_pressed(touch.id()) {
-                direct_turn_input.touch_candidate = Some(TouchTapCandidate {
+                direct_turn_input.touch_candidate = Some(TouchGestureCandidate {
                     id: touch.id(),
                     start_position: touch.position(),
                     max_distance: 0.0,
-                    face_candidate: camera_context.and_then(|(camera, camera_transform)| {
-                        projected_face_hit(camera, camera_transform, order, touch.position())
+                    sticker_candidate: camera_context.and_then(|(camera, camera_transform)| {
+                        projected_sticker_hit(camera, camera_transform, order, touch.position())
                     }),
                 });
                 orbit.touch_drag_active = false;
@@ -967,7 +938,7 @@ fn orbit_camera_input(
                     .max(touch.delta().length());
 
                 if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                    if candidate.face_candidate.is_none() {
+                    if candidate.sticker_candidate.is_none() {
                         direct_turn_input.touch_candidate = None;
                         orbit.touch_drag_active = true;
                         orbit.snap_target = None;
@@ -977,8 +948,8 @@ fn orbit_camera_input(
 
             if orbit.touch_drag_active {
                 orbit.snap_target = None;
-                orbit.yaw -= touch.delta().x * 0.008;
-                orbit.pitch = (orbit.pitch - touch.delta().y * 0.006).clamp(-1.15, 1.15);
+                orbit.yaw += touch.delta().x * 0.008;
+                orbit.pitch = (orbit.pitch + touch.delta().y * 0.006).clamp(-1.15, 1.15);
             }
 
             orbit.previous_touch_center = Some(touch.position());
@@ -993,14 +964,14 @@ fn orbit_camera_input(
             let center = (first.position() + second.position()) * 0.5;
             if let Some(previous_center) = orbit.previous_touch_center {
                 let delta = center - previous_center;
-                orbit.yaw -= delta.x * 0.006;
-                orbit.pitch = (orbit.pitch - delta.y * 0.0045).clamp(-1.15, 1.15);
+                orbit.yaw += delta.x * 0.006;
+                orbit.pitch = (orbit.pitch + delta.y * 0.0045).clamp(-1.15, 1.15);
             }
 
             let pinch_distance = first.position().distance(second.position());
             if let Some(previous_pinch_distance) = orbit.previous_pinch_distance {
-                orbit.radius = (orbit.radius - (pinch_distance - previous_pinch_distance) * 0.01)
-                    .clamp(2.9, 9.4);
+                let zoom_delta = (pinch_distance - previous_pinch_distance) * 0.0022;
+                orbit.radius = (orbit.radius * (-zoom_delta).exp()).clamp(2.9, 9.4);
             }
 
             orbit.previous_touch_center = Some(center);
@@ -1028,7 +999,6 @@ fn orbit_camera_input(
 fn canvas_face_tap_input(
     mut direct_turn_input: ResMut<'_, DirectTurnInputState>,
     sync_state: Res<'_, VisualSyncState>,
-    cameras: Query<'_, '_, (&Camera, &GlobalTransform), With<Camera3d>>,
 ) {
     if sync_state.active_animation.is_some() {
         return;
@@ -1036,25 +1006,7 @@ fn canvas_face_tap_input(
 
     if let Some(turn) = direct_turn_input.queued_turn.take() {
         let _ = update_runtime(|runtime| runtime.apply_turn(turn));
-        return;
-    }
-
-    let Some(queued_tap) = direct_turn_input.queued_tap.take() else {
-        return;
     };
-
-    let Ok((camera, camera_transform)) = cameras.single() else {
-        return;
-    };
-
-    let order = with_runtime(|runtime| runtime.engine.order().get());
-    let Some(turn) =
-        projected_face_tap_turn(camera, camera_transform, order, queued_tap.position, queued_tap.inverse)
-    else {
-        return;
-    };
-
-    let _ = update_runtime(|runtime| runtime.apply_turn(turn));
 }
 
 fn keyboard_turn_shortcuts(keys: Res<'_, ButtonInput<KeyCode>>) {
@@ -1122,26 +1074,17 @@ fn apply_camera_transform(
     *transform = Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y);
 }
 
-fn projected_face_tap_turn(
+fn projected_sticker_candidates(
     camera: &Camera,
     camera_transform: &GlobalTransform,
     order: u8,
-    pointer_position: Vec2,
-    inverse: bool,
-) -> Option<TurnCommand> {
-    projected_face_hit(camera, camera_transform, order, pointer_position)
-        .map(|candidate| face_tap_turn(candidate.face, inverse))
-}
-
-fn projected_face_candidates(
-    camera: &Camera,
-    camera_transform: &GlobalTransform,
-    order: u8,
-) -> Vec<ScreenFaceCandidate> {
-    let half_span = CUBE_FACE_SPAN * 0.5;
+) -> Vec<ScreenStickerCandidate> {
     let face_offset = cube_face_offset(order);
     let camera_forward = camera_transform.forward().as_vec3();
-    let mut candidates = Vec::with_capacity(Face::ALL.len());
+    let face_span = CUBE_FACE_SPAN;
+    let step = face_span / order.max(1) as f32;
+    let half_sticker = step * 0.42;
+    let mut candidates = Vec::with_capacity(Face::ALL.len() * usize::from(order) * usize::from(order));
 
     for face in Face::ALL {
         let visibility = face_outward_normal(face).dot(-camera_forward);
@@ -1149,87 +1092,124 @@ fn projected_face_candidates(
             continue;
         }
 
-        let face_center = cube_face_center(face, face_offset);
-        let (axis_u, axis_v) = face_pick_axes(face);
-        let projected_center = match camera.world_to_viewport(camera_transform, face_center) {
-            Ok(position) => position,
-            Err(_) => continue,
-        };
-        let projected_corner = match camera.world_to_viewport(
-            camera_transform,
-            face_center + axis_u * half_span + axis_v * half_span,
-        ) {
-            Ok(position) => position,
-            Err(_) => continue,
-        };
-        let projected_basis = match camera.world_to_viewport(
-            camera_transform,
-            face_center + axis_u * (half_span * 0.5),
-        ) {
-            Ok(position) => position - projected_center,
-            Err(_) => continue,
-        };
-        let radius = projected_center.distance(projected_corner) * FACE_TAP_RADIUS_SCALE;
-        if radius <= f32::EPSILON || projected_basis.length_squared() <= f32::EPSILON {
-            continue;
-        }
+        for row in 0..usize::from(order) {
+            for col in 0..usize::from(order) {
+                let cubie = sticker_cubie_coord(face, row, col, usize::from(order));
+                let col_axis = sticker_col_direction(face);
+                let row_axis = sticker_row_direction(face);
+                let (world_center, _) =
+                    sticker_world_transform(face, row, col, usize::from(order), face_span, face_offset);
+                let projected_center = match camera.world_to_viewport(camera_transform, world_center) {
+                    Ok(position) => position,
+                    Err(_) => continue,
+                };
+                let projected_col_axis = match camera.world_to_viewport(
+                    camera_transform,
+                    world_center + col_axis * half_sticker,
+                ) {
+                    Ok(position) => position - projected_center,
+                    Err(_) => continue,
+                };
+                let projected_row_axis = match camera.world_to_viewport(
+                    camera_transform,
+                    world_center + row_axis * half_sticker,
+                ) {
+                    Ok(position) => position - projected_center,
+                    Err(_) => continue,
+                };
+                if projected_col_axis.length_squared() <= f32::EPSILON
+                    || projected_row_axis.length_squared() <= f32::EPSILON
+                {
+                    continue;
+                }
 
-        let projected_corners = [
-            camera
-                .world_to_viewport(camera_transform, face_center - axis_u * half_span + axis_v * half_span)
-                .ok(),
-            camera
-                .world_to_viewport(camera_transform, face_center + axis_u * half_span + axis_v * half_span)
-                .ok(),
-            camera
-                .world_to_viewport(camera_transform, face_center + axis_u * half_span - axis_v * half_span)
-                .ok(),
-            camera
-                .world_to_viewport(camera_transform, face_center - axis_u * half_span - axis_v * half_span)
-                .ok(),
-        ];
-        if projected_corners.iter().any(Option::is_none) {
-            continue;
-        }
+                let projected_corners = [
+                    camera
+                        .world_to_viewport(
+                            camera_transform,
+                            world_center - (col_axis * half_sticker) - (row_axis * half_sticker),
+                        )
+                        .ok(),
+                    camera
+                        .world_to_viewport(
+                            camera_transform,
+                            world_center + (col_axis * half_sticker) - (row_axis * half_sticker),
+                        )
+                        .ok(),
+                    camera
+                        .world_to_viewport(
+                            camera_transform,
+                            world_center + (col_axis * half_sticker) + (row_axis * half_sticker),
+                        )
+                        .ok(),
+                    camera
+                        .world_to_viewport(
+                            camera_transform,
+                            world_center - (col_axis * half_sticker) + (row_axis * half_sticker),
+                        )
+                        .ok(),
+                ];
+                if projected_corners.iter().any(Option::is_none) {
+                    continue;
+                }
 
-        candidates.push(ScreenFaceCandidate {
-            face,
-            center: projected_center,
-            radius,
-            drag_basis: projected_basis.normalize(),
-            corners: projected_corners.map(|corner| corner.expect("checked face corner projection")),
-        });
+                let projected_corners =
+                    projected_corners.map(|corner| corner.expect("checked sticker corner projection"));
+                let radius = projected_center.distance(projected_corners[0]) * FACE_TAP_RADIUS_SCALE;
+                if radius <= f32::EPSILON {
+                    continue;
+                }
+
+                candidates.push(ScreenStickerCandidate {
+                    face,
+                    row,
+                    col,
+                    cubie,
+                    world_center,
+                    center: projected_center,
+                    radius,
+                    projected_col_axis: projected_col_axis.normalize(),
+                    projected_row_axis: projected_row_axis.normalize(),
+                    col_axis,
+                    row_axis,
+                    corners: projected_corners,
+                });
+            }
+        }
     }
 
     candidates
 }
 
-fn projected_face_hit(
+fn projected_sticker_hit(
     camera: &Camera,
     camera_transform: &GlobalTransform,
     order: u8,
     pointer_position: Vec2,
-) -> Option<ScreenFaceCandidate> {
-    let candidates = projected_face_candidates(camera, camera_transform, order);
-    pick_face_candidate(pointer_position, &candidates)
+) -> Option<ScreenStickerCandidate> {
+    let candidates = projected_sticker_candidates(camera, camera_transform, order);
+    pick_sticker_candidate(pointer_position, &candidates)
 }
 
-fn pick_face_candidate(
+fn pick_sticker_candidate(
     pointer_position: Vec2,
-    candidates: &[ScreenFaceCandidate],
-) -> Option<ScreenFaceCandidate> {
+    candidates: &[ScreenStickerCandidate],
+) -> Option<ScreenStickerCandidate> {
     candidates
         .iter()
         .filter_map(|candidate| {
             let distance = candidate.center.distance(pointer_position);
-            face_candidate_contains_point(*candidate, pointer_position).then_some((distance, *candidate))
+            sticker_candidate_contains_point(*candidate, pointer_position).then_some((distance, *candidate))
         })
         .min_by(|left, right| left.0.total_cmp(&right.0))
         .map(|(_, candidate)| candidate)
 }
 
-fn drag_turn_from_face_gesture(
-    candidate: ScreenFaceCandidate,
+fn slice_turn_from_sticker_drag(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    order: u8,
+    candidate: ScreenStickerCandidate,
     start_position: Vec2,
     end_position: Vec2,
 ) -> Option<TurnCommand> {
@@ -1238,49 +1218,52 @@ fn drag_turn_from_face_gesture(
         return None;
     }
 
-    let start_from_center = start_position - candidate.center;
-    let end_from_center = end_position - candidate.center;
-    let min_radius = candidate.radius * 0.2;
-    let signed_angle = if start_from_center.length() >= min_radius && end_from_center.length() >= min_radius {
-        signed_screen_angle(start_from_center, end_from_center)
-    } else {
-        drag.dot(candidate.drag_basis) / candidate.radius.max(1.0)
+    let turn_face = slice_face_from_sticker_drag(candidate, drag)?;
+    let start_layer = slice_start_layer(turn_face, candidate.cubie, order);
+
+    let clockwise = TurnCommand {
+        face: turn_face,
+        start_layer,
+        width: 1,
+        rotation: RotationAmount::Clockwise,
+    };
+    let counter_clockwise = TurnCommand {
+        rotation: RotationAmount::CounterClockwise,
+        ..clockwise
     };
 
-    if signed_angle.abs() <= 0.16 {
+    let drag_direction = drag.normalize();
+    let clockwise_score =
+        drag_direction.dot(projected_turn_motion(camera, camera_transform, candidate.world_center, clockwise)?);
+    let counter_clockwise_score = drag_direction.dot(projected_turn_motion(
+        camera,
+        camera_transform,
+        candidate.world_center,
+        counter_clockwise,
+    )?);
+    if clockwise_score.max(counter_clockwise_score) <= 0.2 {
         return None;
     }
 
-    Some(TurnCommand::outer(
-        candidate.face,
-        if signed_angle.is_sign_positive() {
-            RotationAmount::Clockwise
-        } else {
-            RotationAmount::CounterClockwise
-        },
-    ))
+    Some(if clockwise_score >= counter_clockwise_score {
+        clockwise
+    } else {
+        counter_clockwise
+    })
 }
 
-fn face_tap_turn(face: Face, inverse: bool) -> TurnCommand {
-    TurnCommand::outer(
-        face,
-        if inverse {
-            RotationAmount::CounterClockwise
-        } else {
-            RotationAmount::Clockwise
-        },
-    )
+fn slice_face_from_sticker_drag(candidate: ScreenStickerCandidate, drag: Vec2) -> Option<Face> {
+    let col_alignment = drag.dot(candidate.projected_col_axis);
+    let row_alignment = drag.dot(candidate.projected_row_axis);
+    let selected_axis = if col_alignment.abs() >= row_alignment.abs() {
+        -candidate.row_axis
+    } else {
+        candidate.col_axis
+    };
+    axis_face(selected_axis)
 }
 
-fn signed_screen_angle(from: Vec2, to: Vec2) -> f32 {
-    let from_normalized = from.normalize_or_zero();
-    let to_normalized = to.normalize_or_zero();
-    let cross = from_normalized.x * to_normalized.y - from_normalized.y * to_normalized.x;
-    let dot = from_normalized.dot(to_normalized).clamp(-1.0, 1.0);
-    cross.atan2(dot)
-}
-
-fn face_candidate_contains_point(candidate: ScreenFaceCandidate, point: Vec2) -> bool {
+fn sticker_candidate_contains_point(candidate: ScreenStickerCandidate, point: Vec2) -> bool {
     let mut winding_sign = 0.0_f32;
     for index in 0..candidate.corners.len() {
         let current = candidate.corners[index];
@@ -1302,21 +1285,62 @@ fn face_candidate_contains_point(candidate: ScreenFaceCandidate, point: Vec2) ->
     true
 }
 
+fn axis_face(axis: Vec3) -> Option<Face> {
+    if axis.abs_diff_eq(Vec3::X, 0.0001) {
+        Some(Face::Right)
+    } else if axis.abs_diff_eq(-Vec3::X, 0.0001) {
+        Some(Face::Left)
+    } else if axis.abs_diff_eq(Vec3::Y, 0.0001) {
+        Some(Face::Up)
+    } else if axis.abs_diff_eq(-Vec3::Y, 0.0001) {
+        Some(Face::Down)
+    } else if axis.abs_diff_eq(Vec3::Z, 0.0001) {
+        Some(Face::Front)
+    } else if axis.abs_diff_eq(-Vec3::Z, 0.0001) {
+        Some(Face::Back)
+    } else {
+        None
+    }
+}
+
+fn slice_start_layer(face: Face, cubie: UVec3, order: u8) -> u8 {
+    let max = order.saturating_sub(1);
+    match face {
+        Face::Up => max.saturating_sub(cubie.y as u8),
+        Face::Right => max.saturating_sub(cubie.x as u8),
+        Face::Front => max.saturating_sub(cubie.z as u8),
+        Face::Down => cubie.y as u8,
+        Face::Left => cubie.x as u8,
+        Face::Back => cubie.z as u8,
+    }
+}
+
+fn projected_turn_motion(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    world_point: Vec3,
+    turn: TurnCommand,
+) -> Option<Vec2> {
+    let projected_start = camera.world_to_viewport(camera_transform, world_point).ok()?;
+    let direction = turn_rotation_angle(turn).signum();
+    if direction.abs() <= f32::EPSILON {
+        return None;
+    }
+
+    let projected_end = camera
+        .world_to_viewport(
+            camera_transform,
+            Quat::from_axis_angle(turn_rotation_axis(turn.face), 0.12 * direction) * world_point,
+        )
+        .ok()?;
+    let delta = projected_end - projected_start;
+    (delta.length_squared() > f32::EPSILON).then_some(delta.normalize())
+}
+
 fn cube_face_offset(order: u8) -> f32 {
     let step = CUBE_FACE_SPAN / order.max(1) as f32;
     let cube_size = CUBE_FACE_SPAN + (step * 0.12);
     cube_size / 2.0 + 0.03
-}
-
-fn cube_face_center(face: Face, face_offset: f32) -> Vec3 {
-    match face {
-        Face::Up => Vec3::new(0.0, face_offset, 0.0),
-        Face::Right => Vec3::new(face_offset, 0.0, 0.0),
-        Face::Front => Vec3::new(0.0, 0.0, face_offset),
-        Face::Down => Vec3::new(0.0, -face_offset, 0.0),
-        Face::Left => Vec3::new(-face_offset, 0.0, 0.0),
-        Face::Back => Vec3::new(0.0, 0.0, -face_offset),
-    }
 }
 
 fn face_outward_normal(face: Face) -> Vec3 {
@@ -1327,14 +1351,6 @@ fn face_outward_normal(face: Face) -> Vec3 {
         Face::Down => -Vec3::Y,
         Face::Left => -Vec3::X,
         Face::Back => -Vec3::Z,
-    }
-}
-
-fn face_pick_axes(face: Face) -> (Vec3, Vec3) {
-    match face {
-        Face::Up | Face::Down => (Vec3::X, Vec3::Z),
-        Face::Right | Face::Left => (Vec3::Y, Vec3::Z),
-        Face::Front | Face::Back => (Vec3::X, Vec3::Y),
     }
 }
 
@@ -1467,6 +1483,107 @@ fn sticker_cubie_coord(face: Face, row: usize, col: usize, order: usize) -> UVec
     UVec3::new(x as u32, y as u32, z as u32)
 }
 
+fn cubie_axis_position(index: usize, order: usize, face_span: f32) -> f32 {
+    if order <= 1 {
+        0.0
+    } else {
+        let step = face_span / order as f32;
+        (-face_span / 2.0) + (step * 0.5) + (index as f32 * step)
+    }
+}
+
+fn cubie_body_translation(cubie: UVec3, order: usize, face_span: f32) -> Vec3 {
+    Vec3::new(
+        cubie_axis_position(cubie.x as usize, order, face_span),
+        cubie_axis_position(cubie.y as usize, order, face_span),
+        cubie_axis_position(cubie.z as usize, order, face_span),
+    )
+}
+
+fn sticker_col_direction(face: Face) -> Vec3 {
+    match face {
+        Face::Up => Vec3::X,
+        Face::Right => -Vec3::Z,
+        Face::Front => Vec3::X,
+        Face::Down => Vec3::X,
+        Face::Left => Vec3::Z,
+        Face::Back => -Vec3::X,
+    }
+}
+
+fn sticker_row_direction(face: Face) -> Vec3 {
+    match face {
+        Face::Up => Vec3::Z,
+        Face::Right | Face::Front | Face::Left | Face::Back => -Vec3::Y,
+        Face::Down => -Vec3::Z,
+    }
+}
+
+fn sticker_world_transform(
+    face: Face,
+    row: usize,
+    col: usize,
+    order: usize,
+    face_span: f32,
+    face_offset: f32,
+) -> (Vec3, Quat) {
+    let cubie = sticker_cubie_coord(face, row, col, order);
+    let x = cubie.x as usize;
+    let y = cubie.y as usize;
+    let z = cubie.z as usize;
+
+    match face {
+        Face::Front => (
+            Vec3::new(
+                cubie_axis_position(x, order, face_span),
+                cubie_axis_position(y, order, face_span),
+                face_offset,
+            ),
+            sticker_rotation(face),
+        ),
+        Face::Back => (
+            Vec3::new(
+                cubie_axis_position(x, order, face_span),
+                cubie_axis_position(y, order, face_span),
+                -face_offset,
+            ),
+            sticker_rotation(face),
+        ),
+        Face::Right => (
+            Vec3::new(
+                face_offset,
+                cubie_axis_position(y, order, face_span),
+                cubie_axis_position(z, order, face_span),
+            ),
+            sticker_rotation(face),
+        ),
+        Face::Left => (
+            Vec3::new(
+                -face_offset,
+                cubie_axis_position(y, order, face_span),
+                cubie_axis_position(z, order, face_span),
+            ),
+            sticker_rotation(face),
+        ),
+        Face::Up => (
+            Vec3::new(
+                cubie_axis_position(x, order, face_span),
+                face_offset,
+                cubie_axis_position(z, order, face_span),
+            ),
+            sticker_rotation(face),
+        ),
+        Face::Down => (
+            Vec3::new(
+                cubie_axis_position(x, order, face_span),
+                -face_offset,
+                cubie_axis_position(z, order, face_span),
+            ),
+            sticker_rotation(face),
+        ),
+    }
+}
+
 fn sticker_transform(
     face: Face,
     row: usize,
@@ -1476,52 +1593,8 @@ fn sticker_transform(
     face_offset: f32,
     sticker_mesh: &Handle<Mesh>,
 ) -> (Vec3, Quat, Handle<Mesh>) {
-    let cubie = sticker_cubie_coord(face, row, col, order);
-    let x = cubie.x as usize;
-    let y = cubie.y as usize;
-    let z = cubie.z as usize;
-
-    let axis = |index: usize| -> f32 {
-        if order <= 1 {
-            0.0
-        } else {
-            let step = face_span / order as f32;
-            (-face_span / 2.0) + (step * 0.5) + (index as f32 * step)
-        }
-    };
-
-    match face {
-        Face::Front => (
-            Vec3::new(axis(x), axis(y), face_offset),
-            sticker_rotation(face),
-            sticker_mesh.clone(),
-        ),
-        Face::Back => (
-            Vec3::new(axis(x), axis(y), -face_offset),
-            sticker_rotation(face),
-            sticker_mesh.clone(),
-        ),
-        Face::Right => (
-            Vec3::new(face_offset, axis(y), axis(z)),
-            sticker_rotation(face),
-            sticker_mesh.clone(),
-        ),
-        Face::Left => (
-            Vec3::new(-face_offset, axis(y), axis(z)),
-            sticker_rotation(face),
-            sticker_mesh.clone(),
-        ),
-        Face::Up => (
-            Vec3::new(axis(x), face_offset, axis(z)),
-            sticker_rotation(face),
-            sticker_mesh.clone(),
-        ),
-        Face::Down => (
-            Vec3::new(axis(x), -face_offset, axis(z)),
-            sticker_rotation(face),
-            sticker_mesh.clone(),
-        ),
-    }
+    let (translation, rotation) = sticker_world_transform(face, row, col, order, face_span, face_offset);
+    (translation, rotation, sticker_mesh.clone())
 }
 
 fn sticker_rotation(face: Face) -> Quat {
@@ -1684,14 +1757,36 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeBridge, ScreenFaceCandidate, cubie_matches_turn, decode_face, decode_rotation,
-        drag_turn_from_face_gesture, face_candidate_contains_point, face_tap_turn, format_turn,
-        face_outward_normal, keyboard_shortcut_turn, nearest_orbit_snap, normalize_base_path,
-        normalize_canvas_selector, pick_face_candidate, reset_cube, signed_screen_angle,
+        RuntimeBridge, ScreenStickerCandidate, cubie_matches_turn, decode_face, decode_rotation,
+        face_outward_normal, format_turn, keyboard_shortcut_turn, nearest_orbit_snap,
+        normalize_base_path, normalize_canvas_selector, pick_sticker_candidate, reset_cube,
+        slice_face_from_sticker_drag, slice_start_layer, sticker_candidate_contains_point,
         sticker_rotation, turn_rotation_angle,
     };
     use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
     use bevy::prelude::{UVec3, Vec2, Vec3};
+
+    fn sample_sticker_candidate(face: Face, cubie: UVec3) -> ScreenStickerCandidate {
+        ScreenStickerCandidate {
+            face,
+            row: 0,
+            col: 0,
+            cubie,
+            world_center: Vec3::new(0.0, 0.0, 1.0),
+            center: Vec2::new(100.0, 100.0),
+            radius: 18.0,
+            projected_col_axis: Vec2::X,
+            projected_row_axis: Vec2::NEG_Y,
+            col_axis: Vec3::X,
+            row_axis: -Vec3::Y,
+            corners: [
+                Vec2::new(82.0, 82.0),
+                Vec2::new(118.0, 82.0),
+                Vec2::new(118.0, 118.0),
+                Vec2::new(82.0, 118.0),
+            ],
+        }
+    }
 
     #[test]
     fn normalizes_empty_base_path_to_root() {
@@ -1823,27 +1918,43 @@ mod tests {
     }
 
     #[test]
-    fn face_tap_turn_uses_inverse_flag() {
+    fn horizontal_drag_on_front_sticker_selects_the_up_slice() {
+        let candidate = sample_sticker_candidate(Face::Front, UVec3::new(1, 2, 2));
+        let face = slice_face_from_sticker_drag(candidate, Vec2::new(36.0, 0.0));
+
+        assert_eq!(face, Some(Face::Up));
+        assert_eq!(slice_start_layer(face.expect("front drag should map to up"), candidate.cubie, 4), 1);
+    }
+
+    #[test]
+    fn vertical_drag_on_front_sticker_selects_the_right_slice() {
+        let candidate = sample_sticker_candidate(Face::Front, UVec3::new(2, 1, 2));
+        let face = slice_face_from_sticker_drag(candidate, Vec2::new(0.0, -32.0));
+
+        assert_eq!(face, Some(Face::Right));
         assert_eq!(
-            face_tap_turn(Face::Up, false),
-            TurnCommand::outer(Face::Up, RotationAmount::Clockwise)
-        );
-        assert_eq!(
-            face_tap_turn(Face::Up, true),
-            TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise)
+            slice_start_layer(face.expect("front drag should map to right"), candidate.cubie, 4),
+            1
         );
     }
 
     #[test]
-    fn pick_face_candidate_prefers_the_closest_matching_face() {
-        let selected = pick_face_candidate(
+    fn pick_sticker_candidate_prefers_the_closest_matching_face() {
+        let selected = pick_sticker_candidate(
             Vec2::new(104.0, 96.0),
             &[
-                ScreenFaceCandidate {
+                ScreenStickerCandidate {
                     face: Face::Front,
+                    row: 0,
+                    col: 0,
+                    cubie: UVec3::new(1, 1, 2),
+                    world_center: Vec3::new(0.0, 0.0, 1.0),
                     center: Vec2::new(100.0, 100.0),
                     radius: 18.0,
-                    drag_basis: Vec2::X,
+                    projected_col_axis: Vec2::X,
+                    projected_row_axis: Vec2::NEG_Y,
+                    col_axis: Vec3::X,
+                    row_axis: -Vec3::Y,
                     corners: [
                         Vec2::new(82.0, 82.0),
                         Vec2::new(118.0, 82.0),
@@ -1851,11 +1962,18 @@ mod tests {
                         Vec2::new(82.0, 118.0),
                     ],
                 },
-                ScreenFaceCandidate {
+                ScreenStickerCandidate {
                     face: Face::Right,
+                    row: 0,
+                    col: 0,
+                    cubie: UVec3::new(2, 1, 1),
+                    world_center: Vec3::new(1.0, 0.0, 0.0),
                     center: Vec2::new(126.0, 98.0),
                     radius: 18.0,
-                    drag_basis: Vec2::Y,
+                    projected_col_axis: Vec2::NEG_Y,
+                    projected_row_axis: Vec2::NEG_X,
+                    col_axis: -Vec3::Z,
+                    row_axis: -Vec3::Y,
                     corners: [
                         Vec2::new(108.0, 80.0),
                         Vec2::new(144.0, 80.0),
@@ -1870,14 +1988,21 @@ mod tests {
     }
 
     #[test]
-    fn pick_face_candidate_rejects_pointers_outside_face_radius() {
-        let selected = pick_face_candidate(
+    fn pick_sticker_candidate_rejects_pointers_outside_face_radius() {
+        let selected = pick_sticker_candidate(
             Vec2::new(140.0, 140.0),
-            &[ScreenFaceCandidate {
+            &[ScreenStickerCandidate {
                 face: Face::Front,
+                row: 0,
+                col: 0,
+                cubie: UVec3::new(1, 1, 2),
+                world_center: Vec3::new(0.0, 0.0, 1.0),
                 center: Vec2::new(100.0, 100.0),
                 radius: 16.0,
-                drag_basis: Vec2::X,
+                projected_col_axis: Vec2::X,
+                projected_row_axis: Vec2::NEG_Y,
+                col_axis: Vec3::X,
+                row_axis: -Vec3::Y,
                 corners: [
                     Vec2::new(84.0, 84.0),
                     Vec2::new(116.0, 84.0),
@@ -1892,11 +2017,18 @@ mod tests {
 
     #[test]
     fn projected_quad_rejects_points_that_only_match_the_old_circle_hitbox() {
-        let candidate = ScreenFaceCandidate {
+        let candidate = ScreenStickerCandidate {
             face: Face::Up,
+            row: 0,
+            col: 0,
+            cubie: UVec3::new(1, 2, 1),
+            world_center: Vec3::new(0.0, 1.0, 0.0),
             center: Vec2::new(100.0, 100.0),
             radius: 28.0,
-            drag_basis: Vec2::X,
+            projected_col_axis: Vec2::X,
+            projected_row_axis: Vec2::Y,
+            col_axis: Vec3::X,
+            row_axis: Vec3::Z,
             corners: [
                 Vec2::new(100.0, 70.0),
                 Vec2::new(130.0, 100.0),
@@ -1907,59 +2039,8 @@ mod tests {
         let off_corner_point = Vec2::new(118.0, 82.0);
 
         assert!(candidate.center.distance(off_corner_point) < candidate.radius);
-        assert!(!face_candidate_contains_point(candidate, off_corner_point));
-        assert_eq!(pick_face_candidate(off_corner_point, &[candidate]), None);
+        assert!(!sticker_candidate_contains_point(candidate, off_corner_point));
+        assert_eq!(pick_sticker_candidate(off_corner_point, &[candidate]), None);
     }
 
-    #[test]
-    fn signed_screen_angle_is_positive_for_clockwise_arc() {
-        let angle = signed_screen_angle(Vec2::new(0.0, -1.0), Vec2::new(1.0, 0.0));
-        assert!(angle > 1.0);
-    }
-
-    #[test]
-    fn drag_turn_uses_clockwise_arc_on_face_candidate() {
-        let turn = drag_turn_from_face_gesture(
-            ScreenFaceCandidate {
-                face: Face::Front,
-                center: Vec2::new(100.0, 100.0),
-                radius: 40.0,
-                drag_basis: Vec2::X,
-                corners: [
-                    Vec2::new(60.0, 60.0),
-                    Vec2::new(140.0, 60.0),
-                    Vec2::new(140.0, 140.0),
-                    Vec2::new(60.0, 140.0),
-                ],
-            },
-            Vec2::new(100.0, 70.0),
-            Vec2::new(130.0, 100.0),
-        )
-        .expect("clockwise arc should produce a turn");
-
-        assert_eq!(turn, TurnCommand::outer(Face::Front, RotationAmount::Clockwise));
-    }
-
-    #[test]
-    fn drag_turn_falls_back_to_basis_when_started_near_center() {
-        let turn = drag_turn_from_face_gesture(
-            ScreenFaceCandidate {
-                face: Face::Right,
-                center: Vec2::new(100.0, 100.0),
-                radius: 40.0,
-                drag_basis: Vec2::X,
-                corners: [
-                    Vec2::new(60.0, 60.0),
-                    Vec2::new(140.0, 60.0),
-                    Vec2::new(140.0, 140.0),
-                    Vec2::new(60.0, 140.0),
-                ],
-            },
-            Vec2::new(102.0, 101.0),
-            Vec2::new(128.0, 101.0),
-        )
-        .expect("basis-aligned drag should produce a turn");
-
-        assert_eq!(turn, TurnCommand::outer(Face::Right, RotationAmount::Clockwise));
-    }
 }

@@ -79,11 +79,16 @@ app.innerHTML = `
   <div class="shell">
     <header class="masthead">
       <div>
-        <p class="eyebrow">rubikrs / runtime slice</p>
-        <h1>Bevy runtime, now driving an actual sticker state.</h1>
+        <p class="eyebrow">rubikrs</p>
+        <h1>Rust-first 3D cube.</h1>
       </div>
       <div class="status-block">
         <span class="status-pill" data-tone="booting" data-boot-pill>booting</span>
+        <div class="status-inline">
+          <span data-status-order>3x3</span>
+          <span><strong data-status-moves>0</strong> moves</span>
+          <span><strong data-status-timer>00:00.0</strong></span>
+        </div>
         <p class="status-copy" data-boot-copy>Preparing the wasm runtime and canvas bridge.</p>
       </div>
     </header>
@@ -93,11 +98,10 @@ app.innerHTML = `
         <div class="stage-grid" aria-hidden="true"></div>
         <canvas id="rubik-canvas" class="stage-canvas" aria-label="Rubik runtime canvas"></canvas>
         <div class="stage-caption">
-          <p class="stage-label">orbit / inspect / zoom</p>
+          <p class="stage-label">drag / orbit / zoom</p>
           <p class="stage-hint">
-            Drag or single-finger swipe to orbit, scroll or pinch to zoom, press Space to toggle auto-spin.
-            Tap a visible face center to turn it, Shift-click or right-click for inverse, and use U R F D L B on
-            keyboard with 2..9 for inner layers, Alt for wide turns, Shift for inverse, Ctrl for 180,
+            Drag a visible sticker to flick its slice, drag empty space to orbit, and scroll or pinch to zoom.
+            Keyboard: U R F D L B, 2..9 for layer selection, Alt for wide turns, Shift for inverse, Ctrl for 180,
             Backspace undo, Enter redo.
           </p>
         </div>
@@ -105,59 +109,7 @@ app.innerHTML = `
 
       <aside class="telemetry">
         <section class="panel">
-          <p class="panel-kicker">runtime telemetry</p>
-          <dl class="metrics">
-            <div>
-              <dt>base path</dt>
-              <dd>${basePath}</dd>
-            </div>
-            <div>
-              <dt>worker lanes</dt>
-              <dd>${parallelLanes}</dd>
-            </div>
-            <div>
-              <dt>renderer baseline</dt>
-              <dd>webgl2</dd>
-            </div>
-            <div>
-              <dt>runtime owner</dt>
-              <dd>Rust / Bevy</dd>
-            </div>
-          </dl>
-        </section>
-
-        <section class="panel">
-          <p class="panel-kicker">runtime status</p>
-          <dl class="metrics">
-            <div>
-              <dt>order</dt>
-              <dd data-status-order>3x3</dd>
-            </div>
-            <div>
-              <dt>moves</dt>
-              <dd data-status-moves>0</dd>
-            </div>
-            <div>
-              <dt>redo depth</dt>
-              <dd data-status-redo>0</dd>
-            </div>
-            <div>
-              <dt>timer</dt>
-              <dd data-status-timer>00:00.0</dd>
-            </div>
-            <div>
-              <dt>animating</dt>
-              <dd data-status-animation>no</dd>
-            </div>
-            <div>
-              <dt>solved</dt>
-              <dd data-status-solved>yes</dd>
-            </div>
-          </dl>
-        </section>
-
-        <section class="panel">
-          <p class="panel-kicker">browser shell</p>
+          <p class="panel-kicker">cube controls</p>
           <div class="control-cluster">
             <label class="field">
               <span>cube order</span>
@@ -189,12 +141,19 @@ app.innerHTML = `
               <button type="button" data-action="scramble">scramble</button>
             </div>
 
+            <p class="history-line" data-status-history>—</p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <p class="panel-kicker">manual turns</p>
+          <div class="control-cluster">
             <div class="action-row action-row--stacked">
               <label class="field">
                 <span>turn layer</span>
                 <input data-turn-layer type="number" min="1" max="17" value="1" />
               </label>
-              <label class="field">
+              <label class="field field--checkbox">
                 <span>wide x2</span>
                 <input data-turn-wide type="checkbox" />
               </label>
@@ -218,7 +177,7 @@ app.innerHTML = `
         </section>
 
         <section class="panel">
-          <p class="panel-kicker">state bridge</p>
+          <p class="panel-kicker">import / export</p>
           <div class="control-cluster">
             <div class="action-row">
               <button type="button" data-action="export">export json</button>
@@ -238,7 +197,7 @@ app.innerHTML = `
         </section>
 
         <section class="panel">
-          <p class="panel-kicker">solver worker</p>
+          <p class="panel-kicker">solver</p>
           <div class="control-cluster">
             <div class="action-row action-row--stacked">
               <label class="field">
@@ -251,18 +210,8 @@ app.innerHTML = `
               </div>
             </div>
             <p class="history-line" data-solver-status>idle</p>
-            <p class="body-copy" data-solver-detail>
-              No solve request in flight. The first slice uses a dedicated Rust wasm worker with depth-limited search.
-            </p>
+            <p class="body-copy" data-solver-detail>No solve request in flight.</p>
           </div>
-        </section>
-
-        <section class="panel">
-          <p class="panel-kicker">recent turns</p>
-          <p class="history-line" data-status-history>—</p>
-          <p class="body-copy" data-boot-detail>
-            Shell mounted. Waiting for the generated wasm package to initialize.
-          </p>
         </section>
       </aside>
     </main>
@@ -271,7 +220,6 @@ app.innerHTML = `
 
 const bootPill = document.querySelector<HTMLElement>('[data-boot-pill]')
 const bootCopy = document.querySelector<HTMLElement>('[data-boot-copy]')
-const bootDetail = document.querySelector<HTMLElement>('[data-boot-detail]')
 const orderSelect = document.querySelector<HTMLSelectElement>('[data-order-select]')
 const scrambleLength = document.querySelector<HTMLInputElement>('[data-scramble-length]')
 const scrambleSeed = document.querySelector<HTMLInputElement>('[data-scramble-seed]')
@@ -282,10 +230,7 @@ const importArea = document.querySelector<HTMLTextAreaElement>('[data-import-are
 const importFile = document.querySelector<HTMLInputElement>('[data-import-file]')
 const statusOrder = document.querySelector<HTMLElement>('[data-status-order]')
 const statusMoves = document.querySelector<HTMLElement>('[data-status-moves]')
-const statusRedo = document.querySelector<HTMLElement>('[data-status-redo]')
 const statusTimer = document.querySelector<HTMLElement>('[data-status-timer]')
-const statusAnimation = document.querySelector<HTMLElement>('[data-status-animation]')
-const statusSolved = document.querySelector<HTMLElement>('[data-status-solved]')
 const statusHistory = document.querySelector<HTMLElement>('[data-status-history]')
 const solverStatus = document.querySelector<HTMLElement>('[data-solver-status]')
 const solverDetail = document.querySelector<HTMLElement>('[data-solver-detail]')
@@ -296,6 +241,14 @@ const stageCanvas = document.querySelector<HTMLCanvasElement>('#rubik-canvas')
 stageCanvas?.addEventListener('contextmenu', (event) => {
   event.preventDefault()
 })
+
+stageCanvas?.addEventListener(
+  'wheel',
+  (event) => {
+    event.preventDefault()
+  },
+  { passive: false }
+)
 
 function formatTimer(elapsedMillis: number): string {
   const totalTenths = Math.floor(elapsedMillis / 100)
@@ -345,18 +298,15 @@ function renderRuntimeStatus(status: RuntimeStatus | null): void {
 
   statusOrder!.textContent = `${status.order}x${status.order}`
   statusMoves!.textContent = String(status.move_count)
-  statusRedo!.textContent = String(status.redo_depth)
   statusTimer!.textContent = formatTimer(status.elapsed_millis)
-  statusAnimation!.textContent = status.animation_active ? 'yes' : 'no'
-  statusSolved!.textContent = status.is_solved ? 'yes' : 'no'
   statusHistory!.textContent = status.recent_turns.length > 0 ? status.recent_turns.join('  ·  ') : '—'
 
   if (orderSelect && orderSelect.value !== String(status.order)) {
     orderSelect.value = String(status.order)
   }
 
-  if (bootDetail) {
-    bootDetail.textContent = status.last_message
+  if (bootCopy) {
+    bootCopy.textContent = status.last_message
   }
 }
 
@@ -388,9 +338,6 @@ function updateBootState(tone: BootTone, label: string, detail: string): void {
   }
   if (bootCopy) {
     bootCopy.textContent = detail
-  }
-  if (bootDetail) {
-    bootDetail.textContent = detail
   }
 }
 

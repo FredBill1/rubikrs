@@ -159,6 +159,18 @@ h1 {
   color: var(--muted);
 }
 
+.status-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 12px;
+  font-size: 13px;
+}
+
+.status-inline strong {
+  color: var(--text);
+}
+
 .history-line {
   margin: 14px 0 0;
   color: var(--text);
@@ -280,6 +292,17 @@ h1 {
   font-size: 12px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
+}
+
+.field--checkbox {
+  align-content: end;
+}
+
+.field--checkbox input {
+  width: auto;
+  min-height: 0;
+  justify-self: start;
+  margin-top: 4px;
 }
 
 button,

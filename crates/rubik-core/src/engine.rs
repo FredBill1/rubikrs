@@ -109,25 +109,36 @@ impl CubeEngine {
     }
 }
 
-pub fn generate_scramble(_order: CubeOrder, length: usize, seed: u64) -> Vec<TurnCommand> {
+pub fn generate_scramble(order: CubeOrder, length: usize, seed: u64) -> Vec<TurnCommand> {
     let mut rng = DeterministicRng::new(seed);
     let mut scramble = Vec::with_capacity(length);
-    let mut last_face = None;
+    let mut last_move_key = None;
+    let max_start_layer = usize::from(order.get().saturating_sub(1));
 
     while scramble.len() < length {
         let face = Face::ALL[rng.range(Face::ALL.len())];
-        if Some(face) == last_face {
-            continue;
-        }
-
         let rotation = match rng.range(3) {
             0 => RotationAmount::Clockwise,
             1 => RotationAmount::HalfTurn,
             _ => RotationAmount::CounterClockwise,
         };
+        let start_layer = if order.get() <= 3 {
+            0
+        } else {
+            rng.range(max_start_layer + 1) as u8
+        };
+        let move_key = (face, start_layer);
+        if Some(move_key) == last_move_key {
+            continue;
+        }
 
-        scramble.push(TurnCommand::outer(face, rotation));
-        last_face = Some(face);
+        scramble.push(TurnCommand {
+            face,
+            start_layer,
+            width: 1,
+            rotation,
+        });
+        last_move_key = Some(move_key);
     }
 
     scramble
@@ -571,6 +582,19 @@ mod tests {
 
         assert_eq!(a, b);
         assert_eq!(a.len(), 12);
+    }
+
+    #[test]
+    fn three_by_three_scramble_stays_on_outer_layers() {
+        let scramble = generate_scramble(CubeOrder::standard(), 24, 21);
+        assert!(scramble.iter().all(|turn| turn.start_layer == 0 && turn.width == 1));
+    }
+
+    #[test]
+    fn larger_order_scramble_can_include_inner_layers() {
+        let scramble = generate_scramble(CubeOrder::new(4).expect("4x4 should be valid"), 64, 21);
+        assert!(scramble.iter().any(|turn| turn.start_layer > 0));
+        assert!(scramble.iter().all(|turn| turn.width == 1));
     }
 
     #[test]
