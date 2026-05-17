@@ -57,6 +57,13 @@ struct OrbitRig {
 }
 
 #[derive(Resource, Default)]
+struct DirectTurnInputState {
+    mouse_candidate: Option<PointerTapCandidate>,
+    touch_candidate: Option<TouchTapCandidate>,
+    queued_tap: Option<QueuedFaceTap>,
+}
+
+#[derive(Resource, Default)]
 struct VisualSyncState {
     rendered_revision: u64,
     active_animation: Option<ActiveTurnAnimation>,
@@ -116,6 +123,37 @@ struct ActiveTurnAnimation {
     elapsed_secs: f32,
     duration_secs: f32,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct PointerTapCandidate {
+    start_position: Vec2,
+    max_distance: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TouchTapCandidate {
+    id: u64,
+    start_position: Vec2,
+    max_distance: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueuedFaceTap {
+    position: Vec2,
+    inverse: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScreenFaceCandidate {
+    face: Face,
+    center: Vec2,
+    radius: f32,
+}
+
+const CUBE_FACE_SPAN: f32 = 1.9;
+const POINTER_TAP_MAX_DRAG_PX: f32 = 8.0;
+const FACE_TAP_VISIBILITY_THRESHOLD: f32 = 0.18;
+const FACE_TAP_RADIUS_SCALE: f32 = 0.7;
 
 impl Default for OrbitRig {
     fn default() -> Self {
@@ -358,6 +396,7 @@ pub fn start_app(canvas_id: &str, base_path: &str) {
             canvas_selector: canvas_selector.clone(),
         })
         .insert_resource(OrbitRig::default())
+        .insert_resource(DirectTurnInputState::default())
         .insert_resource(VisualSyncState::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -375,9 +414,10 @@ pub fn start_app(canvas_id: &str, base_path: &str) {
             (
                 orbit_camera_input,
                 keyboard_turn_shortcuts,
+                apply_camera_transform,
+                canvas_face_tap_input,
                 animate_turn_visuals,
                 sync_cube_visuals,
-                apply_camera_transform,
             )
                 .chain(),
         )
@@ -640,12 +680,12 @@ fn spawn_cube_visuals(
     state: &CubeState,
 ) -> (Entity, Vec<(Entity, UVec3)>) {
     let order = usize::from(state.order.get());
-    let face_span = 1.9_f32;
+    let face_span = CUBE_FACE_SPAN;
     let step = face_span / order as f32;
     let sticker_size = step * 0.84;
     let sticker_depth = 0.06_f32;
     let cube_size = face_span + (step * 0.12);
-    let face_offset = cube_size / 2.0 + (sticker_depth / 2.0);
+    let face_offset = cube_face_offset(state.order.get());
 
     let root = commands
         .spawn((
@@ -749,10 +789,14 @@ fn orbit_camera_input(
     buttons: Res<'_, ButtonInput<MouseButton>>,
     keys: Res<'_, ButtonInput<KeyCode>>,
     touches: Res<'_, Touches>,
+    windows: Query<'_, '_, &Window>,
     mut mouse_motion: MessageReader<'_, '_, MouseMotion>,
     mut mouse_wheel: MessageReader<'_, '_, MouseWheel>,
     mut orbit: ResMut<'_, OrbitRig>,
+    mut direct_turn_input: ResMut<'_, DirectTurnInputState>,
 ) {
+    let shift_pressed = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+
     if keys.just_pressed(KeyCode::Space) {
         orbit.auto_spin = !orbit.auto_spin;
         orbit.snap_target = None;
@@ -762,30 +806,95 @@ fn orbit_camera_input(
         orbit.yaw += time.delta_secs() * 0.18;
     }
 
-    if buttons.pressed(MouseButton::Left) {
-        orbit.mouse_drag_active = true;
-        orbit.snap_target = None;
+    let cursor_position = windows.iter().next().and_then(|window| window.cursor_position());
+    let mouse_delta = mouse_motion
+        .read()
+        .fold(Vec2::ZERO, |total, event| total + event.delta);
+
+    if buttons.just_pressed(MouseButton::Left) {
+        direct_turn_input.mouse_candidate = cursor_position.map(|position| PointerTapCandidate {
+            start_position: position,
+            max_distance: 0.0,
+        });
+        orbit.mouse_drag_active = false;
         orbit.auto_spin = false;
-        for event in mouse_motion.read() {
-            orbit.yaw -= event.delta.x * 0.008;
-            orbit.pitch = (orbit.pitch - event.delta.y * 0.006).clamp(-1.15, 1.15);
+    }
+
+    if buttons.pressed(MouseButton::Left) {
+        if let Some(candidate) = direct_turn_input.mouse_candidate.as_mut() {
+            candidate.max_distance = candidate.max_distance.max(mouse_delta.length());
+            if let Some(position) = cursor_position {
+                candidate.max_distance = candidate
+                    .max_distance
+                    .max(position.distance(candidate.start_position));
+            }
+
+            if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
+                direct_turn_input.mouse_candidate = None;
+                orbit.mouse_drag_active = true;
+                orbit.snap_target = None;
+            }
         }
-    } else {
+
+        if orbit.mouse_drag_active {
+            orbit.snap_target = None;
+            orbit.auto_spin = false;
+            orbit.yaw -= mouse_delta.x * 0.008;
+            orbit.pitch = (orbit.pitch - mouse_delta.y * 0.006).clamp(-1.15, 1.15);
+        }
+    }
+
+    if buttons.just_released(MouseButton::Left) {
         if orbit.mouse_drag_active {
             orbit.mouse_drag_active = false;
             orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
+        } else if let Some(candidate) = direct_turn_input.mouse_candidate.take() {
+            let position = cursor_position.unwrap_or(candidate.start_position);
+            if position.distance(candidate.start_position) <= POINTER_TAP_MAX_DRAG_PX {
+                direct_turn_input.queued_tap = Some(QueuedFaceTap {
+                    position,
+                    inverse: shift_pressed,
+                });
+            }
         }
-        mouse_motion.clear();
+    }
+
+    if buttons.just_released(MouseButton::Right) {
+        if let Some(position) = cursor_position {
+            direct_turn_input.queued_tap = Some(QueuedFaceTap {
+                position,
+                inverse: true,
+            });
+        }
     }
 
     for event in mouse_wheel.read() {
         orbit.radius = (orbit.radius - event.y * 0.18).clamp(2.9, 9.4);
     }
 
-    let active_touches = touches
-        .iter()
-        .map(|touch| touch.position())
-        .collect::<Vec<Vec2>>();
+    if let Some(candidate) = direct_turn_input.touch_candidate {
+        if let Some(released_touch) = touches.get_released(candidate.id) {
+            if !orbit.touch_drag_active && candidate.max_distance <= POINTER_TAP_MAX_DRAG_PX {
+                direct_turn_input.queued_tap = Some(QueuedFaceTap {
+                    position: released_touch.position(),
+                    inverse: false,
+                });
+            }
+            direct_turn_input.touch_candidate = None;
+        } else if touches.just_canceled(candidate.id) {
+            direct_turn_input.touch_candidate = None;
+        }
+    } else if let Some(one_frame_tap) = touches
+        .iter_just_released()
+        .find(|touch| touches.just_pressed(touch.id()))
+    {
+        direct_turn_input.queued_tap = Some(QueuedFaceTap {
+            position: one_frame_tap.position(),
+            inverse: false,
+        });
+    }
+
+    let active_touches = touches.iter().copied().collect::<Vec<_>>();
 
     match active_touches.as_slice() {
         [] => {
@@ -796,33 +905,58 @@ fn orbit_camera_input(
             orbit.previous_touch_center = None;
             orbit.previous_pinch_distance = None;
         }
-        [position] => {
+        [touch] => {
             orbit.auto_spin = false;
-            orbit.touch_drag_active = true;
-            orbit.snap_target = None;
 
-            if let Some(previous_center) = orbit.previous_touch_center {
-                let delta = *position - previous_center;
-                orbit.yaw -= delta.x * 0.008;
-                orbit.pitch = (orbit.pitch - delta.y * 0.006).clamp(-1.15, 1.15);
+            if touches.just_pressed(touch.id()) {
+                direct_turn_input.touch_candidate = Some(TouchTapCandidate {
+                    id: touch.id(),
+                    start_position: touch.position(),
+                    max_distance: 0.0,
+                });
+                orbit.touch_drag_active = false;
             }
 
-            orbit.previous_touch_center = Some(*position);
+            if let Some(candidate) = direct_turn_input
+                .touch_candidate
+                .as_mut()
+                .filter(|candidate| candidate.id == touch.id())
+            {
+                candidate.max_distance = candidate
+                    .max_distance
+                    .max(touch.position().distance(candidate.start_position))
+                    .max(touch.delta().length());
+
+                if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
+                    direct_turn_input.touch_candidate = None;
+                    orbit.touch_drag_active = true;
+                    orbit.snap_target = None;
+                }
+            }
+
+            if orbit.touch_drag_active {
+                orbit.snap_target = None;
+                orbit.yaw -= touch.delta().x * 0.008;
+                orbit.pitch = (orbit.pitch - touch.delta().y * 0.006).clamp(-1.15, 1.15);
+            }
+
+            orbit.previous_touch_center = Some(touch.position());
             orbit.previous_pinch_distance = None;
         }
         [first, second, ..] => {
             orbit.auto_spin = false;
             orbit.touch_drag_active = true;
             orbit.snap_target = None;
+            direct_turn_input.touch_candidate = None;
 
-            let center = (*first + *second) * 0.5;
+            let center = (first.position() + second.position()) * 0.5;
             if let Some(previous_center) = orbit.previous_touch_center {
                 let delta = center - previous_center;
                 orbit.yaw -= delta.x * 0.006;
                 orbit.pitch = (orbit.pitch - delta.y * 0.0045).clamp(-1.15, 1.15);
             }
 
-            let pinch_distance = first.distance(*second);
+            let pinch_distance = first.position().distance(second.position());
             if let Some(previous_pinch_distance) = orbit.previous_pinch_distance {
                 orbit.radius = (orbit.radius - (pinch_distance - previous_pinch_distance) * 0.01)
                     .clamp(2.9, 9.4);
@@ -848,6 +982,37 @@ fn orbit_camera_input(
             }
         }
     }
+}
+
+fn canvas_face_tap_input(
+    mut direct_turn_input: ResMut<'_, DirectTurnInputState>,
+    sync_state: Res<'_, VisualSyncState>,
+    cameras: Query<'_, '_, (&Camera, &GlobalTransform), With<Camera3d>>,
+) {
+    let Some(queued_tap) = direct_turn_input.queued_tap.take() else {
+        return;
+    };
+
+    if sync_state.active_animation.is_some() {
+        return;
+    }
+
+    let Ok((camera, camera_transform)) = cameras.single() else {
+        return;
+    };
+
+    let order = with_runtime(|runtime| runtime.engine.order().get());
+    let Some(turn) = projected_face_tap_turn(
+        camera,
+        camera_transform,
+        order,
+        queued_tap.position,
+        queued_tap.inverse,
+    ) else {
+        return;
+    };
+
+    let _ = update_runtime(|runtime| runtime.apply_turn(turn));
 }
 
 fn keyboard_turn_shortcuts(keys: Res<'_, ButtonInput<KeyCode>>) {
@@ -913,6 +1078,119 @@ fn apply_camera_transform(
     );
 
     *transform = Transform::from_translation(position).looking_at(Vec3::ZERO, Vec3::Y);
+}
+
+fn projected_face_tap_turn(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    order: u8,
+    pointer_position: Vec2,
+    inverse: bool,
+) -> Option<TurnCommand> {
+    let candidates = projected_face_candidates(camera, camera_transform, order);
+    pick_face_candidate(pointer_position, &candidates).map(|face| face_tap_turn(face, inverse))
+}
+
+fn projected_face_candidates(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    order: u8,
+) -> Vec<ScreenFaceCandidate> {
+    let half_span = CUBE_FACE_SPAN * 0.5;
+    let face_offset = cube_face_offset(order);
+    let camera_forward = camera_transform.forward().as_vec3();
+    let mut candidates = Vec::with_capacity(Face::ALL.len());
+
+    for face in Face::ALL {
+        let visibility = face_outward_normal(face).dot(-camera_forward);
+        if visibility <= FACE_TAP_VISIBILITY_THRESHOLD {
+            continue;
+        }
+
+        let face_center = cube_face_center(face, face_offset);
+        let (axis_u, axis_v) = face_pick_axes(face);
+        let projected_center = match camera.world_to_viewport(camera_transform, face_center) {
+            Ok(position) => position,
+            Err(_) => continue,
+        };
+        let projected_corner = match camera.world_to_viewport(
+            camera_transform,
+            face_center + axis_u * half_span + axis_v * half_span,
+        ) {
+            Ok(position) => position,
+            Err(_) => continue,
+        };
+        let radius = projected_center.distance(projected_corner) * FACE_TAP_RADIUS_SCALE;
+        if radius <= f32::EPSILON {
+            continue;
+        }
+
+        candidates.push(ScreenFaceCandidate {
+            face,
+            center: projected_center,
+            radius,
+        });
+    }
+
+    candidates
+}
+
+fn pick_face_candidate(pointer_position: Vec2, candidates: &[ScreenFaceCandidate]) -> Option<Face> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let distance = candidate.center.distance(pointer_position);
+            (distance <= candidate.radius).then_some((distance, candidate.face))
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, face)| face)
+}
+
+fn face_tap_turn(face: Face, inverse: bool) -> TurnCommand {
+    TurnCommand::outer(
+        face,
+        if inverse {
+            RotationAmount::CounterClockwise
+        } else {
+            RotationAmount::Clockwise
+        },
+    )
+}
+
+fn cube_face_offset(order: u8) -> f32 {
+    let step = CUBE_FACE_SPAN / order.max(1) as f32;
+    let cube_size = CUBE_FACE_SPAN + (step * 0.12);
+    cube_size / 2.0 + 0.03
+}
+
+fn cube_face_center(face: Face, face_offset: f32) -> Vec3 {
+    match face {
+        Face::Up => Vec3::new(0.0, face_offset, 0.0),
+        Face::Right => Vec3::new(face_offset, 0.0, 0.0),
+        Face::Front => Vec3::new(0.0, 0.0, face_offset),
+        Face::Down => Vec3::new(0.0, -face_offset, 0.0),
+        Face::Left => Vec3::new(-face_offset, 0.0, 0.0),
+        Face::Back => Vec3::new(0.0, 0.0, -face_offset),
+    }
+}
+
+fn face_outward_normal(face: Face) -> Vec3 {
+    match face {
+        Face::Up => Vec3::Y,
+        Face::Right => Vec3::X,
+        Face::Front => Vec3::Z,
+        Face::Down => -Vec3::Y,
+        Face::Left => -Vec3::X,
+        Face::Back => -Vec3::Z,
+    }
+}
+
+fn face_pick_axes(face: Face) -> (Vec3, Vec3) {
+    match face {
+        Face::Up | Face::Down => (Vec3::X, Vec3::Z),
+        Face::Right | Face::Left => (Vec3::Y, Vec3::Z),
+        Face::Front | Face::Back => (Vec3::X, Vec3::Y),
+    }
 }
 
 fn ease_out_cubic(progress: f32) -> f32 {
@@ -1252,12 +1530,13 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeBridge, cubie_matches_turn, decode_face, decode_rotation, format_turn,
-        keyboard_shortcut_turn, nearest_orbit_snap, normalize_base_path,
-        normalize_canvas_selector, reset_cube, turn_rotation_angle,
+        RuntimeBridge, ScreenFaceCandidate, cubie_matches_turn, decode_face, decode_rotation,
+        face_tap_turn, format_turn, keyboard_shortcut_turn, nearest_orbit_snap,
+        normalize_base_path, normalize_canvas_selector, pick_face_candidate, reset_cube,
+        turn_rotation_angle,
     };
     use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
-    use bevy::prelude::UVec3;
+    use bevy::prelude::{UVec3, Vec2};
 
     #[test]
     fn normalizes_empty_base_path_to_root() {
@@ -1378,5 +1657,52 @@ mod tests {
         assert_eq!(turn.start_layer, 0);
         assert_eq!(turn.width, 2);
         assert!(keyboard_shortcut_turn(Face::Front, RotationAmount::Clockwise, 2, true, 2).is_none());
+    }
+
+    #[test]
+    fn face_tap_turn_uses_inverse_flag() {
+        assert_eq!(
+            face_tap_turn(Face::Up, false),
+            TurnCommand::outer(Face::Up, RotationAmount::Clockwise)
+        );
+        assert_eq!(
+            face_tap_turn(Face::Up, true),
+            TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise)
+        );
+    }
+
+    #[test]
+    fn pick_face_candidate_prefers_the_closest_matching_face() {
+        let selected = pick_face_candidate(
+            Vec2::new(104.0, 96.0),
+            &[
+                ScreenFaceCandidate {
+                    face: Face::Front,
+                    center: Vec2::new(100.0, 100.0),
+                    radius: 18.0,
+                },
+                ScreenFaceCandidate {
+                    face: Face::Right,
+                    center: Vec2::new(126.0, 98.0),
+                    radius: 18.0,
+                },
+            ],
+        );
+
+        assert_eq!(selected, Some(Face::Front));
+    }
+
+    #[test]
+    fn pick_face_candidate_rejects_pointers_outside_face_radius() {
+        let selected = pick_face_candidate(
+            Vec2::new(140.0, 140.0),
+            &[ScreenFaceCandidate {
+                face: Face::Front,
+                center: Vec2::new(100.0, 100.0),
+                radius: 16.0,
+            }],
+        );
+
+        assert_eq!(selected, None);
     }
 }

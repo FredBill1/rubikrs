@@ -222,6 +222,7 @@ h1 {
   height: 100%;
   min-height: 680px;
   background: transparent;
+  touch-action: none;
 }
 
 .stage-caption {
@@ -232,6 +233,7 @@ h1 {
   background: rgba(7, 11, 19, 0.76);
   border-left: 2px solid var(--line-strong);
   backdrop-filter: blur(10px);
+  pointer-events: none;
 }
 
 .telemetry {

@@ -96,8 +96,9 @@ app.innerHTML = `
           <p class="stage-label">orbit / inspect / zoom</p>
           <p class="stage-hint">
             Drag or single-finger swipe to orbit, scroll or pinch to zoom, press Space to toggle auto-spin.
-            Keyboard turns: U R F D L B, hold 2..9 for inner layers, Alt for wide turns, Shift for inverse,
-            Ctrl for 180, Backspace undo, Enter redo.
+            Tap a visible face center to turn it, Shift-click or right-click for inverse, and use U R F D L B on
+            keyboard with 2..9 for inner layers, Alt for wide turns, Shift for inverse, Ctrl for 180,
+            Backspace undo, Enter redo.
           </p>
         </div>
       </section>
@@ -290,6 +291,11 @@ const solverStatus = document.querySelector<HTMLElement>('[data-solver-status]')
 const solverDetail = document.querySelector<HTMLElement>('[data-solver-detail]')
 const solveButton = document.querySelector<HTMLButtonElement>('[data-action="solve"]')
 const cancelSolveButton = document.querySelector<HTMLButtonElement>('[data-action="cancel-solve"]')
+const stageCanvas = document.querySelector<HTMLCanvasElement>('#rubik-canvas')
+
+stageCanvas?.addEventListener('contextmenu', (event) => {
+  event.preventDefault()
+})
 
 function formatTimer(elapsedMillis: number): string {
   const totalTenths = Math.floor(elapsedMillis / 100)

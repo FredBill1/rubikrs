@@ -25,6 +25,9 @@
 - Add a Rust-native `kewb` two-phase 3x3 fallback behind the existing shallow exact-depth worker search so the browser can escalate deeper 3x3 solves without blocking the UI; this is explicitly an interim usability slice, not the final strict-optimal solver promised for 3x3.
 - Build the worker wasm with `getrandom`'s `wasm_js` backend enabled so `kewb`'s dependency chain works on `wasm32-unknown-unknown` in both local builds and Pages-style CI.
 - Lock `U/D` turn semantics to standard cubing notation and compare every exported single-move facelet state against `kewb`'s own move tables; this catches geometry / notation drift before it turns async solver results into incorrect runtime replays.
+- Add direct canvas face-tap turning through camera projection instead of mesh/ray picking: project the six outer-face centers into screen space, discard faces not pointing toward the camera, and accept taps only inside a conservative projected face radius. This gives mouse/touch cube turns without pulling in heavier picking infrastructure.
+- Separate orbit from tap with a drag-distance threshold on both mouse and touch. Orbit should only start after the pointer clearly moves; otherwise a release is treated as a face tap. This avoids the earlier failure mode where the orbit handler consumed the same press that should have been a cube turn.
+- Make the caption overlay visually present but input-transparent, and set `touch-action: none` on the canvas so the shell copy and the browser's default pan/zoom behavior do not steal cube gestures on mobile.
 
 ## Next risks to validate
 
