@@ -853,6 +853,8 @@ fn orbit_camera_input(
 fn keyboard_turn_shortcuts(keys: Res<'_, ButtonInput<KeyCode>>) {
     let shift_pressed = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let half_turn = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    let wide_turn = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
+    let order = with_runtime(|runtime| runtime.engine.order().get());
     let rotation = if half_turn {
         RotationAmount::HalfTurn
     } else if shift_pressed {
@@ -870,7 +872,10 @@ fn keyboard_turn_shortcuts(keys: Res<'_, ButtonInput<KeyCode>>) {
         (KeyCode::KeyB, Face::Back),
     ] {
         if keys.just_pressed(key) {
-            let _ = update_runtime(|runtime| runtime.apply_turn(TurnCommand::outer(face, rotation)));
+            if let Some(turn) = keyboard_shortcut_turn(face, rotation, order, wide_turn, keyboard_selected_layer(&keys))
+            {
+                let _ = update_runtime(|runtime| runtime.apply_turn(turn));
+            }
         }
     }
 
@@ -1130,6 +1135,52 @@ fn decode_rotation(rotation_code: u8) -> Option<RotationAmount> {
     }
 }
 
+fn keyboard_selected_layer(keys: &ButtonInput<KeyCode>) -> u8 {
+    for (key, layer) in [
+        (KeyCode::Digit9, 9),
+        (KeyCode::Digit8, 8),
+        (KeyCode::Digit7, 7),
+        (KeyCode::Digit6, 6),
+        (KeyCode::Digit5, 5),
+        (KeyCode::Digit4, 4),
+        (KeyCode::Digit3, 3),
+        (KeyCode::Digit2, 2),
+        (KeyCode::Digit1, 1),
+    ] {
+        if keys.pressed(key) {
+            return layer;
+        }
+    }
+
+    1
+}
+
+fn keyboard_shortcut_turn(
+    face: Face,
+    rotation: RotationAmount,
+    order: u8,
+    wide_turn: bool,
+    selected_layer: u8,
+) -> Option<TurnCommand> {
+    if selected_layer == 0 || selected_layer > order {
+        return None;
+    }
+
+    let start_layer = selected_layer - 1;
+    let width = if wide_turn { 2 } else { 1 };
+    let turn = TurnCommand {
+        face,
+        start_layer,
+        width,
+        rotation,
+    };
+
+    CubeOrder::new(order)
+        .ok()
+        .filter(|cube_order| turn.validate_for(*cube_order).is_ok())
+        .map(|_| turn)
+}
+
 fn format_turn(turn: TurnCommand) -> String {
     let face = match turn.face {
         Face::Up => "U",
@@ -1202,8 +1253,8 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 mod tests {
     use super::{
         RuntimeBridge, cubie_matches_turn, decode_face, decode_rotation, format_turn,
-        nearest_orbit_snap, normalize_base_path, normalize_canvas_selector, reset_cube,
-        turn_rotation_angle,
+        keyboard_shortcut_turn, nearest_orbit_snap, normalize_base_path,
+        normalize_canvas_selector, reset_cube, turn_rotation_angle,
     };
     use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
     use bevy::prelude::UVec3;
@@ -1310,5 +1361,22 @@ mod tests {
         assert!((target.x - std::f32::consts::FRAC_PI_4).abs() < 0.05);
         assert!((target.y - 0.26).abs() < 0.05);
         assert!(nearest_orbit_snap(1.7, 0.24).is_none());
+    }
+
+    #[test]
+    fn keyboard_shortcut_can_target_inner_layers() {
+        let turn = keyboard_shortcut_turn(Face::Right, RotationAmount::Clockwise, 4, false, 2)
+            .expect("second layer should be valid on 4x4");
+        assert_eq!(turn.start_layer, 1);
+        assert_eq!(turn.width, 1);
+    }
+
+    #[test]
+    fn keyboard_shortcut_can_expand_to_wide_turns() {
+        let turn = keyboard_shortcut_turn(Face::Front, RotationAmount::CounterClockwise, 4, true, 1)
+            .expect("wide outer turn should be valid on 4x4");
+        assert_eq!(turn.start_layer, 0);
+        assert_eq!(turn.width, 2);
+        assert!(keyboard_shortcut_turn(Face::Front, RotationAmount::Clockwise, 2, true, 2).is_none());
     }
 }

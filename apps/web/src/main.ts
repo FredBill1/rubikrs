@@ -96,7 +96,8 @@ app.innerHTML = `
           <p class="stage-label">orbit / inspect / zoom</p>
           <p class="stage-hint">
             Drag or single-finger swipe to orbit, scroll or pinch to zoom, press Space to toggle auto-spin.
-            Keyboard turns: U R F D L B, Shift for inverse, Ctrl for 180, Backspace undo, Enter redo.
+            Keyboard turns: U R F D L B, hold 2..9 for inner layers, Alt for wide turns, Shift for inverse,
+            Ctrl for 180, Backspace undo, Enter redo.
           </p>
         </div>
       </section>
