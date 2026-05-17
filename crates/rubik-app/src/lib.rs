@@ -465,6 +465,9 @@ fn sync_cube_visuals(
             )),
             Transform::default(),
             GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+            ViewVisibility::default(),
         ))
         .id();
 
