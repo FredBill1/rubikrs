@@ -33,6 +33,8 @@ pub struct SolveRequest {
     pub target_depth: u8,
     #[serde(default)]
     pub allowed_faces: Vec<u8>,
+    #[serde(default)]
+    pub turn_history_json: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,7 +162,60 @@ fn solve_request_str(request_json: &str) -> SolveResponse {
         }
     };
 
+    if let Some(response) = solve_with_recorded_history(
+        &state,
+        request.target_depth,
+        request.turn_history_json.as_deref(),
+    ) {
+        return response;
+    }
+
     solve_exact_request(&state, request.target_depth, &request.allowed_faces)
+}
+
+fn solve_with_recorded_history(
+    state: &CubeState,
+    target_depth: u8,
+    turn_history_json: Option<&str>,
+) -> Option<SolveResponse> {
+    let Some(turn_history_json) = turn_history_json else {
+        return None;
+    };
+    let Ok(turn_history) = serde_json::from_str::<Vec<TurnCommand>>(turn_history_json) else {
+        return None;
+    };
+    if turn_history.is_empty() {
+        return None;
+    }
+
+    let replay_turns = turn_history
+        .iter()
+        .rev()
+        .copied()
+        .map(TurnCommand::inverse)
+        .collect::<Vec<_>>();
+    let mut replayed = state.clone();
+    let mut scratch = replayed.stickers.clone();
+    for turn in &replay_turns {
+        apply_turn_to_state_unchecked(&mut replayed, *turn, &mut scratch).ok()?;
+    }
+
+    if replayed != CubeState::solved(state.order) {
+        return None;
+    }
+
+    Some(SolveResponse {
+        kind: SolveOutcomeKind::Solved,
+        turns: replay_turns.iter().copied().map(encode_turn).collect(),
+        explored: 0,
+        depth_limit: target_depth,
+        message: format!(
+            "replayed the inverse of {} recorded turn(s) to solve this {}x{} state",
+            replay_turns.len(),
+            state.order.get(),
+            state.order.get()
+        ),
+    })
 }
 
 fn solve_exact_request(state: &CubeState, target_depth: u8, allowed_faces: &[u8]) -> SolveResponse {
@@ -474,6 +529,7 @@ mod tests {
             state_json: state.to_json().expect("state json"),
             target_depth: 1,
             allowed_faces: vec![2],
+            turn_history_json: None,
         };
         let response: SolveResponse =
             serde_json::from_str(&solve_request_json(&serde_json::to_string(&request).unwrap()))
@@ -496,12 +552,51 @@ mod tests {
             state_json: state.to_json().expect("state json"),
             target_depth: 1,
             allowed_faces: vec![0],
+            turn_history_json: None,
         };
         let response: SolveResponse =
             serde_json::from_str(&solve_request_json(&serde_json::to_string(&request).unwrap()))
                 .expect("response json");
 
         assert!(matches!(response.kind, SolveOutcomeKind::Unsolved));
+    }
+
+    #[test]
+    fn recorded_history_can_solve_larger_orders_without_searching() {
+        let order = rubik_core::CubeOrder::new(4).expect("supported order");
+        let mut state = rubik_core::CubeState::solved(order);
+        let turn_history = vec![
+            TurnCommand::outer(Face::Front, RotationAmount::Clockwise),
+            TurnCommand::outer(Face::Up, RotationAmount::HalfTurn),
+            TurnCommand {
+                face: Face::Right,
+                start_layer: 1,
+                width: 1,
+                rotation: RotationAmount::CounterClockwise,
+            },
+        ];
+
+        for turn in &turn_history {
+            apply_turn_to_state(&mut state, *turn).expect("turn should be valid");
+        }
+
+        let request = SolveRequest {
+            state_json: state.to_json().expect("state json"),
+            target_depth: 1,
+            allowed_faces: vec![0, 1, 2, 3, 4, 5],
+            turn_history_json: Some(serde_json::to_string(&turn_history).expect("history json")),
+        };
+        let response: SolveResponse =
+            serde_json::from_str(&solve_request_json(&serde_json::to_string(&request).unwrap()))
+                .expect("response json");
+
+        assert!(matches!(response.kind, SolveOutcomeKind::Solved));
+        assert_eq!(response.turns.len(), turn_history.len());
+        assert_eq!(response.turns[0].face_code, 1);
+        assert_eq!(response.turns[0].start_layer, 1);
+        assert_eq!(response.turns[0].rotation_code, 0);
+        assert_eq!(response.turns[1].notation, "U2");
+        assert_eq!(response.turns[2].notation, "F'");
     }
 
     #[test]

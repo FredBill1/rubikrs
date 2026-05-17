@@ -395,6 +395,13 @@ pub fn export_cube_state() -> String {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub fn export_turn_history_json() -> String {
+    with_runtime(|runtime| {
+        serde_json::to_string(runtime.engine.turn_history()).unwrap_or_else(|_| "[]".to_owned())
+    })
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn import_cube_state(json: &str) -> bool {
     update_runtime(|runtime| runtime.import_state(json))
 }

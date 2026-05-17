@@ -6,6 +6,7 @@ type SolveWorkerRequest = {
   stateJson: string
   targetDepth: number
   allowedFaces: number[]
+  turnHistoryJson?: string
 }
 
 type SolveWorkerResponse = {
@@ -56,6 +57,7 @@ self.addEventListener('message', async (event: MessageEvent<SolveWorkerRequest>)
       stateJson: event.data.stateJson,
       targetDepth: event.data.targetDepth,
       allowedFaces: event.data.allowedFaces,
+      turnHistoryJson: event.data.turnHistoryJson,
     }))) as Omit<
       SolveWorkerResponse,
       'requestId' | 'laneId'

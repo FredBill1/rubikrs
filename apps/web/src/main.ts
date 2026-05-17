@@ -31,6 +31,7 @@ type SolveWorkerRequest = {
   stateJson: string
   targetDepth: number
   allowedFaces: number[]
+  turnHistoryJson?: string
 }
 
 type SolveWorkerResponse = {
@@ -48,6 +49,7 @@ type RubikWasmModule = {
   start_app: (canvasId: string, basePath: string) => void
   runtime_status_json: () => string
   export_cube_state: () => string
+  export_turn_history_json: () => string
   import_cube_state: (json: string) => boolean
   set_cube_order: (order: number) => boolean
   reset_cube: () => boolean
@@ -283,6 +285,16 @@ function formatTimer(elapsedMillis: number): string {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${tenths}`
 }
 
+function parseTurnHistoryLength(raw: string): number {
+  try {
+    const history = JSON.parse(raw) as unknown[]
+    return Array.isArray(history) ? history.length : 0
+  } catch (error) {
+    console.error(error)
+    return 0
+  }
+}
+
 function parseRuntimeStatus(raw: string): RuntimeStatus | null {
   try {
     return JSON.parse(raw) as RuntimeStatus
@@ -486,10 +498,89 @@ async function startSolve(module: RubikWasmModule): Promise<void> {
   activeSolveRequestId = requestId
   activeSolveSceneRevision = currentSceneRevision()
   syncSolveControls()
+  const stateJson = module.export_cube_state()
+  const turnHistoryJson = module.export_turn_history_json()
+  const turnHistoryLength = parseTurnHistoryLength(turnHistoryJson)
+  let totalExplored = 0
+
+  if (order !== 3 && turnHistoryLength > 0) {
+    const worker = ensureSolverWorkers(1)[0]
+    updateSolverState(
+      'solving',
+      `Replaying the inverse of ${turnHistoryLength} recorded turn(s) in a Rust wasm worker for ${order}x${order}.`
+    )
+
+    let result: SolveWorkerResponse
+    try {
+      result = await runSolveLane(worker, {
+        kind: 'solve',
+        requestId,
+        laneId: 0,
+        order,
+        stateJson,
+        targetDepth: 1,
+        allowedFaces: [...rootFaceCodes],
+        turnHistoryJson,
+      })
+    } catch (error) {
+      if (activeSolveRequestId !== requestId) {
+        return
+      }
+
+      finishSolveSession()
+      terminateSolverWorkers()
+      updateSolverState('worker fault', error instanceof Error ? error.message : 'unknown worker history failure')
+      return
+    }
+
+    if (activeSolveRequestId !== requestId) {
+      return
+    }
+
+    const sceneRevision = currentSceneRevision()
+    if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
+      finishSolveSession()
+      updateSolverState(
+        'stale result discarded',
+        'The cube state changed while the worker was replaying recorded history, so the returned solution was ignored.'
+      )
+      return
+    }
+
+    if (result.kind === 'error') {
+      finishSolveSession()
+      terminateSolverWorkers()
+      updateSolverState('worker error', result.message)
+      return
+    }
+
+    if (result.kind === 'solved') {
+      finishSolveSession()
+
+      const notation = result.turns.map((turn) => turn.notation).join(' ')
+      for (const turn of result.turns) {
+        module.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
+      }
+      syncStatus()
+
+      const suffix =
+        result.turns.length > 0
+          ? ` Applied ${result.turns.length} recorded inverse turn(s)${notation ? `: ${notation}.` : '.'}`
+          : ' No turns were needed.'
+      updateSolverState('solved', `${result.message}.${suffix}`)
+      return
+    }
+
+    finishSolveSession()
+    updateSolverState(
+      'history unavailable',
+      'Recorded history could not solve the current state, so this NxN request still needs a deeper feasible solver.'
+    )
+    return
+  }
+
   const faceGroups = partitionRootFaces(activeSolveLaneCount())
   const workers = ensureSolverWorkers(faceGroups.length)
-  const stateJson = module.export_cube_state()
-  let totalExplored = 0
 
   for (let depth = 1; depth <= maxDepth; depth += 1) {
     if (activeSolveRequestId !== requestId) {
