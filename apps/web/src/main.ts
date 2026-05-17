@@ -262,6 +262,8 @@ const statusSolved = document.querySelector<HTMLElement>('[data-status-solved]')
 const statusHistory = document.querySelector<HTMLElement>('[data-status-history]')
 const solverStatus = document.querySelector<HTMLElement>('[data-solver-status]')
 const solverDetail = document.querySelector<HTMLElement>('[data-solver-detail]')
+const solveButton = document.querySelector<HTMLButtonElement>('[data-action="solve"]')
+const cancelSolveButton = document.querySelector<HTMLButtonElement>('[data-action="cancel-solve"]')
 
 function formatTimer(elapsedMillis: number): string {
   const totalTenths = Math.floor(elapsedMillis / 100)
@@ -331,6 +333,40 @@ function updateSolverState(label: string, detail: string): void {
   }
 }
 
+function solveDepthCap(order: number): number {
+  if (order <= 2) {
+    return 8
+  }
+  if (order === 3) {
+    return 7
+  }
+  if (order <= 5) {
+    return 5
+  }
+  return 4
+}
+
+function syncSolveControls(): void {
+  const order = Number.parseInt(orderSelect?.value ?? '3', 10) || 3
+  const cap = solveDepthCap(order)
+  const busy = activeSolveRequestId !== null
+
+  if (solveDepth) {
+    solveDepth.max = String(cap)
+    const nextValue = Math.min(cap, Math.max(1, Number.parseInt(solveDepth.value || String(cap), 10) || cap))
+    solveDepth.value = String(nextValue)
+    solveDepth.disabled = busy
+  }
+
+  if (solveButton) {
+    solveButton.disabled = busy
+  }
+
+  if (cancelSolveButton) {
+    cancelSolveButton.disabled = !busy
+  }
+}
+
 function currentSceneRevision(): number | null {
   if (!runtime) {
     return null
@@ -352,6 +388,7 @@ function ensureSolverWorker(): Worker {
 
     const sceneRevision = currentSceneRevision()
     activeSolveRequestId = null
+    syncSolveControls()
 
     if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
       updateSolverState(
@@ -393,6 +430,7 @@ function ensureSolverWorker(): Worker {
   solverWorker.addEventListener('error', () => {
     activeSolveRequestId = null
     activeSolveSceneRevision = null
+    syncSolveControls()
     updateSolverState('worker fault', 'The solver worker crashed and will be recreated on the next request.')
     solverWorker?.terminate()
     solverWorker = null
@@ -410,6 +448,7 @@ function cancelActiveSolve(detail: string): void {
   activeSolveSceneRevision = null
   solverWorker?.terminate()
   solverWorker = null
+  syncSolveControls()
   updateSolverState('cancelled', detail)
 }
 
@@ -419,7 +458,9 @@ function startSolve(module: RubikWasmModule): void {
     return
   }
 
-  const maxDepth = Math.min(8, Math.max(1, Number.parseInt(solveDepth?.value ?? '5', 10) || 5))
+  const order = Number.parseInt(orderSelect?.value ?? '3', 10) || 3
+  const cap = solveDepthCap(order)
+  const maxDepth = Math.min(cap, Math.max(1, Number.parseInt(solveDepth?.value ?? '5', 10) || 5))
   if (solveDepth) {
     solveDepth.value = String(maxDepth)
   }
@@ -427,12 +468,16 @@ function startSolve(module: RubikWasmModule): void {
   const requestId = ++nextSolveRequestId
   activeSolveRequestId = requestId
   activeSolveSceneRevision = currentSceneRevision()
-  updateSolverState('solving', `Searching up to depth ${maxDepth} in a dedicated Rust wasm worker.`)
+  syncSolveControls()
+  updateSolverState(
+    'solving',
+    `Searching up to depth ${maxDepth} for the current ${order}x${order} state in a dedicated Rust wasm worker.`
+  )
 
   const request: SolveWorkerRequest = {
     kind: 'solve',
     requestId,
-    order: Number.parseInt(orderSelect?.value ?? '3', 10) || 3,
+    order,
     stateJson: module.export_cube_state(),
     maxDepth,
   }
@@ -516,6 +561,7 @@ function bindShellControls(module: RubikWasmModule): void {
     cancelActiveSolve('Changing the cube order cancelled the in-flight solve request.')
     const nextOrder = Number.parseInt(orderSelect.value, 10)
     module.set_cube_order(nextOrder)
+    syncSolveControls()
     syncStatus()
   })
 
@@ -535,6 +581,8 @@ function bindShellControls(module: RubikWasmModule): void {
     importFile.value = ''
     syncStatus()
   })
+
+  syncSolveControls()
 }
 
 async function bootstrapRuntime(): Promise<void> {
