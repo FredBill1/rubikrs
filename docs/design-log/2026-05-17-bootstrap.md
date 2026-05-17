@@ -28,6 +28,8 @@
 - Add direct canvas face-tap turning through camera projection instead of mesh/ray picking: project the six outer-face centers into screen space, discard faces not pointing toward the camera, and accept taps only inside a conservative projected face radius. This gives mouse/touch cube turns without pulling in heavier picking infrastructure.
 - Separate orbit from tap with a drag-distance threshold on both mouse and touch. Orbit should only start after the pointer clearly moves; otherwise a release is treated as a face tap. This avoids the earlier failure mode where the orbit handler consumed the same press that should have been a cube turn.
 - Make the caption overlay visually present but input-transparent, and set `touch-action: none` on the canvas so the shell copy and the browser's default pan/zoom behavior do not steal cube gestures on mobile.
+- For direct drag-to-turn, capture the visible face candidate at pointer-down and keep orbit disabled for that gesture path; once drag starts, interpret the release as a face turn instead of a camera move. This keeps drag semantics stable even when the pointer leaves the face during the gesture.
+- Replace the old projected-circle face hitbox with projected quadrilateral containment plus a basis-vector fallback for near-center drags. The circle approximation was good enough for taps but let neighboring visible faces overlap too much, especially around the top/right seam.
 
 ## Next risks to validate
 

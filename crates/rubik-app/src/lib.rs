@@ -61,6 +61,7 @@ struct DirectTurnInputState {
     mouse_candidate: Option<PointerTapCandidate>,
     touch_candidate: Option<TouchTapCandidate>,
     queued_tap: Option<QueuedFaceTap>,
+    queued_turn: Option<TurnCommand>,
 }
 
 #[derive(Resource, Default)]
@@ -128,6 +129,7 @@ struct ActiveTurnAnimation {
 struct PointerTapCandidate {
     start_position: Vec2,
     max_distance: f32,
+    face_candidate: Option<ScreenFaceCandidate>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +137,7 @@ struct TouchTapCandidate {
     id: u64,
     start_position: Vec2,
     max_distance: f32,
+    face_candidate: Option<ScreenFaceCandidate>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +151,8 @@ struct ScreenFaceCandidate {
     face: Face,
     center: Vec2,
     radius: f32,
+    drag_basis: Vec2,
+    corners: [Vec2; 4],
 }
 
 const CUBE_FACE_SPAN: f32 = 1.9;
@@ -790,12 +795,15 @@ fn orbit_camera_input(
     keys: Res<'_, ButtonInput<KeyCode>>,
     touches: Res<'_, Touches>,
     windows: Query<'_, '_, &Window>,
+    cameras: Query<'_, '_, (&Camera, &GlobalTransform), With<Camera3d>>,
     mut mouse_motion: MessageReader<'_, '_, MouseMotion>,
     mut mouse_wheel: MessageReader<'_, '_, MouseWheel>,
     mut orbit: ResMut<'_, OrbitRig>,
     mut direct_turn_input: ResMut<'_, DirectTurnInputState>,
 ) {
     let shift_pressed = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let camera_context = cameras.single().ok();
+    let order = with_runtime(|runtime| runtime.engine.order().get());
 
     if keys.just_pressed(KeyCode::Space) {
         orbit.auto_spin = !orbit.auto_spin;
@@ -815,6 +823,8 @@ fn orbit_camera_input(
         direct_turn_input.mouse_candidate = cursor_position.map(|position| PointerTapCandidate {
             start_position: position,
             max_distance: 0.0,
+            face_candidate: camera_context
+                .and_then(|(camera, camera_transform)| projected_face_hit(camera, camera_transform, order, position)),
         });
         orbit.mouse_drag_active = false;
         orbit.auto_spin = false;
@@ -830,9 +840,11 @@ fn orbit_camera_input(
             }
 
             if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                direct_turn_input.mouse_candidate = None;
-                orbit.mouse_drag_active = true;
-                orbit.snap_target = None;
+                if candidate.face_candidate.is_none() {
+                    direct_turn_input.mouse_candidate = None;
+                    orbit.mouse_drag_active = true;
+                    orbit.snap_target = None;
+                }
             }
         }
 
@@ -850,7 +862,20 @@ fn orbit_camera_input(
             orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
         } else if let Some(candidate) = direct_turn_input.mouse_candidate.take() {
             let position = cursor_position.unwrap_or(candidate.start_position);
-            if position.distance(candidate.start_position) <= POINTER_TAP_MAX_DRAG_PX {
+            if let Some(face_candidate) = candidate.face_candidate {
+                if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
+                    if let Some(turn) =
+                        drag_turn_from_face_gesture(face_candidate, candidate.start_position, position)
+                    {
+                        direct_turn_input.queued_turn = Some(turn);
+                    }
+                } else if position.distance(candidate.start_position) <= POINTER_TAP_MAX_DRAG_PX {
+                    direct_turn_input.queued_tap = Some(QueuedFaceTap {
+                        position,
+                        inverse: shift_pressed,
+                    });
+                }
+            } else if position.distance(candidate.start_position) <= POINTER_TAP_MAX_DRAG_PX {
                 direct_turn_input.queued_tap = Some(QueuedFaceTap {
                     position,
                     inverse: shift_pressed,
@@ -874,7 +899,22 @@ fn orbit_camera_input(
 
     if let Some(candidate) = direct_turn_input.touch_candidate {
         if let Some(released_touch) = touches.get_released(candidate.id) {
-            if !orbit.touch_drag_active && candidate.max_distance <= POINTER_TAP_MAX_DRAG_PX {
+            if let Some(face_candidate) = candidate.face_candidate {
+                if !orbit.touch_drag_active && candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
+                    if let Some(turn) = drag_turn_from_face_gesture(
+                        face_candidate,
+                        candidate.start_position,
+                        released_touch.position(),
+                    ) {
+                        direct_turn_input.queued_turn = Some(turn);
+                    }
+                } else if !orbit.touch_drag_active && candidate.max_distance <= POINTER_TAP_MAX_DRAG_PX {
+                    direct_turn_input.queued_tap = Some(QueuedFaceTap {
+                        position: released_touch.position(),
+                        inverse: false,
+                    });
+                }
+            } else if !orbit.touch_drag_active && candidate.max_distance <= POINTER_TAP_MAX_DRAG_PX {
                 direct_turn_input.queued_tap = Some(QueuedFaceTap {
                     position: released_touch.position(),
                     inverse: false,
@@ -913,6 +953,9 @@ fn orbit_camera_input(
                     id: touch.id(),
                     start_position: touch.position(),
                     max_distance: 0.0,
+                    face_candidate: camera_context.and_then(|(camera, camera_transform)| {
+                        projected_face_hit(camera, camera_transform, order, touch.position())
+                    }),
                 });
                 orbit.touch_drag_active = false;
             }
@@ -928,9 +971,11 @@ fn orbit_camera_input(
                     .max(touch.delta().length());
 
                 if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                    direct_turn_input.touch_candidate = None;
-                    orbit.touch_drag_active = true;
-                    orbit.snap_target = None;
+                    if candidate.face_candidate.is_none() {
+                        direct_turn_input.touch_candidate = None;
+                        orbit.touch_drag_active = true;
+                        orbit.snap_target = None;
+                    }
                 }
             }
 
@@ -989,26 +1034,27 @@ fn canvas_face_tap_input(
     sync_state: Res<'_, VisualSyncState>,
     cameras: Query<'_, '_, (&Camera, &GlobalTransform), With<Camera3d>>,
 ) {
-    let Some(queued_tap) = direct_turn_input.queued_tap.take() else {
-        return;
-    };
-
     if sync_state.active_animation.is_some() {
         return;
     }
+
+    if let Some(turn) = direct_turn_input.queued_turn.take() {
+        let _ = update_runtime(|runtime| runtime.apply_turn(turn));
+        return;
+    }
+
+    let Some(queued_tap) = direct_turn_input.queued_tap.take() else {
+        return;
+    };
 
     let Ok((camera, camera_transform)) = cameras.single() else {
         return;
     };
 
     let order = with_runtime(|runtime| runtime.engine.order().get());
-    let Some(turn) = projected_face_tap_turn(
-        camera,
-        camera_transform,
-        order,
-        queued_tap.position,
-        queued_tap.inverse,
-    ) else {
+    let Some(turn) =
+        projected_face_tap_turn(camera, camera_transform, order, queued_tap.position, queued_tap.inverse)
+    else {
         return;
     };
 
@@ -1087,8 +1133,8 @@ fn projected_face_tap_turn(
     pointer_position: Vec2,
     inverse: bool,
 ) -> Option<TurnCommand> {
-    let candidates = projected_face_candidates(camera, camera_transform, order);
-    pick_face_candidate(pointer_position, &candidates).map(|face| face_tap_turn(face, inverse))
+    projected_face_hit(camera, camera_transform, order, pointer_position)
+        .map(|candidate| face_tap_turn(candidate.face, inverse))
 }
 
 fn projected_face_candidates(
@@ -1120,8 +1166,33 @@ fn projected_face_candidates(
             Ok(position) => position,
             Err(_) => continue,
         };
+        let projected_basis = match camera.world_to_viewport(
+            camera_transform,
+            face_center + axis_u * (half_span * 0.5),
+        ) {
+            Ok(position) => position - projected_center,
+            Err(_) => continue,
+        };
         let radius = projected_center.distance(projected_corner) * FACE_TAP_RADIUS_SCALE;
-        if radius <= f32::EPSILON {
+        if radius <= f32::EPSILON || projected_basis.length_squared() <= f32::EPSILON {
+            continue;
+        }
+
+        let projected_corners = [
+            camera
+                .world_to_viewport(camera_transform, face_center - axis_u * half_span + axis_v * half_span)
+                .ok(),
+            camera
+                .world_to_viewport(camera_transform, face_center + axis_u * half_span + axis_v * half_span)
+                .ok(),
+            camera
+                .world_to_viewport(camera_transform, face_center + axis_u * half_span - axis_v * half_span)
+                .ok(),
+            camera
+                .world_to_viewport(camera_transform, face_center - axis_u * half_span - axis_v * half_span)
+                .ok(),
+        ];
+        if projected_corners.iter().any(Option::is_none) {
             continue;
         }
 
@@ -1129,21 +1200,69 @@ fn projected_face_candidates(
             face,
             center: projected_center,
             radius,
+            drag_basis: projected_basis.normalize(),
+            corners: projected_corners.map(|corner| corner.expect("checked face corner projection")),
         });
     }
 
     candidates
 }
 
-fn pick_face_candidate(pointer_position: Vec2, candidates: &[ScreenFaceCandidate]) -> Option<Face> {
+fn projected_face_hit(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    order: u8,
+    pointer_position: Vec2,
+) -> Option<ScreenFaceCandidate> {
+    let candidates = projected_face_candidates(camera, camera_transform, order);
+    pick_face_candidate(pointer_position, &candidates)
+}
+
+fn pick_face_candidate(
+    pointer_position: Vec2,
+    candidates: &[ScreenFaceCandidate],
+) -> Option<ScreenFaceCandidate> {
     candidates
         .iter()
         .filter_map(|candidate| {
             let distance = candidate.center.distance(pointer_position);
-            (distance <= candidate.radius).then_some((distance, candidate.face))
+            face_candidate_contains_point(*candidate, pointer_position).then_some((distance, *candidate))
         })
         .min_by(|left, right| left.0.total_cmp(&right.0))
-        .map(|(_, face)| face)
+        .map(|(_, candidate)| candidate)
+}
+
+fn drag_turn_from_face_gesture(
+    candidate: ScreenFaceCandidate,
+    start_position: Vec2,
+    end_position: Vec2,
+) -> Option<TurnCommand> {
+    let drag = end_position - start_position;
+    if drag.length() <= POINTER_TAP_MAX_DRAG_PX {
+        return None;
+    }
+
+    let start_from_center = start_position - candidate.center;
+    let end_from_center = end_position - candidate.center;
+    let min_radius = candidate.radius * 0.2;
+    let signed_angle = if start_from_center.length() >= min_radius && end_from_center.length() >= min_radius {
+        signed_screen_angle(start_from_center, end_from_center)
+    } else {
+        drag.dot(candidate.drag_basis) / candidate.radius.max(1.0)
+    };
+
+    if signed_angle.abs() <= 0.16 {
+        return None;
+    }
+
+    Some(TurnCommand::outer(
+        candidate.face,
+        if signed_angle.is_sign_positive() {
+            RotationAmount::Clockwise
+        } else {
+            RotationAmount::CounterClockwise
+        },
+    ))
 }
 
 fn face_tap_turn(face: Face, inverse: bool) -> TurnCommand {
@@ -1155,6 +1274,36 @@ fn face_tap_turn(face: Face, inverse: bool) -> TurnCommand {
             RotationAmount::Clockwise
         },
     )
+}
+
+fn signed_screen_angle(from: Vec2, to: Vec2) -> f32 {
+    let from_normalized = from.normalize_or_zero();
+    let to_normalized = to.normalize_or_zero();
+    let cross = from_normalized.x * to_normalized.y - from_normalized.y * to_normalized.x;
+    let dot = from_normalized.dot(to_normalized).clamp(-1.0, 1.0);
+    cross.atan2(dot)
+}
+
+fn face_candidate_contains_point(candidate: ScreenFaceCandidate, point: Vec2) -> bool {
+    let mut winding_sign = 0.0_f32;
+    for index in 0..candidate.corners.len() {
+        let current = candidate.corners[index];
+        let next = candidate.corners[(index + 1) % candidate.corners.len()];
+        let edge = next - current;
+        let offset = point - current;
+        let cross = edge.x * offset.y - edge.y * offset.x;
+        if cross.abs() <= 0.5 {
+            continue;
+        }
+
+        if winding_sign == 0.0 {
+            winding_sign = cross.signum();
+        } else if cross.signum() != winding_sign {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn cube_face_offset(order: u8) -> f32 {
@@ -1531,8 +1680,9 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 mod tests {
     use super::{
         RuntimeBridge, ScreenFaceCandidate, cubie_matches_turn, decode_face, decode_rotation,
-        face_tap_turn, format_turn, keyboard_shortcut_turn, nearest_orbit_snap,
-        normalize_base_path, normalize_canvas_selector, pick_face_candidate, reset_cube,
+        drag_turn_from_face_gesture, face_candidate_contains_point, face_tap_turn, format_turn,
+        keyboard_shortcut_turn, nearest_orbit_snap, normalize_base_path,
+        normalize_canvas_selector, pick_face_candidate, reset_cube, signed_screen_angle,
         turn_rotation_angle,
     };
     use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
@@ -1680,16 +1830,30 @@ mod tests {
                     face: Face::Front,
                     center: Vec2::new(100.0, 100.0),
                     radius: 18.0,
+                    drag_basis: Vec2::X,
+                    corners: [
+                        Vec2::new(82.0, 82.0),
+                        Vec2::new(118.0, 82.0),
+                        Vec2::new(118.0, 118.0),
+                        Vec2::new(82.0, 118.0),
+                    ],
                 },
                 ScreenFaceCandidate {
                     face: Face::Right,
                     center: Vec2::new(126.0, 98.0),
                     radius: 18.0,
+                    drag_basis: Vec2::Y,
+                    corners: [
+                        Vec2::new(108.0, 80.0),
+                        Vec2::new(144.0, 80.0),
+                        Vec2::new(144.0, 116.0),
+                        Vec2::new(108.0, 116.0),
+                    ],
                 },
             ],
         );
 
-        assert_eq!(selected, Some(Face::Front));
+        assert_eq!(selected.map(|candidate| candidate.face), Some(Face::Front));
     }
 
     #[test]
@@ -1700,9 +1864,89 @@ mod tests {
                 face: Face::Front,
                 center: Vec2::new(100.0, 100.0),
                 radius: 16.0,
+                drag_basis: Vec2::X,
+                corners: [
+                    Vec2::new(84.0, 84.0),
+                    Vec2::new(116.0, 84.0),
+                    Vec2::new(116.0, 116.0),
+                    Vec2::new(84.0, 116.0),
+                ],
             }],
         );
 
         assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn projected_quad_rejects_points_that_only_match_the_old_circle_hitbox() {
+        let candidate = ScreenFaceCandidate {
+            face: Face::Up,
+            center: Vec2::new(100.0, 100.0),
+            radius: 28.0,
+            drag_basis: Vec2::X,
+            corners: [
+                Vec2::new(100.0, 70.0),
+                Vec2::new(130.0, 100.0),
+                Vec2::new(100.0, 130.0),
+                Vec2::new(70.0, 100.0),
+            ],
+        };
+        let off_corner_point = Vec2::new(118.0, 82.0);
+
+        assert!(candidate.center.distance(off_corner_point) < candidate.radius);
+        assert!(!face_candidate_contains_point(candidate, off_corner_point));
+        assert_eq!(pick_face_candidate(off_corner_point, &[candidate]), None);
+    }
+
+    #[test]
+    fn signed_screen_angle_is_positive_for_clockwise_arc() {
+        let angle = signed_screen_angle(Vec2::new(0.0, -1.0), Vec2::new(1.0, 0.0));
+        assert!(angle > 1.0);
+    }
+
+    #[test]
+    fn drag_turn_uses_clockwise_arc_on_face_candidate() {
+        let turn = drag_turn_from_face_gesture(
+            ScreenFaceCandidate {
+                face: Face::Front,
+                center: Vec2::new(100.0, 100.0),
+                radius: 40.0,
+                drag_basis: Vec2::X,
+                corners: [
+                    Vec2::new(60.0, 60.0),
+                    Vec2::new(140.0, 60.0),
+                    Vec2::new(140.0, 140.0),
+                    Vec2::new(60.0, 140.0),
+                ],
+            },
+            Vec2::new(100.0, 70.0),
+            Vec2::new(130.0, 100.0),
+        )
+        .expect("clockwise arc should produce a turn");
+
+        assert_eq!(turn, TurnCommand::outer(Face::Front, RotationAmount::Clockwise));
+    }
+
+    #[test]
+    fn drag_turn_falls_back_to_basis_when_started_near_center() {
+        let turn = drag_turn_from_face_gesture(
+            ScreenFaceCandidate {
+                face: Face::Right,
+                center: Vec2::new(100.0, 100.0),
+                radius: 40.0,
+                drag_basis: Vec2::X,
+                corners: [
+                    Vec2::new(60.0, 60.0),
+                    Vec2::new(140.0, 60.0),
+                    Vec2::new(140.0, 140.0),
+                    Vec2::new(60.0, 140.0),
+                ],
+            },
+            Vec2::new(102.0, 101.0),
+            Vec2::new(128.0, 101.0),
+        )
+        .expect("basis-aligned drag should produce a turn");
+
+        assert_eq!(turn, TurnCommand::outer(Face::Right, RotationAmount::Clockwise));
     }
 }
