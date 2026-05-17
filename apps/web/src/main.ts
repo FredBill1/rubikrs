@@ -25,14 +25,17 @@ type SolveTurn = {
 type SolveWorkerRequest = {
   kind: 'solve'
   requestId: number
+  laneId: number
   order: number
   stateJson: string
-  maxDepth: number
+  targetDepth: number
+  allowedFaces: number[]
 }
 
 type SolveWorkerResponse = {
   kind: 'solved' | 'unsolved' | 'error'
   requestId: number
+  laneId: number
   turns: SolveTurn[]
   explored: number
   depthLimit: number
@@ -61,9 +64,10 @@ if (!app) {
 
 const basePath = import.meta.env.BASE_URL
 const parallelLanes = Math.max(1, Math.min(8, Math.floor((navigator.hardwareConcurrency ?? 4) / 2)))
+const rootFaceCodes = [0, 1, 2, 3, 4, 5] as const
 let runtime: RubikWasmModule | null = null
 let statusPollHandle: number | null = null
-let solverWorker: Worker | null = null
+let solverWorkers: Worker[] = []
 let activeSolveRequestId: number | null = null
 let activeSolveSceneRevision: number | null = null
 let nextSolveRequestId = 0
@@ -375,68 +379,70 @@ function currentSceneRevision(): number | null {
   return parseRuntimeStatus(runtime.runtime_status_json())?.scene_revision ?? null
 }
 
-function ensureSolverWorker(): Worker {
-  if (solverWorker) {
-    return solverWorker
+function activeSolveLaneCount(): number {
+  return Math.max(1, Math.min(parallelLanes, rootFaceCodes.length))
+}
+
+function partitionRootFaces(laneCount: number): number[][] {
+  const groups = Array.from({ length: laneCount }, () => [] as number[])
+
+  rootFaceCodes.forEach((faceCode, index) => {
+    groups[index % laneCount].push(faceCode)
+  })
+
+  return groups.filter((group) => group.length > 0)
+}
+
+function terminateSolverWorkers(): void {
+  for (const worker of solverWorkers) {
+    worker.terminate()
+  }
+  solverWorkers = []
+}
+
+function ensureSolverWorkers(count: number): Worker[] {
+  while (solverWorkers.length < count) {
+    solverWorkers.push(new Worker(new URL('./solver.worker.ts', import.meta.url), { type: 'module' }))
   }
 
-  solverWorker = new Worker(new URL('./solver.worker.ts', import.meta.url), { type: 'module' })
-  solverWorker.addEventListener('message', (event: MessageEvent<SolveWorkerResponse>) => {
-    if (!runtime || activeSolveRequestId === null || event.data.requestId !== activeSolveRequestId) {
-      return
+  while (solverWorkers.length > count) {
+    solverWorkers.pop()?.terminate()
+  }
+
+  return solverWorkers
+}
+
+function runSolveLane(worker: Worker, request: SolveWorkerRequest): Promise<SolveWorkerResponse> {
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      worker.removeEventListener('message', onMessage)
+      worker.removeEventListener('error', onError)
     }
 
-    const sceneRevision = currentSceneRevision()
-    activeSolveRequestId = null
-    syncSolveControls()
-
-    if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
-      updateSolverState(
-        'stale result discarded',
-        'The cube state changed while the worker was searching, so the returned solution was ignored.'
-      )
-      activeSolveSceneRevision = null
-      return
-    }
-
-    activeSolveSceneRevision = null
-
-    if (event.data.kind === 'solved') {
-      const notation = event.data.turns.map((turn) => turn.notation).join(' ')
-      for (const turn of event.data.turns) {
-        runtime.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
+    const onMessage = (event: MessageEvent<SolveWorkerResponse>): void => {
+      if (event.data.requestId !== request.requestId || event.data.laneId !== request.laneId) {
+        return
       }
-      syncStatus()
 
-      const suffix =
-        event.data.turns.length > 0
-          ? ` Applied ${event.data.turns.length} turn(s) from the worker${notation ? `: ${notation}.` : '.'}`
-          : ' No turns were needed.'
-      updateSolverState('solved', `${event.data.message}.${suffix}`)
-      return
+      cleanup()
+      resolve(event.data)
     }
 
-    if (event.data.kind === 'unsolved') {
-      updateSolverState(
-        'depth limit reached',
-        `${event.data.message} Explored ${event.data.explored.toLocaleString()} nodes.`
-      )
-      return
+    const onError = (): void => {
+      cleanup()
+      reject(new Error(`solver worker lane ${request.laneId + 1} crashed`))
     }
 
-    updateSolverState('worker error', event.data.message)
+    worker.addEventListener('message', onMessage)
+    worker.addEventListener('error', onError)
+    worker.postMessage(request)
   })
+}
 
-  solverWorker.addEventListener('error', () => {
-    activeSolveRequestId = null
-    activeSolveSceneRevision = null
-    syncSolveControls()
-    updateSolverState('worker fault', 'The solver worker crashed and will be recreated on the next request.')
-    solverWorker?.terminate()
-    solverWorker = null
-  })
-
-  return solverWorker
+function finishSolveSession(): void {
+  activeSolveRequestId = null
+  activeSolveSceneRevision = null
+  syncSolveControls()
 }
 
 function cancelActiveSolve(detail: string): void {
@@ -444,21 +450,25 @@ function cancelActiveSolve(detail: string): void {
     return
   }
 
-  activeSolveRequestId = null
-  activeSolveSceneRevision = null
-  solverWorker?.terminate()
-  solverWorker = null
-  syncSolveControls()
+  finishSolveSession()
+  terminateSolverWorkers()
   updateSolverState('cancelled', detail)
 }
 
-function startSolve(module: RubikWasmModule): void {
+async function startSolve(module: RubikWasmModule): Promise<void> {
   if (activeSolveRequestId !== null) {
     updateSolverState('busy', 'A solve request is already running. Cancel it before starting another one.')
     return
   }
 
-  const order = Number.parseInt(orderSelect?.value ?? '3', 10) || 3
+  const runtimeStatus = parseRuntimeStatus(module.runtime_status_json())
+  const order = runtimeStatus?.order ?? (Number.parseInt(orderSelect?.value ?? '3', 10) || 3)
+  if (runtimeStatus?.is_solved) {
+    updateSolverState('already solved', 'The current state is already solved, so no worker search was started.')
+    syncSolveControls()
+    return
+  }
+
   const cap = solveDepthCap(order)
   const maxDepth = Math.min(cap, Math.max(1, Number.parseInt(solveDepth?.value ?? '5', 10) || 5))
   if (solveDepth) {
@@ -469,20 +479,107 @@ function startSolve(module: RubikWasmModule): void {
   activeSolveRequestId = requestId
   activeSolveSceneRevision = currentSceneRevision()
   syncSolveControls()
-  updateSolverState(
-    'solving',
-    `Searching up to depth ${maxDepth} for the current ${order}x${order} state in a dedicated Rust wasm worker.`
-  )
+  const faceGroups = partitionRootFaces(activeSolveLaneCount())
+  const workers = ensureSolverWorkers(faceGroups.length)
+  const stateJson = module.export_cube_state()
+  let totalExplored = 0
 
-  const request: SolveWorkerRequest = {
-    kind: 'solve',
-    requestId,
-    order,
-    stateJson: module.export_cube_state(),
-    maxDepth,
+  for (let depth = 1; depth <= maxDepth; depth += 1) {
+    if (activeSolveRequestId !== requestId) {
+      return
+    }
+
+    updateSolverState(
+      'solving',
+      `Searching depth ${depth}/${maxDepth} for ${order}x${order} across ${faceGroups.length} worker lane(s).`
+    )
+
+    let results: SolveWorkerResponse[]
+    try {
+      results = await Promise.all(
+        faceGroups.map((allowedFaces, laneId) =>
+          runSolveLane(workers[laneId], {
+            kind: 'solve',
+            requestId,
+            laneId,
+            order,
+            stateJson,
+            targetDepth: depth,
+            allowedFaces,
+          })
+        )
+      )
+    } catch (error) {
+      if (activeSolveRequestId !== requestId) {
+        return
+      }
+
+      finishSolveSession()
+      terminateSolverWorkers()
+      updateSolverState('worker fault', error instanceof Error ? error.message : 'unknown worker pool failure')
+      return
+    }
+
+    if (activeSolveRequestId !== requestId) {
+      return
+    }
+
+    totalExplored += results.reduce((sum, result) => sum + result.explored, 0)
+
+    const sceneRevision = currentSceneRevision()
+    if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
+      finishSolveSession()
+      updateSolverState(
+        'stale result discarded',
+        'The cube state changed while the worker pool was searching, so the returned solution was ignored.'
+      )
+      return
+    }
+
+    const errorResult = results.find((result) => result.kind === 'error')
+    if (errorResult) {
+      finishSolveSession()
+      terminateSolverWorkers()
+      updateSolverState('worker error', errorResult.message)
+      return
+    }
+
+    const solvedResult = results.find((result) => result.kind === 'solved')
+    if (solvedResult) {
+      finishSolveSession()
+
+      const notation = solvedResult.turns.map((turn) => turn.notation).join(' ')
+      for (const turn of solvedResult.turns) {
+        module.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
+      }
+      syncStatus()
+
+      const suffix =
+        solvedResult.turns.length > 0
+          ? ` Applied ${solvedResult.turns.length} turn(s) from the worker pool${notation ? `: ${notation}.` : '.'}`
+          : ' No turns were needed.'
+      updateSolverState(
+        'solved',
+        `${solvedResult.message}. Explored ${totalExplored.toLocaleString()} nodes across ${faceGroups.length} lane(s).${suffix}`
+      )
+      return
+    }
+
+    updateSolverState(
+      'searching next depth',
+      `Depth ${depth} finished with no solution. Explored ${totalExplored.toLocaleString()} nodes across ${faceGroups.length} lane(s) so far.`
+    )
   }
 
-  ensureSolverWorker().postMessage(request)
+  if (activeSolveRequestId !== requestId) {
+    return
+  }
+
+  finishSolveSession()
+  updateSolverState(
+    'depth limit reached',
+    `No solution was found up to depth ${maxDepth}. Explored ${totalExplored.toLocaleString()} nodes across ${faceGroups.length} lane(s).`
+  )
 }
 
 function bindShellControls(module: RubikWasmModule): void {
@@ -532,7 +629,7 @@ function bindShellControls(module: RubikWasmModule): void {
           importFile?.click()
           break
         case 'solve':
-          startSolve(module)
+          void startSolve(module)
           break
         case 'cancel-solve':
           cancelActiveSolve('Solve request cancelled. A fresh worker will be created next time.')
@@ -595,7 +692,7 @@ async function bootstrapRuntime(): Promise<void> {
     updateBootState('booting', 'starting bevy', 'Binding the runtime to #rubik-canvas.')
     runtime.start_app('rubik-canvas', basePath)
     bindShellControls(runtime)
-    ensureSolverWorker()
+    ensureSolverWorkers(activeSolveLaneCount())
     syncStatus()
 
     if (statusPollHandle !== null) {
@@ -620,7 +717,7 @@ async function bootstrapRuntime(): Promise<void> {
 }
 
 window.addEventListener('beforeunload', () => {
-  solverWorker?.terminate()
+  terminateSolverWorkers()
 })
 
 void bootstrapRuntime()

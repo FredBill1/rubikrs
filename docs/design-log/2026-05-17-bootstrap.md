@@ -16,6 +16,7 @@
 - Expose solver turns from Rust in camelCase and keep the browser bridge typed to that payload shape; otherwise wasm-bindgen calls quietly coerce `undefined` turn codes and replay the wrong move.
 - Avoid `std::time::Instant` in the wasm runtime shell state; use a platform-safe millisecond clock so browser-side turns, scrambles, and solve replays do not panic on unsupported wasm timing APIs.
 - A second round of Bevy feature pruning (dropping `bevy_state`, `default_font`, `multi_threaded`, and `x11`) is safe for the current slice but only shaves a tiny amount off the wasm artifact, so larger bundle wins will likely need architectural rather than flag-level changes.
+- Move the solver shell from one long-running worker to a small worker pool that searches one exact depth at a time and partitions the six root faces across lanes; this preserves GitHub Pages compatibility, makes cancellation simple, and gives deterministic global "first solved depth" behavior without relying on `SharedArrayBuffer`.
 
 ## Next risks to validate
 

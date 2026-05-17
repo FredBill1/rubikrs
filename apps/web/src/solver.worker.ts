@@ -1,14 +1,17 @@
 type SolveWorkerRequest = {
   kind: 'solve'
   requestId: number
+  laneId: number
   order: number
   stateJson: string
-  maxDepth: number
+  targetDepth: number
+  allowedFaces: number[]
 }
 
 type SolveWorkerResponse = {
   kind: 'solved' | 'unsolved' | 'error'
   requestId: number
+  laneId: number
   turns: Array<{
     faceCode: number
     rotationCode: number
@@ -23,7 +26,7 @@ type SolveWorkerResponse = {
 
 type SolverWorkerModule = {
   default: () => Promise<unknown>
-  solve_state_json: (stateJson: string, maxDepth: number) => string
+  solve_request_json: (requestJson: string) => string
 }
 
 let modulePromise: Promise<SolverWorkerModule> | null = null
@@ -49,14 +52,19 @@ self.addEventListener('message', async (event: MessageEvent<SolveWorkerRequest>)
 
   try {
     const module = await ensureSolverModule()
-    const response = JSON.parse(module.solve_state_json(event.data.stateJson, event.data.maxDepth)) as Omit<
+    const response = JSON.parse(module.solve_request_json(JSON.stringify({
+      stateJson: event.data.stateJson,
+      targetDepth: event.data.targetDepth,
+      allowedFaces: event.data.allowedFaces,
+    }))) as Omit<
       SolveWorkerResponse,
-      'requestId'
+      'requestId' | 'laneId'
     >
 
     const payload: SolveWorkerResponse = {
       ...response,
       requestId: event.data.requestId,
+      laneId: event.data.laneId,
     }
 
     self.postMessage(payload)
@@ -64,9 +72,10 @@ self.addEventListener('message', async (event: MessageEvent<SolveWorkerRequest>)
     self.postMessage({
       kind: 'error',
       requestId: event.data.requestId,
+      laneId: event.data.laneId,
       turns: [],
       explored: 0,
-      depthLimit: event.data.maxDepth,
+      depthLimit: event.data.targetDepth,
       message: error instanceof Error ? error.message : 'unknown solver worker error',
     } satisfies SolveWorkerResponse)
   }
