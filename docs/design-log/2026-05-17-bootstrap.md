@@ -30,6 +30,8 @@
 - Make the caption overlay visually present but input-transparent, and set `touch-action: none` on the canvas so the shell copy and the browser's default pan/zoom behavior do not steal cube gestures on mobile.
 - For direct drag-to-turn, capture the visible face candidate at pointer-down and keep orbit disabled for that gesture path; once drag starts, interpret the release as a face turn instead of a camera move. This keeps drag semantics stable even when the pointer leaves the face during the gesture.
 - Replace the old projected-circle face hitbox with projected quadrilateral containment plus a basis-vector fallback for near-center drags. The circle approximation was good enough for taps but let neighboring visible faces overlap too much, especially around the top/right seam.
+- Clamp the stage shell with an explicit CSS height instead of letting the canvas size itself from percentage height plus intrinsic pixels. Bevy's `fit_canvas_to_parent` updates the canvas pixel size continuously, and leaving the DOM height on the intrinsic feedback path caused the desktop landscape layout to grow until the page became unstable.
+- Keep every sticker on one canonical thin front-facing mesh and rotate it per face normal. Mixing axis-specific thin cuboids with extra per-face rotations looked harmless for solid colors, but it double-oriented the side/top stickers and made them all behave like front-facing slabs.
 
 ## Next risks to validate
 

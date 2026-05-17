@@ -720,9 +720,7 @@ fn spawn_cube_visuals(
         ..default()
     });
 
-    let sticker_mesh_front = meshes.add(Cuboid::new(sticker_size, sticker_size, sticker_depth));
-    let sticker_mesh_side = meshes.add(Cuboid::new(sticker_depth, sticker_size, sticker_size));
-    let sticker_mesh_top = meshes.add(Cuboid::new(sticker_size, sticker_depth, sticker_size));
+    let sticker_mesh = meshes.add(Cuboid::new(sticker_size, sticker_size, sticker_depth));
     let mut sticker_entities = Vec::with_capacity(Face::ALL.len() * order * order);
 
     commands.entity(root).with_children(|parent| {
@@ -759,9 +757,7 @@ fn spawn_cube_visuals(
                         order,
                         face_span,
                         face_offset,
-                        &sticker_mesh_front,
-                        &sticker_mesh_side,
-                        &sticker_mesh_top,
+                        &sticker_mesh,
                     );
 
                     let material = materials.add(StandardMaterial {
@@ -1478,9 +1474,7 @@ fn sticker_transform(
     order: usize,
     face_span: f32,
     face_offset: f32,
-    front_mesh: &Handle<Mesh>,
-    side_mesh: &Handle<Mesh>,
-    top_mesh: &Handle<Mesh>,
+    sticker_mesh: &Handle<Mesh>,
 ) -> (Vec3, Quat, Handle<Mesh>) {
     let cubie = sticker_cubie_coord(face, row, col, order);
     let x = cubie.x as usize;
@@ -1499,34 +1493,45 @@ fn sticker_transform(
     match face {
         Face::Front => (
             Vec3::new(axis(x), axis(y), face_offset),
-            Quat::IDENTITY,
-            front_mesh.clone(),
+            sticker_rotation(face),
+            sticker_mesh.clone(),
         ),
         Face::Back => (
             Vec3::new(axis(x), axis(y), -face_offset),
-            Quat::from_rotation_y(std::f32::consts::PI),
-            front_mesh.clone(),
+            sticker_rotation(face),
+            sticker_mesh.clone(),
         ),
         Face::Right => (
             Vec3::new(face_offset, axis(y), axis(z)),
-            Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2),
-            side_mesh.clone(),
+            sticker_rotation(face),
+            sticker_mesh.clone(),
         ),
         Face::Left => (
             Vec3::new(-face_offset, axis(y), axis(z)),
-            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
-            side_mesh.clone(),
+            sticker_rotation(face),
+            sticker_mesh.clone(),
         ),
         Face::Up => (
             Vec3::new(axis(x), face_offset, axis(z)),
-            Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
-            top_mesh.clone(),
+            sticker_rotation(face),
+            sticker_mesh.clone(),
         ),
         Face::Down => (
             Vec3::new(axis(x), -face_offset, axis(z)),
-            Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
-            top_mesh.clone(),
+            sticker_rotation(face),
+            sticker_mesh.clone(),
         ),
+    }
+}
+
+fn sticker_rotation(face: Face) -> Quat {
+    match face {
+        Face::Front => Quat::IDENTITY,
+        Face::Back => Quat::from_rotation_y(std::f32::consts::PI),
+        Face::Right => Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+        Face::Left => Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2),
+        Face::Up => Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+        Face::Down => Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
     }
 }
 
@@ -1681,12 +1686,12 @@ mod tests {
     use super::{
         RuntimeBridge, ScreenFaceCandidate, cubie_matches_turn, decode_face, decode_rotation,
         drag_turn_from_face_gesture, face_candidate_contains_point, face_tap_turn, format_turn,
-        keyboard_shortcut_turn, nearest_orbit_snap, normalize_base_path,
+        face_outward_normal, keyboard_shortcut_turn, nearest_orbit_snap, normalize_base_path,
         normalize_canvas_selector, pick_face_candidate, reset_cube, signed_screen_angle,
-        turn_rotation_angle,
+        sticker_rotation, turn_rotation_angle,
     };
     use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
-    use bevy::prelude::{UVec3, Vec2};
+    use bevy::prelude::{UVec3, Vec2, Vec3};
 
     #[test]
     fn normalizes_empty_base_path_to_root() {
@@ -1782,6 +1787,14 @@ mod tests {
             turn_rotation_angle(TurnCommand::outer(Face::Back, RotationAmount::CounterClockwise)),
             std::f32::consts::FRAC_PI_2
         );
+    }
+
+    #[test]
+    fn sticker_rotations_face_the_expected_cube_normals() {
+        for face in Face::ALL {
+            let rotated_normal = sticker_rotation(face) * Vec3::Z;
+            assert!(rotated_normal.abs_diff_eq(face_outward_normal(face), 0.0001));
+        }
     }
 
     #[test]
