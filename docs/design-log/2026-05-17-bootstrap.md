@@ -37,6 +37,8 @@
 - Expand NxN scramble generation to sample valid inner layers for orders above 3 while keeping 3x3 scrambles outer-layer only. This preserves familiar 3x3 notation but stops larger cubes from looking “scrambled” while leaving their inner slices untouched.
 - Use non-passive wheel suppression on the canvas and exponential radius scaling for zoom. Preventing page scroll keeps the pointer interaction local to the cube, and multiplicative zoom produces smoother motion across both mouse wheels and high-resolution trackpads.
 - Trim the browser shell back to one compact status block plus the actual control panels. Runtime telemetry such as worker lanes, renderer baseline, and similar implementation details were useful during bring-up but should not be part of the end-user interface.
+- Treat 3x3 center-slice solving as a **full cube-frame problem**, not a color relabeling problem. When middle-slice turns move centers, the worker now derives the current cube orientation from the six center stickers, rotates the whole 54-sticker state back into the canonical `U/R/F/D/L/B` frame before exact search or `kewb`, remaps returned outer-face turns back into the runtime frame, and then appends the minimal center-frame alignment turns needed to restore the canonical solved orientation.
+- Keep gap clicks strict-first and tolerance-second. `rubik-app` still prefers exact projected sticker-quad hits, but if the pointer lands a few pixels into the seam between adjacent stickers it now falls back to the nearest projected quad edge within a tiny tolerance. This fixes “gap starts orbit” without reviving the older broad face-overlap hitboxes.
 
 ## Next risks to validate
 

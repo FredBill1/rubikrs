@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
-use std::sync::OnceLock;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::OnceLock,
+};
 
 use kewb::{CubieCube as KewbCubieCube, DataTable as KewbDataTable, FaceCube as KewbFaceCube, Move as KewbMove, Solver as KewbSolver};
-use rubik_core::{CubeState, Face, RotationAmount, StickerColor, TurnCommand, apply_turn_to_state_unchecked};
+use rubik_core::{
+    CubeOrder, CubeState, Face, RotationAmount, StickerColor, TurnCommand, apply_turn_to_state_unchecked,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_arch = "wasm32")]
@@ -16,12 +21,420 @@ use wasm_bindgen::prelude::wasm_bindgen;
 static PANIC_HOOK: Once = Once::new();
 
 static KEWB_DATA_TABLE: OnceLock<KewbDataTable> = OnceLock::new();
+static ORIENTATION_TURN_SEQUENCES: OnceLock<HashMap<OrientationKey, Vec<TurnCommand>>> = OnceLock::new();
 
 const ROTATIONS: [RotationAmount; 3] = [
     RotationAmount::Clockwise,
     RotationAmount::HalfTurn,
     RotationAmount::CounterClockwise,
 ];
+const RIGHT_MIDDLE_CLOCKWISE: TurnCommand = TurnCommand {
+    face: Face::Right,
+    start_layer: 1,
+    width: 1,
+    rotation: RotationAmount::Clockwise,
+};
+const RIGHT_MIDDLE_COUNTER_CLOCKWISE: TurnCommand = TurnCommand {
+    rotation: RotationAmount::CounterClockwise,
+    ..RIGHT_MIDDLE_CLOCKWISE
+};
+const UP_MIDDLE_CLOCKWISE: TurnCommand = TurnCommand {
+    face: Face::Up,
+    start_layer: 1,
+    width: 1,
+    rotation: RotationAmount::Clockwise,
+};
+const UP_MIDDLE_COUNTER_CLOCKWISE: TurnCommand = TurnCommand {
+    rotation: RotationAmount::CounterClockwise,
+    ..UP_MIDDLE_CLOCKWISE
+};
+const FRONT_MIDDLE_CLOCKWISE: TurnCommand = TurnCommand {
+    face: Face::Front,
+    start_layer: 1,
+    width: 1,
+    rotation: RotationAmount::Clockwise,
+};
+const FRONT_MIDDLE_COUNTER_CLOCKWISE: TurnCommand = TurnCommand {
+    rotation: RotationAmount::CounterClockwise,
+    ..FRONT_MIDDLE_CLOCKWISE
+};
+const ROTATE_X: [TurnCommand; 3] = [
+    TurnCommand::outer(Face::Right, RotationAmount::Clockwise),
+    RIGHT_MIDDLE_CLOCKWISE,
+    TurnCommand::outer(Face::Left, RotationAmount::CounterClockwise),
+];
+const ROTATE_X_PRIME: [TurnCommand; 3] = [
+    TurnCommand::outer(Face::Right, RotationAmount::CounterClockwise),
+    RIGHT_MIDDLE_COUNTER_CLOCKWISE,
+    TurnCommand::outer(Face::Left, RotationAmount::Clockwise),
+];
+const ROTATE_Y: [TurnCommand; 3] = [
+    TurnCommand::outer(Face::Up, RotationAmount::Clockwise),
+    UP_MIDDLE_CLOCKWISE,
+    TurnCommand::outer(Face::Down, RotationAmount::CounterClockwise),
+];
+const ROTATE_Y_PRIME: [TurnCommand; 3] = [
+    TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise),
+    UP_MIDDLE_COUNTER_CLOCKWISE,
+    TurnCommand::outer(Face::Down, RotationAmount::Clockwise),
+];
+const ROTATE_Z: [TurnCommand; 3] = [
+    TurnCommand::outer(Face::Front, RotationAmount::Clockwise),
+    FRONT_MIDDLE_CLOCKWISE,
+    TurnCommand::outer(Face::Back, RotationAmount::CounterClockwise),
+];
+const ROTATE_Z_PRIME: [TurnCommand; 3] = [
+    TurnCommand::outer(Face::Front, RotationAmount::CounterClockwise),
+    FRONT_MIDDLE_COUNTER_CLOCKWISE,
+    TurnCommand::outer(Face::Back, RotationAmount::Clockwise),
+];
+const ORIENTATION_GENERATORS: [&[TurnCommand]; 6] = [
+    &ROTATE_X,
+    &ROTATE_X_PRIME,
+    &ROTATE_Y,
+    &ROTATE_Y_PRIME,
+    &ROTATE_Z,
+    &ROTATE_Z_PRIME,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AxisVector {
+    x: i8,
+    y: i8,
+    z: i8,
+}
+
+impl AxisVector {
+    const fn new(x: i8, y: i8, z: i8) -> Self {
+        Self { x, y, z }
+    }
+
+    const fn dot(self, other: Self) -> i8 {
+        (self.x * other.x) + (self.y * other.y) + (self.z * other.z)
+    }
+
+    const fn cross(self, other: Self) -> Self {
+        Self {
+            x: (self.y * other.z) - (self.z * other.y),
+            y: (self.z * other.x) - (self.x * other.z),
+            z: (self.x * other.y) - (self.y * other.x),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct OrientationKey([Face; 6]);
+
+#[derive(Debug, Clone)]
+struct ThreeByThreeFrame {
+    canonical_to_actual: [Face; 6],
+    actual_to_canonical: [Face; 6],
+    actual_x: AxisVector,
+    actual_y: AxisVector,
+    actual_z: AxisVector,
+}
+
+impl ThreeByThreeFrame {
+    fn for_state(state: &CubeState) -> Option<Self> {
+        if state.order.get() != 3 || state.stickers.len() != 54 {
+            return None;
+        }
+
+        let mut canonical_to_actual = [Face::Up; 6];
+        let mut actual_to_canonical = [Face::Up; 6];
+        let mut seen_canonical_faces = [false; 6];
+
+        for actual_face in Face::ALL {
+            let canonical_face = face_for_color(*state.stickers.get(face_center_index(actual_face))?);
+            let canonical_index = face_index(canonical_face);
+            if seen_canonical_faces[canonical_index] {
+                return None;
+            }
+
+            seen_canonical_faces[canonical_index] = true;
+            canonical_to_actual[canonical_index] = actual_face;
+            actual_to_canonical[face_index(actual_face)] = canonical_face;
+        }
+
+        let actual_x = face_vector(canonical_to_actual[face_index(Face::Right)]);
+        let actual_y = face_vector(canonical_to_actual[face_index(Face::Up)]);
+        let actual_z = face_vector(canonical_to_actual[face_index(Face::Front)]);
+        if actual_x.dot(actual_y) != 0
+            || actual_x.dot(actual_z) != 0
+            || actual_y.dot(actual_z) != 0
+            || actual_x.cross(actual_y) != actual_z
+        {
+            return None;
+        }
+
+        Some(Self {
+            canonical_to_actual,
+            actual_to_canonical,
+            actual_x,
+            actual_y,
+            actual_z,
+        })
+    }
+
+    fn orientation_key(&self) -> OrientationKey {
+        OrientationKey(self.canonical_to_actual)
+    }
+
+    fn normalize_state(&self, state: &CubeState) -> CubeState {
+        let mut normalized = CubeState::solved(state.order);
+
+        for face in Face::ALL {
+            for row in 0..3 {
+                for col in 0..3 {
+                    let source_index = sticker_index(face, row, col);
+                    let cubie = sticker_cubie_vector(face, row, col);
+                    let canonical_face = face_from_vector(self.actual_vector_to_canonical(face_vector(face)))
+                        .expect("3x3 frame should map every face normal back into the canonical basis");
+                    let canonical_cubie = self.actual_vector_to_canonical(cubie);
+                    let (canonical_row, canonical_col) =
+                        row_col_from_cubie(canonical_face, canonical_cubie);
+                    let target_index = sticker_index(canonical_face, canonical_row, canonical_col);
+                    normalized.stickers[target_index] = state.stickers[source_index];
+                }
+            }
+        }
+
+        normalized
+    }
+
+    fn normalize_allowed_faces(&self, allowed_faces: &[u8]) -> Result<Vec<u8>, String> {
+        allowed_faces
+            .iter()
+            .map(|&face_code| {
+                let Some(actual_face) = decode_face(face_code) else {
+                    return Err(format!("unknown face code {face_code} in worker request"));
+                };
+
+                Ok(encode_face(self.actual_to_canonical[face_index(actual_face)]))
+            })
+            .collect()
+    }
+
+    fn remap_solution(&self, response: SolveResponse) -> SolveResponse {
+        let SolveResponse {
+            kind,
+            turns,
+            explored,
+            depth_limit,
+            message,
+        } = response;
+        if !matches!(kind, SolveOutcomeKind::Solved) {
+            return SolveResponse {
+                kind,
+                turns,
+                explored,
+                depth_limit,
+                message,
+            };
+        }
+
+        let Some(mut remapped_turns) = turns
+            .iter()
+            .map(solve_turn_to_command)
+            .collect::<Option<Vec<_>>>()
+            .map(|turns| {
+                turns
+                    .into_iter()
+                    .map(|turn| TurnCommand {
+                        face: self.canonical_to_actual[face_index(turn.face)],
+                        ..turn
+                    })
+                    .collect::<Vec<_>>()
+            })
+        else {
+            return SolveResponse {
+                kind: SolveOutcomeKind::Error,
+                turns: Vec::new(),
+                explored,
+                depth_limit,
+                message: "solver worker returned an undecodable 3x3 turn".to_string(),
+            };
+        };
+
+        let orientation_correction = self.orientation_correction_turns();
+        let correction_len = orientation_correction.len();
+        remapped_turns.extend(orientation_correction);
+
+        let mut message = message;
+        if correction_len > 0 {
+            message.push_str(&format!(
+                "; appended {correction_len} center-frame alignment turn(s)"
+            ));
+        }
+
+        SolveResponse {
+            kind,
+            message,
+            turns: remapped_turns.into_iter().map(encode_turn).collect(),
+            explored,
+            depth_limit,
+        }
+    }
+
+    fn orientation_correction_turns(&self) -> Vec<TurnCommand> {
+        orientation_turn_sequences()
+            .get(&self.orientation_key())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .map(TurnCommand::inverse)
+            .collect()
+    }
+
+    fn actual_vector_to_canonical(&self, actual: AxisVector) -> AxisVector {
+        AxisVector::new(
+            actual.dot(self.actual_x),
+            actual.dot(self.actual_y),
+            actual.dot(self.actual_z),
+        )
+    }
+}
+
+fn orientation_turn_sequences() -> &'static HashMap<OrientationKey, Vec<TurnCommand>> {
+    ORIENTATION_TURN_SEQUENCES.get_or_init(|| {
+        let solved = CubeState::solved(CubeOrder::standard());
+        let mut sequences = HashMap::new();
+        let mut queue = VecDeque::new();
+
+        let identity_key = ThreeByThreeFrame::for_state(&solved)
+            .expect("canonical solved 3x3 should always define a valid center frame")
+            .orientation_key();
+        sequences.insert(identity_key, Vec::new());
+        queue.push_back((solved.clone(), Vec::new()));
+
+        while let Some((state, path)) = queue.pop_front() {
+            for generator in ORIENTATION_GENERATORS {
+                let mut next_state = state.clone();
+                let mut scratch = next_state.stickers.clone();
+                for &turn in generator.iter() {
+                    apply_turn_to_state_unchecked(&mut next_state, turn, &mut scratch)
+                        .expect("whole-cube rotation generators should always validate on 3x3");
+                }
+
+                let frame = ThreeByThreeFrame::for_state(&next_state)
+                    .expect("whole-cube rotation generators should keep the 3x3 center frame valid");
+                assert_eq!(
+                    frame.normalize_state(&next_state),
+                    solved,
+                    "whole-cube rotation generators should only rotate the solved 3x3 frame",
+                );
+
+                let key = frame.orientation_key();
+                if sequences.contains_key(&key) {
+                    continue;
+                }
+
+                let mut next_path = path.clone();
+                next_path.extend_from_slice(generator);
+                sequences.insert(key, next_path.clone());
+                queue.push_back((next_state, next_path));
+            }
+        }
+
+        assert_eq!(
+            sequences.len(),
+            24,
+            "whole-cube rotation generators should enumerate all 24 possible 3x3 center orientations",
+        );
+        sequences
+    })
+}
+
+fn solve_turn_to_command(turn: &SolveTurn) -> Option<TurnCommand> {
+    Some(TurnCommand {
+        face: decode_face(turn.face_code)?,
+        start_layer: turn.start_layer,
+        width: turn.width,
+        rotation: decode_rotation(turn.rotation_code)?,
+    })
+}
+
+fn face_index(face: Face) -> usize {
+    match face {
+        Face::Up => 0,
+        Face::Right => 1,
+        Face::Front => 2,
+        Face::Down => 3,
+        Face::Left => 4,
+        Face::Back => 5,
+    }
+}
+
+fn face_center_index(face: Face) -> usize {
+    (face_index(face) * 9) + 4
+}
+
+fn face_vector(face: Face) -> AxisVector {
+    match face {
+        Face::Up => AxisVector::new(0, 1, 0),
+        Face::Right => AxisVector::new(1, 0, 0),
+        Face::Front => AxisVector::new(0, 0, 1),
+        Face::Down => AxisVector::new(0, -1, 0),
+        Face::Left => AxisVector::new(-1, 0, 0),
+        Face::Back => AxisVector::new(0, 0, -1),
+    }
+}
+
+fn face_from_vector(vector: AxisVector) -> Option<Face> {
+    match vector {
+        AxisVector { x: 0, y: 1, z: 0 } => Some(Face::Up),
+        AxisVector { x: 1, y: 0, z: 0 } => Some(Face::Right),
+        AxisVector { x: 0, y: 0, z: 1 } => Some(Face::Front),
+        AxisVector { x: 0, y: -1, z: 0 } => Some(Face::Down),
+        AxisVector { x: -1, y: 0, z: 0 } => Some(Face::Left),
+        AxisVector { x: 0, y: 0, z: -1 } => Some(Face::Back),
+        _ => None,
+    }
+}
+
+fn face_for_color(color: StickerColor) -> Face {
+    match color {
+        StickerColor::White => Face::Up,
+        StickerColor::Red => Face::Right,
+        StickerColor::Green => Face::Front,
+        StickerColor::Yellow => Face::Down,
+        StickerColor::Orange => Face::Left,
+        StickerColor::Blue => Face::Back,
+    }
+}
+
+fn sticker_index(face: Face, row: usize, col: usize) -> usize {
+    (face_index(face) * 9) + (row * 3) + col
+}
+
+fn sticker_cubie_vector(face: Face, row: usize, col: usize) -> AxisVector {
+    let (x, y, z) = match face {
+        Face::Up => (col as i8 - 1, 1, row as i8 - 1),
+        Face::Right => (1, 1 - row as i8, 1 - col as i8),
+        Face::Front => (col as i8 - 1, 1 - row as i8, 1),
+        Face::Down => (col as i8 - 1, -1, 1 - row as i8),
+        Face::Left => (-1, 1 - row as i8, col as i8 - 1),
+        Face::Back => (1 - col as i8, 1 - row as i8, -1),
+    };
+
+    AxisVector::new(x, y, z)
+}
+
+fn row_col_from_cubie(face: Face, cubie: AxisVector) -> (usize, usize) {
+    let x = usize::try_from(cubie.x + 1).expect("3x3 cubie x coordinate should stay within -1..=1");
+    let y = usize::try_from(cubie.y + 1).expect("3x3 cubie y coordinate should stay within -1..=1");
+    let z = usize::try_from(cubie.z + 1).expect("3x3 cubie z coordinate should stay within -1..=1");
+
+    match face {
+        Face::Up => (z, x),
+        Face::Right => (2 - y, 2 - z),
+        Face::Front => (2 - y, x),
+        Face::Down => (2 - z, x),
+        Face::Left => (2 - y, z),
+        Face::Back => (2 - y, 2 - x),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -114,10 +527,36 @@ fn solve_iterative(state_json: &str, max_depth: u8) -> SolveResponse {
         };
     }
 
+    let three_by_three_frame = if state.order.get() == 3 {
+        match ThreeByThreeFrame::for_state(&state) {
+            Some(frame) => Some(frame),
+            None => {
+                return SolveResponse {
+                    kind: SolveOutcomeKind::Error,
+                    turns: Vec::new(),
+                    explored: 0,
+                    depth_limit: max_depth,
+                    message:
+                        "3x3 centers no longer form a valid cube orientation for the solver frame"
+                            .to_string(),
+                };
+            }
+        }
+    } else {
+        None
+    };
+    let normalized_state = three_by_three_frame
+        .as_ref()
+        .map(|frame| frame.normalize_state(&state));
+    let search_state = normalized_state.as_ref().unwrap_or(&state);
     let mut explored = 0_u64;
 
     for depth in 1..=max_depth {
-        let response = solve_exact_request(&state, depth, &[]);
+        let response = if let Some(frame) = &three_by_three_frame {
+            frame.remap_solution(solve_exact_request(search_state, depth, &[]))
+        } else {
+            solve_exact_request(search_state, depth, &[])
+        };
         explored = explored.saturating_add(response.explored);
 
         if matches!(response.kind, SolveOutcomeKind::Solved | SolveOutcomeKind::Error) {
@@ -130,7 +569,10 @@ fn solve_iterative(state_json: &str, max_depth: u8) -> SolveResponse {
     }
 
     if state.order.get() == 3 {
-        if let Some(mut response) = solve_three_phase_fallback(&state) {
+        if let Some(mut response) = solve_three_phase_fallback(search_state) {
+            if let Some(frame) = &three_by_three_frame {
+                response = frame.remap_solution(response);
+            }
             response.explored = explored.saturating_add(response.explored);
             return response;
         }
@@ -174,8 +616,36 @@ fn solve_request_str(request_json: &str) -> SolveResponse {
         }
     };
 
+    let three_by_three_frame = if state.order.get() == 3 {
+        match ThreeByThreeFrame::for_state(&state) {
+            Some(frame) => Some(frame),
+            None => {
+                return SolveResponse {
+                    kind: SolveOutcomeKind::Error,
+                    turns: Vec::new(),
+                    explored: 0,
+                    depth_limit: request.target_depth,
+                    message:
+                        "3x3 centers no longer form a valid cube orientation for the solver frame"
+                            .to_string(),
+                };
+            }
+        }
+    } else {
+        None
+    };
+    let normalized_state = three_by_three_frame
+        .as_ref()
+        .map(|frame| frame.normalize_state(&state));
+    let search_state = normalized_state.as_ref().unwrap_or(&state);
+
     if request.target_depth == 0 && state.order.get() == 3 {
-        return solve_three_phase_fallback(&state).unwrap_or(SolveResponse {
+        return solve_three_phase_fallback(search_state)
+            .map(|response| match &three_by_three_frame {
+                Some(frame) => frame.remap_solution(response),
+                None => response,
+            })
+            .unwrap_or(SolveResponse {
             kind: SolveOutcomeKind::Unsolved,
             turns: Vec::new(),
             explored: 0,
@@ -192,7 +662,27 @@ fn solve_request_str(request_json: &str) -> SolveResponse {
         return response;
     }
 
-    solve_exact_request(&state, request.target_depth, &request.allowed_faces)
+    if let Some(frame) = &three_by_three_frame {
+        let normalized_allowed_faces = match frame.normalize_allowed_faces(&request.allowed_faces) {
+            Ok(face_codes) => face_codes,
+            Err(message) => {
+                return SolveResponse {
+                    kind: SolveOutcomeKind::Error,
+                    turns: Vec::new(),
+                    explored: 0,
+                    depth_limit: request.target_depth,
+                    message,
+                };
+            }
+        };
+        return frame.remap_solution(solve_exact_request(
+            search_state,
+            request.target_depth,
+            &normalized_allowed_faces,
+        ));
+    }
+
+    solve_exact_request(search_state, request.target_depth, &request.allowed_faces)
 }
 
 fn solve_three_phase_fallback(state: &CubeState) -> Option<SolveResponse> {
@@ -552,6 +1042,15 @@ fn decode_face(face_code: u8) -> Option<Face> {
     }
 }
 
+fn decode_rotation(rotation_code: u8) -> Option<RotationAmount> {
+    match rotation_code {
+        0 => Some(RotationAmount::Clockwise),
+        1 => Some(RotationAmount::HalfTurn),
+        2 => Some(RotationAmount::CounterClockwise),
+        _ => None,
+    }
+}
+
 fn encode_rotation(rotation: RotationAmount) -> u8 {
     match rotation {
         RotationAmount::Clockwise => 0,
@@ -570,11 +1069,25 @@ fn format_turn(turn: TurnCommand) -> String {
         Face::Back => "B",
     };
 
-    match turn.rotation {
-        RotationAmount::Clockwise => face.to_string(),
-        RotationAmount::HalfTurn => format!("{face}2"),
-        RotationAmount::CounterClockwise => format!("{face}'"),
-    }
+    let width = if turn.width > 1 {
+        format!("{}w", turn.width)
+    } else {
+        String::new()
+    };
+
+    let inner = if turn.start_layer > 0 {
+        format!("[{}]", turn.start_layer + 1)
+    } else {
+        String::new()
+    };
+
+    let rotation = match turn.rotation {
+        RotationAmount::Clockwise => "",
+        RotationAmount::HalfTurn => "2",
+        RotationAmount::CounterClockwise => "'",
+    };
+
+    format!("{width}{face}{inner}{rotation}")
 }
 
 fn install_panic_hook() {
@@ -585,11 +1098,22 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::{
-        KewbCubieCube, KewbFaceCube, KewbMove, ROTATIONS, SolveOutcomeKind, SolveRequest,
-        SolveResponse, cube_state_to_facelet_string, kewb_move_to_turn, solve_request_json,
-        solve_request_str, solve_state_json,
+        KewbCubieCube, KewbFaceCube, KewbMove, ROTATE_X, ROTATIONS, SolveOutcomeKind,
+        SolveRequest, SolveResponse, ThreeByThreeFrame, cube_state_to_facelet_string,
+        kewb_move_to_turn, solve_request_json, solve_request_str, solve_state_json,
+        solve_turn_to_command,
     };
-    use rubik_core::{Face, RotationAmount, TurnCommand, apply_turn_to_state};
+    use rubik_core::{CubeOrder, CubeState, Face, RotationAmount, TurnCommand, apply_turn_to_state};
+
+    fn apply_solution_turns(state: &mut CubeState, response: &SolveResponse) {
+        for turn in &response.turns {
+            apply_turn_to_state(
+                state,
+                solve_turn_to_command(turn).expect("solver turn should decode back into a turn command"),
+            )
+            .expect("solver turn should apply cleanly");
+        }
+    }
 
     #[test]
     fn reports_solved_when_state_is_already_solved() {
@@ -869,6 +1393,106 @@ mod tests {
             );
             assert!(!response.turns.is_empty(), "{face:?} should produce at least one turn");
         }
+    }
+
+    #[test]
+    fn center_slice_state_uses_fallback_and_reaches_canonical_solved_state() {
+        let mut state = CubeState::solved(CubeOrder::standard());
+        apply_turn_to_state(
+            &mut state,
+            TurnCommand {
+                face: Face::Up,
+                start_layer: 1,
+                width: 1,
+                rotation: RotationAmount::CounterClockwise,
+            },
+        )
+        .expect("middle slice should be valid");
+
+        let response = solve_request_str(
+            &serde_json::to_string(&SolveRequest {
+                state_json: state.to_json().expect("state should serialize"),
+                target_depth: 0,
+                allowed_faces: Vec::new(),
+                turn_history_json: None,
+            })
+            .expect("request should serialize"),
+        );
+
+        assert!(
+            matches!(response.kind, SolveOutcomeKind::Solved),
+            "expected center-slice state to solve, got {:?}: {}",
+            response.kind,
+            response.message
+        );
+
+        apply_solution_turns(&mut state, &response);
+        assert_eq!(state, CubeState::solved(CubeOrder::standard()));
+    }
+
+    #[test]
+    fn rotated_solved_state_gets_alignment_turns_instead_of_false_solved() {
+        let mut state = CubeState::solved(CubeOrder::standard());
+        for turn in ROTATE_X {
+            apply_turn_to_state(&mut state, turn).expect("whole-cube rotation proxy should apply");
+        }
+
+        let frame = ThreeByThreeFrame::for_state(&state).expect("rotation proxy should keep a valid frame");
+        assert_eq!(frame.normalize_state(&state), CubeState::solved(CubeOrder::standard()));
+
+        let response = solve_request_str(
+            &serde_json::to_string(&SolveRequest {
+                state_json: state.to_json().expect("state should serialize"),
+                target_depth: 1,
+                allowed_faces: Vec::new(),
+                turn_history_json: None,
+            })
+            .expect("request should serialize"),
+        );
+
+        assert!(
+            matches!(response.kind, SolveOutcomeKind::Solved),
+            "expected rotated solved state to resolve via alignment turns, got {:?}: {}",
+            response.kind,
+            response.message
+        );
+        assert!(!response.turns.is_empty(), "rotation-aligned solved state should not report an empty solution");
+
+        apply_solution_turns(&mut state, &response);
+        assert_eq!(state, CubeState::solved(CubeOrder::standard()));
+    }
+
+    #[test]
+    fn center_frame_remapping_preserves_exact_lane_constraints() {
+        let mut state = CubeState::solved(CubeOrder::standard());
+        for turn in ROTATE_X {
+            apply_turn_to_state(&mut state, turn).expect("whole-cube rotation proxy should apply");
+        }
+        apply_turn_to_state(
+            &mut state,
+            TurnCommand::outer(Face::Front, RotationAmount::Clockwise),
+        )
+        .expect("outer turn should apply");
+
+        let response = solve_request_str(
+            &serde_json::to_string(&SolveRequest {
+                state_json: state.to_json().expect("state should serialize"),
+                target_depth: 1,
+                allowed_faces: vec![2],
+                turn_history_json: None,
+            })
+            .expect("request should serialize"),
+        );
+
+        assert!(
+            matches!(response.kind, SolveOutcomeKind::Solved),
+            "expected normalized face partition to stay solvable, got {:?}: {}",
+            response.kind,
+            response.message
+        );
+
+        apply_solution_turns(&mut state, &response);
+        assert_eq!(state, CubeState::solved(CubeOrder::standard()));
     }
 
     #[test]

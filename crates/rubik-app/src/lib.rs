@@ -160,6 +160,7 @@ const CUBE_FACE_SPAN: f32 = 1.9;
 const POINTER_TAP_MAX_DRAG_PX: f32 = 8.0;
 const FACE_TAP_VISIBILITY_THRESHOLD: f32 = 0.18;
 const FACE_TAP_RADIUS_SCALE: f32 = 0.7;
+const STICKER_GAP_HIT_TOLERANCE_PX: f32 = 4.0;
 
 impl Default for OrbitRig {
     fn default() -> Self {
@@ -1199,10 +1200,19 @@ fn pick_sticker_candidate(
         .iter()
         .filter_map(|candidate| {
             let distance = candidate.center.distance(pointer_position);
-            sticker_candidate_contains_point(*candidate, pointer_position).then_some((distance, *candidate))
+            let gap_distance = if sticker_candidate_contains_point(*candidate, pointer_position) {
+                0.0
+            } else {
+                sticker_candidate_gap_distance(*candidate, pointer_position)
+            };
+            (gap_distance <= STICKER_GAP_HIT_TOLERANCE_PX).then_some((gap_distance, distance, *candidate))
         })
-        .min_by(|left, right| left.0.total_cmp(&right.0))
-        .map(|(_, candidate)| candidate)
+        .min_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        })
+        .map(|(_, _, candidate)| candidate)
 }
 
 fn slice_turn_from_sticker_drag(
@@ -1283,6 +1293,28 @@ fn sticker_candidate_contains_point(candidate: ScreenStickerCandidate, point: Ve
     }
 
     true
+}
+
+fn sticker_candidate_gap_distance(candidate: ScreenStickerCandidate, point: Vec2) -> f32 {
+    (0..candidate.corners.len())
+        .map(|index| {
+            let current = candidate.corners[index];
+            let next = candidate.corners[(index + 1) % candidate.corners.len()];
+            point_segment_distance(point, current, next)
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn point_segment_distance(point: Vec2, start: Vec2, end: Vec2) -> f32 {
+    let segment = end - start;
+    let segment_length_squared = segment.length_squared();
+    if segment_length_squared <= f32::EPSILON {
+        return point.distance(start);
+    }
+
+    let projection = ((point - start).dot(segment) / segment_length_squared).clamp(0.0, 1.0);
+    let closest = start + (segment * projection);
+    point.distance(closest)
 }
 
 fn axis_face(axis: Vec3) -> Option<Face> {
@@ -1999,6 +2031,83 @@ mod tests {
                 world_center: Vec3::new(0.0, 0.0, 1.0),
                 center: Vec2::new(100.0, 100.0),
                 radius: 16.0,
+                projected_col_axis: Vec2::X,
+                projected_row_axis: Vec2::NEG_Y,
+                col_axis: Vec3::X,
+                row_axis: -Vec3::Y,
+                corners: [
+                    Vec2::new(84.0, 84.0),
+                    Vec2::new(116.0, 84.0),
+                    Vec2::new(116.0, 116.0),
+                    Vec2::new(84.0, 116.0),
+                ],
+            }],
+        );
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn pick_sticker_candidate_uses_small_gap_tolerance_between_adjacent_stickers() {
+        let selected = pick_sticker_candidate(
+            Vec2::new(121.0, 100.0),
+            &[
+                ScreenStickerCandidate {
+                    face: Face::Front,
+                    row: 0,
+                    col: 0,
+                    cubie: UVec3::new(0, 1, 2),
+                    world_center: Vec3::new(-1.0, 0.0, 1.0),
+                    center: Vec2::new(100.0, 100.0),
+                    radius: 18.0,
+                    projected_col_axis: Vec2::X,
+                    projected_row_axis: Vec2::NEG_Y,
+                    col_axis: Vec3::X,
+                    row_axis: -Vec3::Y,
+                    corners: [
+                        Vec2::new(82.0, 82.0),
+                        Vec2::new(118.0, 82.0),
+                        Vec2::new(118.0, 118.0),
+                        Vec2::new(82.0, 118.0),
+                    ],
+                },
+                ScreenStickerCandidate {
+                    face: Face::Front,
+                    row: 0,
+                    col: 1,
+                    cubie: UVec3::new(1, 1, 2),
+                    world_center: Vec3::new(0.0, 0.0, 1.0),
+                    center: Vec2::new(140.0, 100.0),
+                    radius: 18.0,
+                    projected_col_axis: Vec2::X,
+                    projected_row_axis: Vec2::NEG_Y,
+                    col_axis: Vec3::X,
+                    row_axis: -Vec3::Y,
+                    corners: [
+                        Vec2::new(122.0, 82.0),
+                        Vec2::new(158.0, 82.0),
+                        Vec2::new(158.0, 118.0),
+                        Vec2::new(122.0, 118.0),
+                    ],
+                },
+            ],
+        );
+
+        assert_eq!(selected.map(|candidate| (candidate.face, candidate.col)), Some((Face::Front, 1)));
+    }
+
+    #[test]
+    fn pick_sticker_candidate_keeps_orbit_space_outside_gap_tolerance() {
+        let selected = pick_sticker_candidate(
+            Vec2::new(122.0, 100.0),
+            &[ScreenStickerCandidate {
+                face: Face::Front,
+                row: 0,
+                col: 0,
+                cubie: UVec3::new(1, 1, 2),
+                world_center: Vec3::new(0.0, 0.0, 1.0),
+                center: Vec2::new(100.0, 100.0),
+                radius: 18.0,
                 projected_col_axis: Vec2::X,
                 projected_row_axis: Vec2::NEG_Y,
                 col_axis: Vec3::X,
