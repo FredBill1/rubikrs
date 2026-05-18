@@ -1021,7 +1021,7 @@ fn sync_cube_visuals(
     mut meshes: ResMut<'_, Assets<Mesh>>,
     mut materials: ResMut<'_, Assets<StandardMaterial>>,
     mut sync_state: ResMut<'_, VisualSyncState>,
-    existing_visuals: Query<'_, '_, Entity, With<CubeVisual>>,
+    existing_visual_roots: Query<'_, '_, Entity, With<CubeVisualRoot>>,
 ) {
     let snapshot = with_runtime(|runtime| runtime.snapshot());
 
@@ -1031,7 +1031,7 @@ fn sync_cube_visuals(
             return;
         }
 
-        clear_cube_visuals(&mut commands, &existing_visuals);
+        clear_cube_visuals(&mut commands, &existing_visual_roots);
         sync_state.active_animation = None;
         sync_state.rendered_revision = 0;
         sync_state.completed_animation_revision = None;
@@ -1043,7 +1043,7 @@ fn sync_cube_visuals(
         return;
     }
 
-    clear_cube_visuals(&mut commands, &existing_visuals);
+    clear_cube_visuals(&mut commands, &existing_visual_roots);
 
     if let Some(transition) = snapshot
         .transition
@@ -1101,7 +1101,7 @@ fn animate_turn_visuals(
     time: Res<'_, Time>,
     mut commands: Commands<'_, '_>,
     mut sync_state: ResMut<'_, VisualSyncState>,
-    existing_visuals: Query<'_, '_, Entity, With<CubeVisual>>,
+    existing_visual_roots: Query<'_, '_, Entity, With<CubeVisualRoot>>,
     mut pivots: Query<'_, '_, &mut Transform, With<TurnAnimationPivot>>,
 ) {
     let Some(animation) = sync_state.active_animation.as_mut() else {
@@ -1129,7 +1129,7 @@ fn animate_turn_visuals(
 
     if progress >= 1.0 {
         let scene_revision = animation.scene_revision;
-        clear_cube_visuals(&mut commands, &existing_visuals);
+        clear_cube_visuals(&mut commands, &existing_visual_roots);
         sync_state.rendered_revision = 0;
         sync_state.active_animation = None;
         sync_state.completed_animation_revision = Some(scene_revision);
@@ -1139,9 +1139,9 @@ fn animate_turn_visuals(
 
 fn clear_cube_visuals(
     commands: &mut Commands<'_, '_>,
-    existing_visuals: &Query<'_, '_, Entity, With<CubeVisual>>,
+    existing_visual_roots: &Query<'_, '_, Entity, With<CubeVisualRoot>>,
 ) {
-    for entity in existing_visuals.iter() {
+    for entity in existing_visual_roots.iter() {
         commands.entity(entity).despawn();
     }
 }
@@ -2460,17 +2460,21 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        CanvasTouchSpace, OrbitRig, RuntimeBridge, ScreenStickerCandidate,
+        CanvasTouchSpace, CubeVisual, CubeVisualRoot, OrbitRig, RuntimeBridge,
+        ScreenStickerCandidate, TurnAnimationPivot,
         TOUCH_MOUSE_SUPPRESSION_SECS, TouchOrbitMode, cube_surface_hit_from_ray,
-        cubie_matches_turn, decode_face, decode_rotation, face_outward_normal, format_turn,
-        keyboard_shortcut_turn, nearest_orbit_snap, normalize_base_path, normalize_canvas_selector,
-        normalize_touch_position, position_delta, reset_cube, set_touch_orbit_mode,
-        should_begin_mouse_orbit, should_emulate_two_finger_touch,
-        should_reset_single_touch_gesture, slice_face_from_sticker_drag, slice_start_layer,
-        sticker_rotation, surface_axis_index, turn_rotation_angle, virtual_cube_half_extent,
-        virtual_surface_center,
+        clear_cube_visuals, cubie_matches_turn, decode_face, decode_rotation,
+        face_outward_normal, format_turn, keyboard_shortcut_turn, nearest_orbit_snap,
+        normalize_base_path, normalize_canvas_selector, normalize_touch_position, position_delta,
+        reset_cube, set_touch_orbit_mode, should_begin_mouse_orbit,
+        should_emulate_two_finger_touch, should_reset_single_touch_gesture,
+        slice_face_from_sticker_drag, slice_start_layer, sticker_rotation, surface_axis_index,
+        turn_rotation_angle, virtual_cube_half_extent, virtual_surface_center,
     };
-    use bevy::prelude::{MouseButton, UVec3, Vec2, Vec3};
+    use bevy::{
+        ecs::system::SystemState,
+        prelude::{ChildOf, Commands, Entity, MouseButton, Query, UVec3, Vec2, Vec3, With, World},
+    };
     use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
 
     fn sample_sticker_candidate(face: Face, cubie: UVec3) -> ScreenStickerCandidate {
@@ -2818,5 +2822,30 @@ mod tests {
         let col = surface_axis_index(Face::Front, point, 3, surface_span, false);
 
         assert_eq!((row, col), (0, 0));
+    }
+
+    #[test]
+    fn clear_cube_visuals_despawns_a_visual_tree_from_its_root() {
+        let mut world = World::new();
+        let root = world.spawn((CubeVisual, CubeVisualRoot)).id();
+        let pivot = world
+            .spawn((CubeVisual, TurnAnimationPivot, ChildOf(root)))
+            .id();
+        let cubie = world.spawn((CubeVisual, ChildOf(root))).id();
+
+        let mut system_state: SystemState<(
+            Commands<'_, '_>,
+            Query<'_, '_, Entity, With<CubeVisualRoot>>,
+        )> = SystemState::new(&mut world);
+        {
+            let (mut commands, visual_roots) = system_state.get_mut(&mut world);
+            clear_cube_visuals(&mut commands, &visual_roots);
+        }
+        system_state.apply(&mut world);
+        world.flush();
+
+        assert!(!world.entities().contains(root));
+        assert!(!world.entities().contains(pivot));
+        assert!(!world.entities().contains(cubie));
     }
 }

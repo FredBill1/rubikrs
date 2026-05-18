@@ -45,6 +45,7 @@
 - Suppress Chrome device emulation's synthetic mouse stream when touch is active. The canvas now calls `preventDefault()` on touch lifecycle events in the host shell, and the Bevy runtime keeps a short post-touch mouse suppression window so a single emulated gesture cannot drive both the touch path and the mouse orbit path at once.
 - Stop trusting `Touch::delta()` as the authoritative orbit increment for web device emulation. The runtime now derives single-finger orbit motion from explicit normalized position differences so a blank-space drag stops rotating immediately when the emulated touch stops moving instead of replaying a stale delta every frame.
 - Treat `Shift` + one active emulated touch as a DevTools-only stand-in for a two-finger camera gesture. When that modifier is held, the runtime skips single-finger sticker-turn candidacy and forces the gesture down the orbit path so clicking the cube during Shift-based device emulation behaves like a two-finger drag instead of a direct cube manipulation.
+- Only despawn rendered cube visuals from the `CubeVisualRoot`. The old cleanup loop queued `despawn()` for every `CubeVisual`, including parents and descendants in the same hierarchy, which made Bevy log noisy "Entity despawned" command errors during normal turns even though the scene still recovered.
 
 ## Next risks to validate
 
