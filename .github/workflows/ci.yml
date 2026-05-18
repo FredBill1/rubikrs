@@ -1,42 +1,66 @@
 name: CI
 
 on:
-  pull_request:
   push:
     branches:
       - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   verify:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-      - name: Setup Node
-        uses: actions/setup-node@v5
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
-          node-version: 24
+          node-version: 22
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
 
-      - name: Setup Rust
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu-stable-wasm
+          workspaces: |
+            . -> target
+          cache-workspace-crates: true
+          cache-all-crates: true
+          cache-on-failure: true
+          cache-bin: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Install wasm-pack
-        run: cargo install wasm-pack --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+          fallback: none
 
       - name: Install web dependencies
         working-directory: apps/web
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit
 
       - name: Run Rust tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Build web app
         working-directory: apps/web
         run: npm run build
-
