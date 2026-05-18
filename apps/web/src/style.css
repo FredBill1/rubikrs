@@ -313,6 +313,7 @@ select {
 
 .telemetry {
   display: grid;
+  grid-auto-rows: max-content;
   min-height: 0;
   gap: 14px;
   overflow-x: hidden;
@@ -324,7 +325,7 @@ select {
 
 .panel {
   padding: 18px 18px 16px;
-  min-height: fit-content;
+  min-height: auto;
 }
 
 .status-bar {
@@ -390,9 +391,21 @@ select {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.action-row--pair {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .action-row--stacked {
   grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
   align-items: end;
+}
+
+.action-row--stacked > .action-row--pair {
+  grid-column: 1 / -1;
+}
+
+.action-row--stacked > .field--inline {
+  grid-column: 1 / -1;
 }
 
 .turn-grid {
@@ -404,11 +417,21 @@ select {
   gap: 6px;
 }
 
+.field--inline {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
 .field span {
   color: var(--muted);
   font-size: 12px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
+}
+
+.field--inline span {
+  white-space: nowrap;
 }
 
 .field--checkbox {
@@ -434,6 +457,7 @@ textarea {
 
 button {
   min-height: 42px;
+  min-width: 0;
   padding: 0 12px;
   text-transform: uppercase;
   letter-spacing: 0.14em;
