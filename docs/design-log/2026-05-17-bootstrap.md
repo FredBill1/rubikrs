@@ -11,7 +11,7 @@
 - Model history as a linear applied-turn log plus redo stack, instead of trying to reconstruct history from inverse moves later.
 - Replace Bevy's default feature set with an explicit runtime whitelist once the first browser slice is stable; this removes UI, audio, scene, picking and glTF overhead from the wasm bundle while keeping the current 3D runtime intact.
 - Keep the 3D camera on `Tonemapping::None` for the trimmed WebGL2 build instead of depending on LUT-backed tonemapping variants that are easy to break when pruning Bevy features.
-- Add touch orbit controls directly in the Bevy runtime (single-finger orbit + two-finger pinch zoom) so mobile interaction stays in the Rust-side input layer rather than fragmenting between TS and Bevy.
+- Keep touch interaction Rust-native in the Bevy runtime, but align its semantics with mouse input: single-finger drag on a sticker turns the cube, single-finger drag on blank space orbits, and two-finger drag plus pinch maps to orbit + zoom.
 - Keep the first async solve slice intentionally narrow: one dedicated Rust wasm worker, a small JSON protocol, depth-limited IDDFS, and terminate/recreate cancellation on the TS side before attempting a real worker pool.
 - Expose solver turns from Rust in camelCase and keep the browser bridge typed to that payload shape; otherwise wasm-bindgen calls quietly coerce `undefined` turn codes and replay the wrong move.
 - Avoid `std::time::Instant` in the wasm runtime shell state; use a platform-safe millisecond clock so browser-side turns, scrambles, and solve replays do not panic on unsupported wasm timing APIs.
@@ -39,13 +39,19 @@
 - Trim the browser shell back to one compact status block plus the actual control panels. Runtime telemetry such as worker lanes, renderer baseline, and similar implementation details were useful during bring-up but should not be part of the end-user interface.
 - Treat 3x3 center-slice solving as a **full cube-frame problem**, not a color relabeling problem. When middle-slice turns move centers, the worker now derives the current cube orientation from the six center stickers, rotates the whole 54-sticker state back into the canonical `U/R/F/D/L/B` frame before exact search or `kewb`, remaps returned outer-face turns back into the runtime frame, and then appends the minimal center-frame alignment turns needed to restore the canonical solved orientation.
 - Stop treating cube interaction as a sticker-polygon problem. `rubik-app` now casts the pointer through a **virtual outer cube volume**, resolves the hit face from the first ray-box intersection, and then maps the hit point into that face's row/column grid. This makes sticker seams and cubie gaps behave like one continuous manipulable surface while still letting blank space outside the cube silhouette fall back to orbit.
+- Device-emulated web touch needed a stricter coordinate audit than mouse. In Chrome DevTools emulation, the DOM touch path was not safely interchangeable with Bevy's `Touches`: the canvas `offsetX/Y` we observed for touch were already canvas-relative, but they still had to be mapped into Bevy's logical viewport space before `viewport_to_world` could hit the same virtual-cube surface as mouse input.
+- Replace the old touch-orbit boolean with explicit single-finger and multi-finger orbit modes. Resetting the tracked mode, midpoint, and pinch distance whenever the finger count changes prevents the lingering-rotation bug that used to appear when a two-finger gesture collapsed back to one touch.
+- Fix web touch picking by bypassing the unreliable Bevy-emulated touch coordinates on wasm and consuming DOM `pointerType: "touch"` events directly. The stable mapping for this stack is: keep DOM touch points canvas-relative, then rescale them with `window logical size / canvas client rect size`; subtracting `rect.left/top` a second time was the bug that collapsed the hit region into the upper-left phantom area.
+- Suppress Chrome device emulation's synthetic mouse stream when touch is active. The canvas now calls `preventDefault()` on touch lifecycle events in the host shell, and the Bevy runtime keeps a short post-touch mouse suppression window so a single emulated gesture cannot drive both the touch path and the mouse orbit path at once.
+- Stop trusting `Touch::delta()` as the authoritative orbit increment for web device emulation. The runtime now derives single-finger orbit motion from explicit normalized position differences so a blank-space drag stops rotating immediately when the emulated touch stops moving instead of replaying a stale delta every frame.
+- Treat `Shift` + one active emulated touch as a DevTools-only stand-in for a two-finger camera gesture. When that modifier is held, the runtime skips single-finger sticker-turn candidacy and forces the gesture down the orbit path so clicking the cube during Shift-based device emulation behaves like a two-finger drag instead of a direct cube manipulation.
 
 ## Next risks to validate
 
 - Bevy canvas mounting in a GitHub Pages-friendly base path
 - Input delivery in the browser runtime
 - wasm build ergonomics between local development and CI
-- touch interaction polish beyond baseline orbit / pinch
+- touch interaction polish beyond the current single-finger turn / blank-space orbit / two-finger orbit+pinch baseline
 - layer picking and direct canvas turn gestures, which are still open even though animated turns and orbit snapping are now live
 - the current solver is still not the required 3x3 strict-optimal / NxN final solver set; 3x3 remains shallow search, while NxN now has an in-session recorded-history feasible fallback rather than a full general-purpose reduction pipeline
 

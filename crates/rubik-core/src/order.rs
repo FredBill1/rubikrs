@@ -47,10 +47,16 @@ impl fmt::Display for CubeOrderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooSmall { attempted, min } => {
-                write!(f, "cube order {attempted} is below the minimum supported order {min}")
+                write!(
+                    f,
+                    "cube order {attempted} is below the minimum supported order {min}"
+                )
             }
             Self::TooLarge { attempted, max } => {
-                write!(f, "cube order {attempted} exceeds the maximum supported order {max}")
+                write!(
+                    f,
+                    "cube order {attempted} exceeds the maximum supported order {max}"
+                )
             }
         }
     }

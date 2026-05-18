@@ -17,10 +17,13 @@ use rubik_core::{
 use serde::Serialize;
 
 #[cfg(target_arch = "wasm32")]
-use js_sys::Date;
+use serde::Deserialize;
 
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::wasm_bindgen;
+use js_sys::{Array, Date};
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 thread_local! {
     static RUNTIME: RefCell<RuntimeBridge> = RefCell::new(RuntimeBridge::new(CubeOrder::standard()));
@@ -48,8 +51,10 @@ struct OrbitRig {
     radius: f32,
     auto_spin: bool,
     mouse_drag_button: Option<MouseButton>,
-    touch_drag_active: bool,
+    touch_drag_mode: TouchOrbitMode,
+    touch_mouse_suppression_secs: f32,
     snap_target: Option<Vec2>,
+    previous_single_touch_position: Option<Vec2>,
     previous_touch_center: Option<Vec2>,
     previous_pinch_distance: Option<f32>,
 }
@@ -132,9 +137,77 @@ struct PointerGestureCandidate {
 #[derive(Debug, Clone, Copy)]
 struct TouchGestureCandidate {
     id: u64,
+    raw_start_position: Vec2,
     start_position: Vec2,
     max_distance: f32,
     sticker_candidate: Option<ScreenStickerCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TouchOrbitMode {
+    #[default]
+    Idle,
+    SingleFinger {
+        id: u64,
+    },
+    MultiFinger,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveTouch {
+    id: u64,
+    raw_position: Vec2,
+    position: Vec2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CanvasTouchSpace {
+    offset: Vec2,
+    scale: Vec2,
+    rect_size: Vec2,
+    canvas_size: Vec2,
+    device_pixel_ratio: f32,
+    viewport_scale: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReleasedTouch {
+    id: u64,
+    raw_position: Vec2,
+    position: Vec2,
+    canceled: bool,
+}
+
+#[derive(Debug, Default)]
+struct TouchInputFrame {
+    active: Vec<ActiveTouch>,
+    just_pressed_ids: BTreeSet<u64>,
+    released: Vec<ReleasedTouch>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Deserialize)]
+struct BrowserTouchSnapshot {
+    active: Vec<BrowserTouchPoint>,
+    started: Vec<BrowserTouchPoint>,
+    released: Vec<BrowserTouchRelease>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Deserialize)]
+struct BrowserTouchPoint {
+    id: u64,
+    x: f32,
+    y: f32,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Deserialize)]
+struct BrowserTouchRelease {
+    id: u64,
+    x: f32,
+    y: f32,
+    canceled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -163,6 +236,7 @@ const CUBE_FACE_SPAN: f32 = 1.9;
 const POINTER_TAP_MAX_DRAG_PX: f32 = 8.0;
 const FACE_TAP_RADIUS_SCALE: f32 = 0.7;
 const VIRTUAL_SURFACE_INSET: f32 = 0.03;
+const TOUCH_MOUSE_SUPPRESSION_SECS: f32 = 0.12;
 
 impl Default for OrbitRig {
     fn default() -> Self {
@@ -172,12 +246,388 @@ impl Default for OrbitRig {
             radius: 7.2,
             auto_spin: false,
             mouse_drag_button: None,
-            touch_drag_active: false,
+            touch_drag_mode: TouchOrbitMode::Idle,
+            touch_mouse_suppression_secs: 0.0,
             snap_target: None,
+            previous_single_touch_position: None,
             previous_touch_center: None,
             previous_pinch_distance: None,
         }
     }
+}
+
+impl Default for CanvasTouchSpace {
+    fn default() -> Self {
+        Self {
+            offset: Vec2::ZERO,
+            scale: Vec2::ONE,
+            rect_size: Vec2::ZERO,
+            canvas_size: Vec2::ZERO,
+            device_pixel_ratio: 1.0,
+            viewport_scale: 1.0,
+        }
+    }
+}
+
+impl TouchOrbitMode {
+    fn is_orbiting(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
+impl CanvasTouchSpace {
+    fn offset_only_position(self, pointer_position: Vec2) -> Vec2 {
+        pointer_position - self.offset
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn canvas_relative_position(self, pointer_position: Vec2) -> Vec2 {
+        pointer_position * self.scale
+    }
+
+    fn scaled_position(self, pointer_position: Vec2) -> Vec2 {
+        self.offset_only_position(pointer_position) * self.scale
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(inline_js = r#"
+export function rubikCanvasClientMetrics(selector) {
+  if (typeof document === 'undefined' || typeof window === 'undefined') {
+    return null;
+  }
+
+  const canvas = document.querySelector(selector);
+  if (!(canvas instanceof HTMLCanvasElement)) {
+    return null;
+  }
+
+  const rect = canvas.getBoundingClientRect();
+  return [
+    rect.left,
+    rect.top,
+    rect.width,
+    rect.height,
+    canvas.width,
+    canvas.height,
+    window.devicePixelRatio ?? 1,
+    window.visualViewport?.scale ?? 1,
+  ];
+}
+
+const rubikTouchStores = globalThis.__rubikTouchStores ??= new Map();
+
+function ensureRubikTouchStore(selector) {
+  if (typeof document === 'undefined') {
+    return null;
+  }
+
+  const canvas = document.querySelector(selector);
+  if (!(canvas instanceof HTMLCanvasElement)) {
+    return null;
+  }
+
+  let store = rubikTouchStores.get(selector);
+  if (store) {
+    return store;
+  }
+
+  store = {
+    active: new Map(),
+    started: [],
+    released: [],
+  };
+
+  const pointFromEvent = (event) => ({
+    id: event.pointerId,
+    x: event.offsetX,
+    y: event.offsetY,
+  });
+
+  const onPointerDown = (event) => {
+    if (event.pointerType !== 'touch') {
+      return;
+    }
+    try {
+      canvas.setPointerCapture(event.pointerId);
+    } catch {}
+    const point = pointFromEvent(event);
+    store.active.set(event.pointerId, point);
+    store.started.push(point);
+  };
+
+  const onPointerMove = (event) => {
+    if (event.pointerType !== 'touch') {
+      return;
+    }
+    if (!store.active.has(event.pointerId)) {
+      return;
+    }
+    store.active.set(event.pointerId, pointFromEvent(event));
+  };
+
+  const onPointerEnd = (event, canceled) => {
+    if (event.pointerType !== 'touch') {
+      return;
+    }
+    try {
+      canvas.releasePointerCapture(event.pointerId);
+    } catch {}
+    const point = pointFromEvent(event);
+    store.active.delete(event.pointerId);
+    store.released.push({ ...point, canceled });
+  };
+
+  canvas.addEventListener('pointerdown', onPointerDown, { passive: false });
+  canvas.addEventListener('pointermove', onPointerMove, { passive: false });
+  canvas.addEventListener('pointerup', (event) => onPointerEnd(event, false), { passive: false });
+  canvas.addEventListener('pointercancel', (event) => onPointerEnd(event, true), { passive: false });
+
+  rubikTouchStores.set(selector, store);
+  return store;
+}
+
+export function rubikConsumeTouchPointerSnapshot(selector) {
+  const store = ensureRubikTouchStore(selector);
+  if (!store) {
+    return null;
+  }
+
+  const payload = {
+    active: Array.from(store.active.values()),
+    started: store.started.splice(0),
+    released: store.released.splice(0),
+  };
+  return JSON.stringify(payload);
+}
+"#)]
+extern "C" {
+    fn rubikCanvasClientMetrics(selector: &str) -> JsValue;
+    fn rubikConsumeTouchPointerSnapshot(selector: &str) -> JsValue;
+}
+
+fn build_touch_candidate(
+    camera_context: Option<(&Camera, &GlobalTransform)>,
+    order: u8,
+    id: u64,
+    raw_position: Vec2,
+    position: Vec2,
+) -> TouchGestureCandidate {
+    TouchGestureCandidate {
+        id,
+        raw_start_position: raw_position,
+        start_position: position,
+        max_distance: 0.0,
+        sticker_candidate: camera_context.and_then(|(camera, camera_transform)| {
+            projected_sticker_hit(camera, camera_transform, order, position)
+        }),
+    }
+}
+
+fn should_reset_single_touch_gesture(
+    touch_mode: TouchOrbitMode,
+    candidate_id: Option<u64>,
+    touch_id: u64,
+    just_pressed: bool,
+) -> bool {
+    just_pressed
+        || matches!(touch_mode, TouchOrbitMode::MultiFinger)
+        || matches!(touch_mode, TouchOrbitMode::SingleFinger { id } if id != touch_id)
+        || candidate_id.is_some_and(|candidate_id| candidate_id != touch_id)
+}
+
+fn set_touch_orbit_mode(orbit: &mut OrbitRig, mode: TouchOrbitMode) {
+    orbit.touch_drag_mode = mode;
+    orbit.previous_single_touch_position = None;
+    orbit.previous_touch_center = None;
+    orbit.previous_pinch_distance = None;
+    orbit.snap_target = None;
+}
+
+fn clear_touch_orbit_state(orbit: &mut OrbitRig) {
+    orbit.touch_drag_mode = TouchOrbitMode::Idle;
+    orbit.previous_single_touch_position = None;
+    orbit.previous_touch_center = None;
+    orbit.previous_pinch_distance = None;
+}
+
+fn position_delta(previous_position: &mut Option<Vec2>, current_position: Vec2) -> Vec2 {
+    previous_position
+        .replace(current_position)
+        .map_or(Vec2::ZERO, |previous_position| {
+            current_position - previous_position
+        })
+}
+
+fn should_emulate_two_finger_touch(shift_pressed: bool, active_touch_count: usize) -> bool {
+    shift_pressed && active_touch_count == 1
+}
+
+fn canvas_touch_space(config: &ShellConfig, window: &Window) -> CanvasTouchSpace {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let value = rubikCanvasClientMetrics(&config.canvas_selector);
+        if value.is_null() || value.is_undefined() {
+            return CanvasTouchSpace::default();
+        }
+
+        let values = Array::from(&value);
+        let rect_width = values.get(2).as_f64().unwrap_or_default() as f32;
+        let rect_height = values.get(3).as_f64().unwrap_or_default() as f32;
+        if rect_width <= f32::EPSILON || rect_height <= f32::EPSILON {
+            return CanvasTouchSpace::default();
+        }
+
+        return CanvasTouchSpace {
+            offset: Vec2::new(
+                values.get(0).as_f64().unwrap_or_default() as f32,
+                values.get(1).as_f64().unwrap_or_default() as f32,
+            ),
+            scale: Vec2::new(window.width() / rect_width, window.height() / rect_height),
+            rect_size: Vec2::new(rect_width, rect_height),
+            canvas_size: Vec2::new(
+                values.get(4).as_f64().unwrap_or_default() as f32,
+                values.get(5).as_f64().unwrap_or_default() as f32,
+            ),
+            device_pixel_ratio: values.get(6).as_f64().unwrap_or(1.0) as f32,
+            viewport_scale: values.get(7).as_f64().unwrap_or(1.0) as f32,
+        };
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (config, window);
+        CanvasTouchSpace::default()
+    }
+}
+
+fn normalize_touch_position(touch_space: CanvasTouchSpace, position: Vec2) -> Vec2 {
+    touch_space.offset_only_position(position)
+}
+
+fn bevy_touch_frame(touches: &Touches, touch_space: CanvasTouchSpace) -> TouchInputFrame {
+    let active = touches
+        .iter()
+        .map(|touch| ActiveTouch {
+            id: touch.id(),
+            raw_position: touch.position(),
+            position: normalize_touch_position(touch_space, touch.position()),
+        })
+        .collect::<Vec<_>>();
+    let just_pressed_ids = touches
+        .iter_just_pressed()
+        .map(|touch| touch.id())
+        .collect::<BTreeSet<_>>();
+    let mut released = touches
+        .iter_just_released()
+        .map(|touch| ReleasedTouch {
+            id: touch.id(),
+            raw_position: touch.position(),
+            position: normalize_touch_position(touch_space, touch.position()),
+            canceled: false,
+        })
+        .collect::<Vec<_>>();
+    released.extend(touches.iter_just_canceled().map(|touch| ReleasedTouch {
+        id: touch.id(),
+        raw_position: touch.position(),
+        position: normalize_touch_position(touch_space, touch.position()),
+        canceled: true,
+    }));
+
+    TouchInputFrame {
+        active,
+        just_pressed_ids,
+        released,
+    }
+}
+
+fn dom_touch_frame(config: &ShellConfig, touch_space: CanvasTouchSpace) -> Option<TouchInputFrame> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let value = rubikConsumeTouchPointerSnapshot(&config.canvas_selector);
+        if value.is_null() || value.is_undefined() {
+            return None;
+        }
+
+        let snapshot = serde_json::from_str::<BrowserTouchSnapshot>(&value.as_string()?).ok()?;
+        return Some(TouchInputFrame {
+            active: snapshot
+                .active
+                .into_iter()
+                .map(|point| ActiveTouch {
+                    id: point.id,
+                    raw_position: Vec2::new(point.x, point.y),
+                    position: touch_space.canvas_relative_position(Vec2::new(point.x, point.y)),
+                })
+                .collect(),
+            just_pressed_ids: snapshot.started.into_iter().map(|point| point.id).collect(),
+            released: snapshot
+                .released
+                .into_iter()
+                .map(|point| ReleasedTouch {
+                    id: point.id,
+                    raw_position: Vec2::new(point.x, point.y),
+                    position: touch_space.canvas_relative_position(Vec2::new(point.x, point.y)),
+                    canceled: point.canceled,
+                })
+                .collect(),
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (config, touch_space);
+        None
+    }
+}
+
+fn format_vec2(value: Vec2) -> String {
+    format!("{:.1},{:.1}", value.x, value.y)
+}
+
+fn format_optional_vec2(value: Option<Vec2>) -> String {
+    value.map(format_vec2).unwrap_or_else(|| "—".to_owned())
+}
+
+fn publish_touch_diagnostic(
+    label: &str,
+    window: Option<&Window>,
+    touch_space: CanvasTouchSpace,
+    raw_position: Vec2,
+    local_position: Vec2,
+    cursor_position: Option<Vec2>,
+    sticker_hit: Option<bool>,
+) {
+    let scaled = touch_space.scaled_position(raw_position);
+    let sticker_hit = sticker_hit
+        .map(|value| if value { "Y" } else { "N" })
+        .unwrap_or("?");
+    let compact = format!(
+        "{label} hit:{sticker_hit} raw {} local {} scaled {} cursor {}",
+        format_vec2(raw_position),
+        format_vec2(local_position),
+        format_vec2(scaled),
+        format_optional_vec2(cursor_position),
+    );
+
+    let detail = if let Some(window) = window {
+        format!(
+            "{compact} | win {:.1}x{:.1} sf {:.2} | rect {} {}x{} | canvas {} dpr {:.2} vvp {:.2}",
+            window.width(),
+            window.height(),
+            window.scale_factor(),
+            format_vec2(touch_space.offset),
+            format_vec2(touch_space.rect_size),
+            format_vec2(touch_space.scale),
+            format_vec2(touch_space.canvas_size),
+            touch_space.device_pixel_ratio,
+            touch_space.viewport_scale,
+        )
+    } else {
+        compact.clone()
+    };
+
+    info!("touch diagnostic: {detail}");
 }
 
 impl RuntimeBridge {
@@ -815,6 +1265,7 @@ fn orbit_camera_input(
     buttons: Res<'_, ButtonInput<MouseButton>>,
     keys: Res<'_, ButtonInput<KeyCode>>,
     touches: Res<'_, Touches>,
+    config: Res<'_, ShellConfig>,
     windows: Query<'_, '_, &Window>,
     cameras: Query<'_, '_, (&Camera, &GlobalTransform), With<Camera3d>>,
     mut mouse_motion: MessageReader<'_, '_, MouseMotion>,
@@ -824,6 +1275,9 @@ fn orbit_camera_input(
 ) {
     let camera_context = cameras.single().ok();
     let order = with_runtime(|runtime| runtime.engine.order().get());
+    let shift_pressed = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    orbit.touch_mouse_suppression_secs =
+        (orbit.touch_mouse_suppression_secs - time.delta_secs()).max(0.0);
 
     if keys.just_pressed(KeyCode::Space) {
         orbit.auto_spin = !orbit.auto_spin;
@@ -834,96 +1288,109 @@ fn orbit_camera_input(
         orbit.yaw += time.delta_secs() * 0.18;
     }
 
-    let cursor_position = windows
-        .iter()
-        .next()
-        .and_then(|window| window.cursor_position());
+    let primary_window = windows.iter().next();
+    let cursor_position = primary_window.and_then(|window| window.cursor_position());
+    let touch_space = primary_window
+        .map(|window| canvas_touch_space(&config, window))
+        .unwrap_or_default();
+    let touch_frame = dom_touch_frame(&config, touch_space)
+        .unwrap_or_else(|| bevy_touch_frame(&touches, touch_space));
+    let active_touches = touch_frame.active.as_slice();
     let mouse_delta = mouse_motion
         .read()
         .fold(Vec2::ZERO, |total, event| total + event.delta);
-
-    if buttons.just_pressed(MouseButton::Left) {
-        direct_turn_input.mouse_candidate =
-            cursor_position.map(|position| PointerGestureCandidate {
-                start_position: position,
-                max_distance: 0.0,
-                sticker_candidate: camera_context.and_then(|(camera, camera_transform)| {
-                    projected_sticker_hit(camera, camera_transform, order, position)
-                }),
-            });
-        orbit.mouse_drag_button = None;
-        orbit.snap_target = None;
-        orbit.auto_spin = false;
+    if !active_touches.is_empty() {
+        orbit.touch_mouse_suppression_secs = TOUCH_MOUSE_SUPPRESSION_SECS;
     }
+    let suppress_mouse = orbit.touch_mouse_suppression_secs > 0.0;
 
-    if buttons.just_pressed(MouseButton::Right) {
+    if suppress_mouse {
         direct_turn_input.mouse_candidate = None;
-        orbit.mouse_drag_button = Some(MouseButton::Right);
-        orbit.snap_target = None;
-        orbit.auto_spin = false;
-    }
+        orbit.mouse_drag_button = None;
+    } else {
+        if buttons.just_pressed(MouseButton::Left) {
+            direct_turn_input.mouse_candidate =
+                cursor_position.map(|position| PointerGestureCandidate {
+                    start_position: position,
+                    max_distance: 0.0,
+                    sticker_candidate: camera_context.and_then(|(camera, camera_transform)| {
+                        projected_sticker_hit(camera, camera_transform, order, position)
+                    }),
+                });
+            orbit.mouse_drag_button = None;
+            orbit.snap_target = None;
+            orbit.auto_spin = false;
+        }
 
-    if buttons.pressed(MouseButton::Left) {
-        if let Some(candidate) = direct_turn_input.mouse_candidate.as_mut() {
-            candidate.max_distance = candidate.max_distance.max(mouse_delta.length());
-            if let Some(position) = cursor_position {
-                candidate.max_distance = candidate
-                    .max_distance
-                    .max(position.distance(candidate.start_position));
-            }
+        if buttons.just_pressed(MouseButton::Right) {
+            direct_turn_input.mouse_candidate = None;
+            orbit.mouse_drag_button = Some(MouseButton::Right);
+            orbit.snap_target = None;
+            orbit.auto_spin = false;
+        }
 
-            if should_begin_mouse_orbit(
-                MouseButton::Left,
-                candidate.max_distance,
-                candidate.sticker_candidate.is_some(),
-            ) {
-                direct_turn_input.mouse_candidate = None;
-                orbit.mouse_drag_button = Some(MouseButton::Left);
-                orbit.snap_target = None;
+        if buttons.pressed(MouseButton::Left) {
+            if let Some(candidate) = direct_turn_input.mouse_candidate.as_mut() {
+                candidate.max_distance = candidate.max_distance.max(mouse_delta.length());
+                if let Some(position) = cursor_position {
+                    candidate.max_distance = candidate
+                        .max_distance
+                        .max(position.distance(candidate.start_position));
+                }
+
+                if should_begin_mouse_orbit(
+                    MouseButton::Left,
+                    candidate.max_distance,
+                    candidate.sticker_candidate.is_some(),
+                ) {
+                    direct_turn_input.mouse_candidate = None;
+                    orbit.mouse_drag_button = Some(MouseButton::Left);
+                    orbit.snap_target = None;
+                }
             }
         }
-    }
 
-    if orbit
-        .mouse_drag_button
-        .is_some_and(|button| buttons.pressed(button))
-    {
-        orbit.snap_target = None;
-        orbit.auto_spin = false;
-        orbit.yaw += mouse_delta.x * 0.008;
-        orbit.pitch = (orbit.pitch + mouse_delta.y * 0.006).clamp(-1.15, 1.15);
-    }
+        if orbit
+            .mouse_drag_button
+            .is_some_and(|button| buttons.pressed(button))
+        {
+            orbit.snap_target = None;
+            orbit.auto_spin = false;
+            orbit.yaw += mouse_delta.x * 0.008;
+            orbit.pitch = (orbit.pitch + mouse_delta.y * 0.006).clamp(-1.15, 1.15);
+        }
 
-    if buttons.just_released(MouseButton::Left) {
-        if orbit.mouse_drag_button == Some(MouseButton::Left) {
-            orbit.mouse_drag_button = None;
-            orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
-        } else if let Some(candidate) = direct_turn_input.mouse_candidate.take() {
-            let position = cursor_position.unwrap_or(candidate.start_position);
-            if let (Some(sticker_candidate), Some((camera, camera_transform))) =
-                (candidate.sticker_candidate, camera_context)
-            {
-                if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                    if let Some(turn) = slice_turn_from_sticker_drag(
-                        camera,
-                        camera_transform,
-                        order,
-                        sticker_candidate,
-                        candidate.start_position,
-                        position,
-                    ) {
-                        direct_turn_input.queued_turn = Some(turn);
+        if buttons.just_released(MouseButton::Left) {
+            if orbit.mouse_drag_button == Some(MouseButton::Left) {
+                orbit.mouse_drag_button = None;
+                orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
+            } else if let Some(candidate) = direct_turn_input.mouse_candidate.take() {
+                let position = cursor_position.unwrap_or(candidate.start_position);
+                if let (Some(sticker_candidate), Some((camera, camera_transform))) =
+                    (candidate.sticker_candidate, camera_context)
+                {
+                    if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
+                        if let Some(turn) = slice_turn_from_sticker_drag(
+                            camera,
+                            camera_transform,
+                            order,
+                            sticker_candidate,
+                            candidate.start_position,
+                            position,
+                        ) {
+                            direct_turn_input.queued_turn = Some(turn);
+                        }
                     }
                 }
             }
         }
-    }
 
-    if buttons.just_released(MouseButton::Right)
-        && orbit.mouse_drag_button == Some(MouseButton::Right)
-    {
-        orbit.mouse_drag_button = None;
-        orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
+        if buttons.just_released(MouseButton::Right)
+            && orbit.mouse_drag_button == Some(MouseButton::Right)
+        {
+            orbit.mouse_drag_button = None;
+            orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
+        }
     }
 
     for event in mouse_wheel.read() {
@@ -935,97 +1402,177 @@ fn orbit_camera_input(
     }
 
     if let Some(candidate) = direct_turn_input.touch_candidate {
-        if let Some(released_touch) = touches.get_released(candidate.id) {
+        if let Some(released_touch) = touch_frame
+            .released
+            .iter()
+            .find(|touch| touch.id == candidate.id && !touch.canceled)
+        {
             if let (Some(sticker_candidate), Some((camera, camera_transform))) =
                 (candidate.sticker_candidate, camera_context)
             {
-                if !orbit.touch_drag_active && candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
+                if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
                     if let Some(turn) = slice_turn_from_sticker_drag(
                         camera,
                         camera_transform,
                         order,
                         sticker_candidate,
                         candidate.start_position,
-                        released_touch.position(),
+                        released_touch.position,
                     ) {
                         direct_turn_input.queued_turn = Some(turn);
                     }
                 }
             }
+            publish_touch_diagnostic(
+                "release",
+                primary_window,
+                touch_space,
+                released_touch.raw_position,
+                released_touch.position,
+                cursor_position,
+                Some(candidate.sticker_candidate.is_some()),
+            );
             direct_turn_input.touch_candidate = None;
-        } else if touches.just_canceled(candidate.id) {
+        } else if touch_frame
+            .released
+            .iter()
+            .any(|touch| touch.id == candidate.id && touch.canceled)
+        {
+            publish_touch_diagnostic(
+                "cancel",
+                primary_window,
+                touch_space,
+                candidate.raw_start_position,
+                candidate.start_position,
+                cursor_position,
+                Some(candidate.sticker_candidate.is_some()),
+            );
             direct_turn_input.touch_candidate = None;
         }
     }
 
-    let active_touches = touches.iter().copied().collect::<Vec<_>>();
-
-    match active_touches.as_slice() {
+    match active_touches {
         [] => {
-            if orbit.touch_drag_active {
+            if orbit.touch_drag_mode.is_orbiting() {
                 orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
             }
-            orbit.touch_drag_active = false;
-            orbit.previous_touch_center = None;
-            orbit.previous_pinch_distance = None;
+            clear_touch_orbit_state(&mut orbit);
         }
         [touch] => {
             orbit.auto_spin = false;
+            orbit.snap_target = None;
+            let emulate_two_finger = should_emulate_two_finger_touch(shift_pressed, 1);
 
-            if touches.just_pressed(touch.id()) {
-                direct_turn_input.touch_candidate = Some(TouchGestureCandidate {
-                    id: touch.id(),
-                    start_position: touch.position(),
-                    max_distance: 0.0,
-                    sticker_candidate: camera_context.and_then(|(camera, camera_transform)| {
-                        projected_sticker_hit(camera, camera_transform, order, touch.position())
-                    }),
-                });
-                orbit.touch_drag_active = false;
-            }
+            if emulate_two_finger {
+                direct_turn_input.touch_candidate = None;
+                if !matches!(
+                    orbit.touch_drag_mode,
+                    TouchOrbitMode::SingleFinger { id } if id == touch.id
+                ) {
+                    set_touch_orbit_mode(&mut orbit, TouchOrbitMode::SingleFinger { id: touch.id });
+                    orbit.previous_single_touch_position = Some(touch.position);
+                    publish_touch_diagnostic(
+                        "emulate-2f",
+                        primary_window,
+                        touch_space,
+                        touch.raw_position,
+                        touch.position,
+                        cursor_position,
+                        None,
+                    );
+                }
+            } else {
+                let touch_just_pressed = touch_frame.just_pressed_ids.contains(&touch.id);
+                if should_reset_single_touch_gesture(
+                    orbit.touch_drag_mode,
+                    direct_turn_input
+                        .touch_candidate
+                        .map(|candidate| candidate.id),
+                    touch.id,
+                    touch_just_pressed,
+                ) {
+                    clear_touch_orbit_state(&mut orbit);
+                    let candidate = build_touch_candidate(
+                        camera_context,
+                        order,
+                        touch.id,
+                        touch.raw_position,
+                        touch.position,
+                    );
+                    publish_touch_diagnostic(
+                        "start",
+                        primary_window,
+                        touch_space,
+                        touch.raw_position,
+                        touch.position,
+                        cursor_position,
+                        Some(candidate.sticker_candidate.is_some()),
+                    );
+                    direct_turn_input.touch_candidate = Some(candidate);
+                }
 
-            if let Some(candidate) = direct_turn_input
-                .touch_candidate
-                .as_mut()
-                .filter(|candidate| candidate.id == touch.id())
-            {
-                candidate.max_distance = candidate
-                    .max_distance
-                    .max(touch.position().distance(candidate.start_position))
-                    .max(touch.delta().length());
+                let mut should_begin_touch_orbit = false;
 
-                if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                    if candidate.sticker_candidate.is_none() {
-                        direct_turn_input.touch_candidate = None;
-                        orbit.touch_drag_active = true;
-                        orbit.snap_target = None;
-                    }
+                if let Some(candidate) = direct_turn_input
+                    .touch_candidate
+                    .as_mut()
+                    .filter(|candidate| candidate.id == touch.id)
+                {
+                    candidate.max_distance = candidate
+                        .max_distance
+                        .max(touch.position.distance(candidate.start_position));
+
+                    should_begin_touch_orbit = should_begin_mouse_orbit(
+                        MouseButton::Left,
+                        candidate.max_distance,
+                        candidate.sticker_candidate.is_some(),
+                    );
+                }
+
+                if should_begin_touch_orbit {
+                    direct_turn_input.touch_candidate = None;
+                    set_touch_orbit_mode(&mut orbit, TouchOrbitMode::SingleFinger { id: touch.id });
+                    orbit.previous_single_touch_position = Some(touch.position);
+                    publish_touch_diagnostic(
+                        "orbit",
+                        primary_window,
+                        touch_space,
+                        touch.raw_position,
+                        touch.position,
+                        cursor_position,
+                        None,
+                    );
                 }
             }
 
-            if orbit.touch_drag_active {
-                orbit.snap_target = None;
-                orbit.yaw += touch.delta().x * 0.008;
-                orbit.pitch = (orbit.pitch + touch.delta().y * 0.006).clamp(-1.15, 1.15);
+            if matches!(
+                orbit.touch_drag_mode,
+                TouchOrbitMode::SingleFinger { id } if id == touch.id
+            ) {
+                let delta =
+                    position_delta(&mut orbit.previous_single_touch_position, touch.position);
+                if delta.length_squared() > 0.0 {
+                    orbit.yaw += delta.x * 0.008;
+                    orbit.pitch = (orbit.pitch + delta.y * 0.006).clamp(-1.15, 1.15);
+                }
             }
-
-            orbit.previous_touch_center = Some(touch.position());
-            orbit.previous_pinch_distance = None;
         }
         [first, second, ..] => {
             orbit.auto_spin = false;
-            orbit.touch_drag_active = true;
             orbit.snap_target = None;
             direct_turn_input.touch_candidate = None;
+            if orbit.touch_drag_mode != TouchOrbitMode::MultiFinger {
+                set_touch_orbit_mode(&mut orbit, TouchOrbitMode::MultiFinger);
+            }
 
-            let center = (first.position() + second.position()) * 0.5;
-            if let Some(previous_center) = orbit.previous_touch_center {
-                let delta = center - previous_center;
+            let center = (first.position + second.position) * 0.5;
+            let delta = position_delta(&mut orbit.previous_touch_center, center);
+            if delta.length_squared() > 0.0 {
                 orbit.yaw += delta.x * 0.006;
                 orbit.pitch = (orbit.pitch + delta.y * 0.0045).clamp(-1.15, 1.15);
             }
 
-            let pinch_distance = first.position().distance(second.position());
+            let pinch_distance = first.position.distance(second.position);
             if let Some(previous_pinch_distance) = orbit.previous_pinch_distance {
                 let zoom_delta = (pinch_distance - previous_pinch_distance) * 0.0022;
                 orbit.radius = (orbit.radius * (-zoom_delta).exp()).clamp(2.9, 9.4);
@@ -1036,7 +1583,8 @@ fn orbit_camera_input(
         }
     }
 
-    if !orbit.auto_spin && orbit.mouse_drag_button.is_none() && !orbit.touch_drag_active {
+    if !orbit.auto_spin && orbit.mouse_drag_button.is_none() && !orbit.touch_drag_mode.is_orbiting()
+    {
         if let Some(target) = orbit.snap_target {
             let yaw_delta = shortest_angle_delta(orbit.yaw, target.x);
             let pitch_delta = target.y - orbit.pitch;
@@ -1912,10 +2460,13 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeBridge, ScreenStickerCandidate, cube_surface_hit_from_ray, cubie_matches_turn,
-        decode_face, decode_rotation, face_outward_normal, format_turn, keyboard_shortcut_turn,
-        nearest_orbit_snap, normalize_base_path, normalize_canvas_selector, reset_cube,
-        should_begin_mouse_orbit, slice_face_from_sticker_drag, slice_start_layer,
+        CanvasTouchSpace, OrbitRig, RuntimeBridge, ScreenStickerCandidate,
+        TOUCH_MOUSE_SUPPRESSION_SECS, TouchOrbitMode, cube_surface_hit_from_ray,
+        cubie_matches_turn, decode_face, decode_rotation, face_outward_normal, format_turn,
+        keyboard_shortcut_turn, nearest_orbit_snap, normalize_base_path, normalize_canvas_selector,
+        normalize_touch_position, position_delta, reset_cube, set_touch_orbit_mode,
+        should_begin_mouse_orbit, should_emulate_two_finger_touch,
+        should_reset_single_touch_gesture, slice_face_from_sticker_drag, slice_start_layer,
         sticker_rotation, surface_axis_index, turn_rotation_angle, virtual_cube_half_extent,
         virtual_surface_center,
     };
@@ -2070,6 +2621,107 @@ mod tests {
         assert!(!should_begin_mouse_orbit(MouseButton::Left, 12.0, true));
         assert!(!should_begin_mouse_orbit(MouseButton::Left, 4.0, false));
         assert!(should_begin_mouse_orbit(MouseButton::Left, 12.0, false));
+    }
+
+    #[test]
+    fn multi_touch_transition_restarts_single_touch_gesture() {
+        assert!(should_reset_single_touch_gesture(
+            TouchOrbitMode::MultiFinger,
+            None,
+            7,
+            false
+        ));
+    }
+
+    #[test]
+    fn continuing_single_touch_keeps_current_gesture() {
+        assert!(!should_reset_single_touch_gesture(
+            TouchOrbitMode::SingleFinger { id: 7 },
+            Some(7),
+            7,
+            false
+        ));
+    }
+
+    #[test]
+    fn touch_positions_are_shifted_into_canvas_space_without_extra_scaling() {
+        let touch_space = CanvasTouchSpace {
+            offset: Vec2::new(40.0, 12.0),
+            scale: Vec2::new(0.5, 2.0),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalize_touch_position(touch_space, Vec2::new(164.0, 108.0)),
+            Vec2::new(124.0, 96.0)
+        );
+    }
+
+    #[test]
+    fn dom_touch_positions_scale_canvas_relative_offsets_without_rect_subtraction() {
+        let touch_space = CanvasTouchSpace {
+            offset: Vec2::new(19.0, 19.0),
+            scale: Vec2::splat(0.5),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            touch_space.canvas_relative_position(Vec2::new(795.0, 515.0)),
+            Vec2::new(397.5, 257.5)
+        );
+    }
+
+    #[test]
+    fn entering_multi_touch_orbit_clears_stale_touch_history() {
+        let mut orbit = OrbitRig::default();
+        orbit.previous_single_touch_position = Some(Vec2::new(12.0, 18.0));
+        orbit.previous_touch_center = Some(Vec2::new(32.0, 48.0));
+        orbit.previous_pinch_distance = Some(120.0);
+
+        set_touch_orbit_mode(&mut orbit, TouchOrbitMode::MultiFinger);
+
+        assert_eq!(orbit.touch_drag_mode, TouchOrbitMode::MultiFinger);
+        assert_eq!(orbit.previous_single_touch_position, None);
+        assert_eq!(orbit.previous_touch_center, None);
+        assert_eq!(orbit.previous_pinch_distance, None);
+    }
+
+    #[test]
+    fn position_delta_is_zero_when_position_does_not_change() {
+        let mut previous = Some(Vec2::new(24.0, 36.0));
+
+        assert_eq!(
+            position_delta(&mut previous, Vec2::new(24.0, 36.0)),
+            Vec2::ZERO
+        );
+        assert_eq!(previous, Some(Vec2::new(24.0, 36.0)));
+    }
+
+    #[test]
+    fn position_delta_uses_explicit_position_difference() {
+        let mut previous = Some(Vec2::new(24.0, 36.0));
+
+        assert_eq!(
+            position_delta(&mut previous, Vec2::new(34.0, 30.0)),
+            Vec2::new(10.0, -6.0)
+        );
+        assert_eq!(previous, Some(Vec2::new(34.0, 30.0)));
+    }
+
+    #[test]
+    fn shift_pressed_emulates_two_finger_touch_for_single_touch_gesture() {
+        assert!(should_emulate_two_finger_touch(true, 1));
+        assert!(!should_emulate_two_finger_touch(false, 1));
+        assert!(!should_emulate_two_finger_touch(true, 2));
+    }
+
+    #[test]
+    fn orbit_rig_defaults_to_no_touch_mouse_suppression() {
+        let orbit = OrbitRig::default();
+
+        assert_eq!(orbit.touch_mouse_suppression_secs, 0.0);
+        assert_eq!(orbit.previous_single_touch_position, None);
+        assert!(TOUCH_MOUSE_SUPPRESSION_SECS > 0.0);
     }
 
     #[test]

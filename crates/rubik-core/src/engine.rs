@@ -1,8 +1,8 @@
 use core::fmt;
 
 use crate::{
-    CubeOrder, CubeState, CubeStateValidationError, Face, RotationAmount, TurnCommand,
-    StickerColor, TurnCommandValidationError,
+    CubeOrder, CubeState, CubeStateValidationError, Face, RotationAmount, StickerColor,
+    TurnCommand, TurnCommandValidationError,
 };
 
 #[derive(Debug, Clone)]
@@ -144,9 +144,13 @@ pub fn generate_scramble(order: CubeOrder, length: usize, seed: u64) -> Vec<Turn
     scramble
 }
 
-pub fn apply_turn_to_state(state: &mut CubeState, turn: TurnCommand) -> Result<(), CubeEngineError> {
+pub fn apply_turn_to_state(
+    state: &mut CubeState,
+    turn: TurnCommand,
+) -> Result<(), CubeEngineError> {
     let mut scratch = state.stickers.clone();
-    apply_turn_to_state_unchecked(state, turn, &mut scratch).map_err(CubeEngineError::InvalidTurn)?;
+    apply_turn_to_state_unchecked(state, turn, &mut scratch)
+        .map_err(CubeEngineError::InvalidTurn)?;
     state.validate().map_err(CubeEngineError::InvalidState)?;
     Ok(())
 }
@@ -293,7 +297,11 @@ fn is_affected(sticker: StickerPosition, turn: TurnCommand, order: usize) -> boo
     depth >= start && depth < end
 }
 
-fn rotate_sticker(mut sticker: StickerPosition, turn: TurnCommand, order: usize) -> StickerPosition {
+fn rotate_sticker(
+    mut sticker: StickerPosition,
+    turn: TurnCommand,
+    order: usize,
+) -> StickerPosition {
     for _ in 0..quarter_turns(turn.rotation) {
         sticker = rotate_clockwise(sticker, turn.face, order);
     }
@@ -587,7 +595,11 @@ mod tests {
     #[test]
     fn three_by_three_scramble_stays_on_outer_layers() {
         let scramble = generate_scramble(CubeOrder::standard(), 24, 21);
-        assert!(scramble.iter().all(|turn| turn.start_layer == 0 && turn.width == 1));
+        assert!(
+            scramble
+                .iter()
+                .all(|turn| turn.start_layer == 0 && turn.width == 1)
+        );
     }
 
     #[test]

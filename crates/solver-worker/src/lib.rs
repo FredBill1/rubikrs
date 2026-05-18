@@ -5,9 +5,13 @@ use std::{
     sync::OnceLock,
 };
 
-use kewb::{CubieCube as KewbCubieCube, DataTable as KewbDataTable, FaceCube as KewbFaceCube, Move as KewbMove, Solver as KewbSolver};
+use kewb::{
+    CubieCube as KewbCubieCube, DataTable as KewbDataTable, FaceCube as KewbFaceCube,
+    Move as KewbMove, Solver as KewbSolver,
+};
 use rubik_core::{
-    CubeOrder, CubeState, Face, RotationAmount, StickerColor, TurnCommand, apply_turn_to_state_unchecked,
+    CubeOrder, CubeState, Face, RotationAmount, StickerColor, TurnCommand,
+    apply_turn_to_state_unchecked,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +25,8 @@ use wasm_bindgen::prelude::wasm_bindgen;
 static PANIC_HOOK: Once = Once::new();
 
 static KEWB_DATA_TABLE: OnceLock<KewbDataTable> = OnceLock::new();
-static ORIENTATION_TURN_SEQUENCES: OnceLock<HashMap<OrientationKey, Vec<TurnCommand>>> = OnceLock::new();
+static ORIENTATION_TURN_SEQUENCES: OnceLock<HashMap<OrientationKey, Vec<TurnCommand>>> =
+    OnceLock::new();
 
 const ROTATIONS: [RotationAmount; 3] = [
     RotationAmount::Clockwise,
@@ -145,7 +150,8 @@ impl ThreeByThreeFrame {
         let mut seen_canonical_faces = [false; 6];
 
         for actual_face in Face::ALL {
-            let canonical_face = face_for_color(*state.stickers.get(face_center_index(actual_face))?);
+            let canonical_face =
+                face_for_color(*state.stickers.get(face_center_index(actual_face))?);
             let canonical_index = face_index(canonical_face);
             if seen_canonical_faces[canonical_index] {
                 return None;
@@ -188,8 +194,10 @@ impl ThreeByThreeFrame {
                 for col in 0..3 {
                     let source_index = sticker_index(face, row, col);
                     let cubie = sticker_cubie_vector(face, row, col);
-                    let canonical_face = face_from_vector(self.actual_vector_to_canonical(face_vector(face)))
-                        .expect("3x3 frame should map every face normal back into the canonical basis");
+                    let canonical_face = face_from_vector(
+                        self.actual_vector_to_canonical(face_vector(face)),
+                    )
+                    .expect("3x3 frame should map every face normal back into the canonical basis");
                     let canonical_cubie = self.actual_vector_to_canonical(cubie);
                     let (canonical_row, canonical_col) =
                         row_col_from_cubie(canonical_face, canonical_cubie);
@@ -210,7 +218,9 @@ impl ThreeByThreeFrame {
                     return Err(format!("unknown face code {face_code} in worker request"));
                 };
 
-                Ok(encode_face(self.actual_to_canonical[face_index(actual_face)]))
+                Ok(encode_face(
+                    self.actual_to_canonical[face_index(actual_face)],
+                ))
             })
             .collect()
     }
@@ -485,7 +495,8 @@ pub fn solve_state_json(state_json: &str, max_depth: u8) -> String {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn solve_request_json(request_json: &str) -> String {
     install_panic_hook();
-    serde_json::to_string(&solve_request_str(request_json)).expect("solve response should serialize")
+    serde_json::to_string(&solve_request_str(request_json))
+        .expect("solve response should serialize")
 }
 
 fn solve_iterative(state_json: &str, max_depth: u8) -> SolveResponse {
@@ -559,7 +570,10 @@ fn solve_iterative(state_json: &str, max_depth: u8) -> SolveResponse {
         };
         explored = explored.saturating_add(response.explored);
 
-        if matches!(response.kind, SolveOutcomeKind::Solved | SolveOutcomeKind::Error) {
+        if matches!(
+            response.kind,
+            SolveOutcomeKind::Solved | SolveOutcomeKind::Error
+        ) {
             return SolveResponse {
                 explored,
                 depth_limit: response.depth_limit,
@@ -646,12 +660,12 @@ fn solve_request_str(request_json: &str) -> SolveResponse {
                 None => response,
             })
             .unwrap_or(SolveResponse {
-            kind: SolveOutcomeKind::Unsolved,
-            turns: Vec::new(),
-            explored: 0,
-            depth_limit: 0,
-            message: "two-phase fallback could not solve the current 3x3 state".to_string(),
-        });
+                kind: SolveOutcomeKind::Unsolved,
+                turns: Vec::new(),
+                explored: 0,
+                depth_limit: 0,
+                message: "two-phase fallback could not solve the current 3x3 state".to_string(),
+            });
     }
 
     if let Some(response) = solve_with_recorded_history(
@@ -889,9 +903,7 @@ fn solve_exact_request(state: &CubeState, target_depth: u8, allowed_faces: &[u8]
         turns: Vec::new(),
         explored,
         depth_limit: target_depth,
-        message: format!(
-            "no solution found at exact depth {target_depth} in this worker lane"
-        ),
+        message: format!("no solution found at exact depth {target_depth} in this worker lane"),
     }
 }
 
@@ -907,7 +919,8 @@ fn search_root_faces(
     for &face in root_faces {
         for rotation in ROTATIONS {
             let turn = TurnCommand::outer(face, rotation);
-            apply_turn_to_state_unchecked(working, turn, scratch).expect("outer turns should validate");
+            apply_turn_to_state_unchecked(working, turn, scratch)
+                .expect("outer turns should validate");
             *explored += 1;
             path.push(turn);
 
@@ -956,7 +969,8 @@ fn dfs_exact(
 
         for rotation in ROTATIONS {
             let turn = TurnCommand::outer(face, rotation);
-            apply_turn_to_state_unchecked(working, turn, scratch).expect("outer turns should validate");
+            apply_turn_to_state_unchecked(working, turn, scratch)
+                .expect("outer turns should validate");
             *explored += 1;
             path.push(turn);
 
@@ -1098,18 +1112,20 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::{
-        KewbCubieCube, KewbFaceCube, KewbMove, ROTATE_X, ROTATIONS, SolveOutcomeKind,
-        SolveRequest, SolveResponse, ThreeByThreeFrame, cube_state_to_facelet_string,
-        kewb_move_to_turn, solve_request_json, solve_request_str, solve_state_json,
-        solve_turn_to_command,
+        KewbCubieCube, KewbFaceCube, KewbMove, ROTATE_X, ROTATIONS, SolveOutcomeKind, SolveRequest,
+        SolveResponse, ThreeByThreeFrame, cube_state_to_facelet_string, kewb_move_to_turn,
+        solve_request_json, solve_request_str, solve_state_json, solve_turn_to_command,
     };
-    use rubik_core::{CubeOrder, CubeState, Face, RotationAmount, TurnCommand, apply_turn_to_state};
+    use rubik_core::{
+        CubeOrder, CubeState, Face, RotationAmount, TurnCommand, apply_turn_to_state,
+    };
 
     fn apply_solution_turns(state: &mut CubeState, response: &SolveResponse) {
         for turn in &response.turns {
             apply_turn_to_state(
                 state,
-                solve_turn_to_command(turn).expect("solver turn should decode back into a turn command"),
+                solve_turn_to_command(turn)
+                    .expect("solver turn should decode back into a turn command"),
             )
             .expect("solver turn should apply cleanly");
         }
@@ -1159,9 +1175,10 @@ mod tests {
             allowed_faces: vec![2],
             turn_history_json: None,
         };
-        let response: SolveResponse =
-            serde_json::from_str(&solve_request_json(&serde_json::to_string(&request).unwrap()))
-                .expect("response json");
+        let response: SolveResponse = serde_json::from_str(&solve_request_json(
+            &serde_json::to_string(&request).unwrap(),
+        ))
+        .expect("response json");
 
         assert!(matches!(response.kind, SolveOutcomeKind::Solved));
         assert_eq!(response.turns[0].notation, "F'");
@@ -1182,9 +1199,10 @@ mod tests {
             allowed_faces: vec![0],
             turn_history_json: None,
         };
-        let response: SolveResponse =
-            serde_json::from_str(&solve_request_json(&serde_json::to_string(&request).unwrap()))
-                .expect("response json");
+        let response: SolveResponse = serde_json::from_str(&solve_request_json(
+            &serde_json::to_string(&request).unwrap(),
+        ))
+        .expect("response json");
 
         assert!(matches!(response.kind, SolveOutcomeKind::Unsolved));
     }
@@ -1214,9 +1232,10 @@ mod tests {
             allowed_faces: vec![0, 1, 2, 3, 4, 5],
             turn_history_json: Some(serde_json::to_string(&turn_history).expect("history json")),
         };
-        let response: SolveResponse =
-            serde_json::from_str(&solve_request_json(&serde_json::to_string(&request).unwrap()))
-                .expect("response json");
+        let response: SolveResponse = serde_json::from_str(&solve_request_json(
+            &serde_json::to_string(&request).unwrap(),
+        ))
+        .expect("response json");
 
         assert!(matches!(response.kind, SolveOutcomeKind::Solved));
         assert_eq!(response.turns.len(), turn_history.len());
@@ -1249,9 +1268,10 @@ mod tests {
             allowed_faces: vec![],
             turn_history_json: None,
         };
-        let response: SolveResponse =
-            serde_json::from_str(&solve_request_json(&serde_json::to_string(&request).unwrap()))
-                .expect("response json");
+        let response: SolveResponse = serde_json::from_str(&solve_request_json(
+            &serde_json::to_string(&request).unwrap(),
+        ))
+        .expect("response json");
 
         assert!(matches!(response.kind, SolveOutcomeKind::Solved));
         assert!(!response.turns.is_empty());
@@ -1274,7 +1294,8 @@ mod tests {
             apply_turn_to_state(&mut state, turn).expect("turn should be valid");
         }
 
-        let facelet_string = cube_state_to_facelet_string(&state).expect("3x3 export should succeed");
+        let facelet_string =
+            cube_state_to_facelet_string(&state).expect("3x3 export should succeed");
         let face_cube =
             KewbFaceCube::try_from(facelet_string.as_str()).expect("facelet string should parse");
         let cubie = KewbCubieCube::try_from(&face_cube)
@@ -1300,8 +1321,8 @@ mod tests {
                             apply_turn_to_state(&mut state, turn).expect("turn should be valid");
                         }
 
-                        let facelet_string =
-                            cube_state_to_facelet_string(&state).expect("3x3 export should succeed");
+                        let facelet_string = cube_state_to_facelet_string(&state)
+                            .expect("3x3 export should succeed");
                         let face_cube = KewbFaceCube::try_from(facelet_string.as_str())
                             .expect("facelet string should parse");
                         let cubie = KewbCubieCube::try_from(&face_cube).unwrap_or_else(|error| {
@@ -1391,7 +1412,10 @@ mod tests {
                 response.kind,
                 response.message
             );
-            assert!(!response.turns.is_empty(), "{face:?} should produce at least one turn");
+            assert!(
+                !response.turns.is_empty(),
+                "{face:?} should produce at least one turn"
+            );
         }
     }
 
@@ -1437,8 +1461,12 @@ mod tests {
             apply_turn_to_state(&mut state, turn).expect("whole-cube rotation proxy should apply");
         }
 
-        let frame = ThreeByThreeFrame::for_state(&state).expect("rotation proxy should keep a valid frame");
-        assert_eq!(frame.normalize_state(&state), CubeState::solved(CubeOrder::standard()));
+        let frame =
+            ThreeByThreeFrame::for_state(&state).expect("rotation proxy should keep a valid frame");
+        assert_eq!(
+            frame.normalize_state(&state),
+            CubeState::solved(CubeOrder::standard())
+        );
 
         let response = solve_request_str(
             &serde_json::to_string(&SolveRequest {
@@ -1456,7 +1484,10 @@ mod tests {
             response.kind,
             response.message
         );
-        assert!(!response.turns.is_empty(), "rotation-aligned solved state should not report an empty solution");
+        assert!(
+            !response.turns.is_empty(),
+            "rotation-aligned solved state should not report an empty solution"
+        );
 
         apply_solution_turns(&mut state, &response);
         assert_eq!(state, CubeState::solved(CubeOrder::standard()));

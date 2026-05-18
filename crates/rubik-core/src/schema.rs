@@ -235,10 +235,16 @@ impl fmt::Display for CubeStateValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedVersion { expected, actual } => {
-                write!(f, "state schema version {actual} is unsupported; expected version {expected}")
+                write!(
+                    f,
+                    "state schema version {actual} is unsupported; expected version {expected}"
+                )
             }
             Self::UnexpectedStickerCount { expected, actual } => {
-                write!(f, "state contains {actual} stickers but {expected} were expected")
+                write!(
+                    f,
+                    "state contains {actual} stickers but {expected} were expected"
+                )
             }
             Self::UnexpectedColorCount {
                 color,
@@ -314,8 +320,8 @@ impl std::error::Error for TurnCommandValidationError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CubeState, CubeStateParseError, CubeStateValidationError, Face, RotationAmount,
-        StickerColor, TurnCommand, TurnCommandValidationError, CUBE_STATE_SCHEMA_VERSION,
+        CUBE_STATE_SCHEMA_VERSION, CubeState, CubeStateParseError, CubeStateValidationError, Face,
+        RotationAmount, StickerColor, TurnCommand, TurnCommandValidationError,
     };
     use crate::CubeOrder;
 
