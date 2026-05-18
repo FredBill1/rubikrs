@@ -1,9 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    cell::RefCell,
-    collections::BTreeSet,
-};
+use std::{cell::RefCell, collections::BTreeSet};
 
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
@@ -50,7 +47,7 @@ struct OrbitRig {
     pitch: f32,
     radius: f32,
     auto_spin: bool,
-    mouse_drag_active: bool,
+    mouse_drag_button: Option<MouseButton>,
     touch_drag_active: bool,
     snap_target: Option<Vec2>,
     previous_touch_center: Option<Vec2>,
@@ -174,7 +171,7 @@ impl Default for OrbitRig {
             pitch: 0.26,
             radius: 7.2,
             auto_spin: false,
-            mouse_drag_active: false,
+            mouse_drag_button: None,
             touch_drag_active: false,
             snap_target: None,
             previous_touch_center: None,
@@ -239,7 +236,8 @@ impl RuntimeBridge {
 
     fn bump_scene(&mut self) {
         self.scene_revision += 1;
-        self.timer.sync(self.engine.move_count(), self.engine.is_solved());
+        self.timer
+            .sync(self.engine.move_count(), self.engine.is_solved());
     }
 
     fn record_transition(&mut self, from_state: CubeState, animation: Option<TurnCommand>) {
@@ -271,7 +269,9 @@ impl RuntimeBridge {
 
     fn apply_turn(&mut self, turn: TurnCommand) -> Result<(), String> {
         let from_state = self.engine.state().clone();
-        self.engine.apply_turn(turn).map_err(|error| error.to_string())?;
+        self.engine
+            .apply_turn(turn)
+            .map_err(|error| error.to_string())?;
         self.bump_scene();
         self.record_transition(from_state, Some(turn));
         self.set_message(format!("Applied {}.", format_turn(turn)));
@@ -398,7 +398,9 @@ pub fn start_app(canvas_id: &str, base_path: &str) {
 
     with_runtime_mut(|runtime| {
         *runtime = RuntimeBridge::new(CubeOrder::standard());
-        runtime.set_message("Bevy runtime mounted. Use the shell or keyboard shortcuts to manipulate the cube.");
+        runtime.set_message(
+            "Bevy runtime mounted. Use the shell or keyboard shortcuts to manipulate the cube.",
+        );
     });
 
     App::new()
@@ -438,12 +440,20 @@ pub fn start_app(canvas_id: &str, base_path: &str) {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn runtime_status_json() -> String {
-    with_runtime(|runtime| serde_json::to_string(&runtime.status()).unwrap_or_else(|_| "{}".to_owned()))
+    with_runtime(|runtime| {
+        serde_json::to_string(&runtime.status()).unwrap_or_else(|_| "{}".to_owned())
+    })
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn export_cube_state() -> String {
-    with_runtime(|runtime| runtime.engine.state().to_json().unwrap_or_else(|_| "{}".to_owned()))
+    with_runtime(|runtime| {
+        runtime
+            .engine
+            .state()
+            .to_json()
+            .unwrap_or_else(|_| "{}".to_owned())
+    })
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -462,7 +472,10 @@ pub fn import_cube_state(json: &str) -> bool {
 pub fn set_cube_order(order: u8) -> bool {
     let Ok(order) = CubeOrder::new(order) else {
         with_runtime_mut(|runtime| {
-            runtime.set_message(format!("Order {} is outside the supported 2..=17 range.", order));
+            runtime.set_message(format!(
+                "Order {} is outside the supported 2..=17 range.",
+                order
+            ));
         });
         return false;
     };
@@ -521,14 +534,10 @@ pub fn apply_turn(face_code: u8, rotation_code: u8, start_layer: u8, width: u8) 
     })
 }
 
-fn setup_scene(
-    mut commands: Commands<'_, '_>,
-    config: Res<'_, ShellConfig>,
-) {
+fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
     info!(
         "booting Bevy runtime on {} with canvas {}",
-        config.base_path,
-        config.canvas_selector
+        config.base_path, config.canvas_selector
     );
 
     commands.spawn((
@@ -657,14 +666,16 @@ fn animate_turn_visuals(
         return;
     };
 
-    animation.elapsed_secs = (animation.elapsed_secs + time.delta_secs()).min(animation.duration_secs);
+    animation.elapsed_secs =
+        (animation.elapsed_secs + time.delta_secs()).min(animation.duration_secs);
     let progress = if animation.duration_secs <= f32::EPSILON {
         1.0
     } else {
         animation.elapsed_secs / animation.duration_secs
     };
     let eased = ease_out_cubic(progress);
-    pivot_transform.rotation = Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
+    pivot_transform.rotation =
+        Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
 
     if progress >= 1.0 {
         let scene_revision = animation.scene_revision;
@@ -703,7 +714,11 @@ fn spawn_cube_visuals(
         .spawn((
             CubeVisual,
             CubeVisualRoot,
-            Name::new(format!("cube-visual-{}x{}", state.order.get(), state.order.get())),
+            Name::new(format!(
+                "cube-visual-{}x{}",
+                state.order.get(),
+                state.order.get()
+            )),
             Transform::default(),
             GlobalTransform::default(),
             Visibility::Visible,
@@ -720,9 +735,14 @@ fn spawn_cube_visuals(
         ..default()
     });
 
-    let cubie_body_mesh = meshes.add(Cuboid::new(cubie_body_size, cubie_body_size, cubie_body_size));
+    let cubie_body_mesh = meshes.add(Cuboid::new(
+        cubie_body_size,
+        cubie_body_size,
+        cubie_body_size,
+    ));
     let sticker_mesh = meshes.add(Cuboid::new(sticker_size, sticker_size, sticker_depth));
-    let mut animated_entities = Vec::with_capacity((Face::ALL.len() * order * order) + (order * order * 6));
+    let mut animated_entities =
+        Vec::with_capacity((Face::ALL.len() * order * order) + (order * order * 6));
     let mut surface_cubies = BTreeSet::new();
 
     for face in Face::ALL {
@@ -755,8 +775,15 @@ fn spawn_cube_visuals(
                 for col in 0..order {
                     let color = state.stickers[(face_index * order * order) + (row * order) + col];
                     let cubie = sticker_cubie_coord(face, row, col, order);
-                    let (translation, rotation, mesh) =
-                        sticker_transform(face, row, col, order, face_span, face_offset, &sticker_mesh);
+                    let (translation, rotation, mesh) = sticker_transform(
+                        face,
+                        row,
+                        col,
+                        order,
+                        face_span,
+                        face_offset,
+                        &sticker_mesh,
+                    );
 
                     let material = materials.add(StandardMaterial {
                         base_color: color_for_sticker(color),
@@ -807,20 +834,32 @@ fn orbit_camera_input(
         orbit.yaw += time.delta_secs() * 0.18;
     }
 
-    let cursor_position = windows.iter().next().and_then(|window| window.cursor_position());
+    let cursor_position = windows
+        .iter()
+        .next()
+        .and_then(|window| window.cursor_position());
     let mouse_delta = mouse_motion
         .read()
         .fold(Vec2::ZERO, |total, event| total + event.delta);
 
     if buttons.just_pressed(MouseButton::Left) {
-        direct_turn_input.mouse_candidate = cursor_position.map(|position| PointerGestureCandidate {
-            start_position: position,
-            max_distance: 0.0,
-            sticker_candidate: camera_context.and_then(|(camera, camera_transform)| {
-                projected_sticker_hit(camera, camera_transform, order, position)
-            }),
-        });
-        orbit.mouse_drag_active = false;
+        direct_turn_input.mouse_candidate =
+            cursor_position.map(|position| PointerGestureCandidate {
+                start_position: position,
+                max_distance: 0.0,
+                sticker_candidate: camera_context.and_then(|(camera, camera_transform)| {
+                    projected_sticker_hit(camera, camera_transform, order, position)
+                }),
+            });
+        orbit.mouse_drag_button = None;
+        orbit.snap_target = None;
+        orbit.auto_spin = false;
+    }
+
+    if buttons.just_pressed(MouseButton::Right) {
+        direct_turn_input.mouse_candidate = None;
+        orbit.mouse_drag_button = Some(MouseButton::Right);
+        orbit.snap_target = None;
         orbit.auto_spin = false;
     }
 
@@ -833,26 +872,31 @@ fn orbit_camera_input(
                     .max(position.distance(candidate.start_position));
             }
 
-            if candidate.max_distance > POINTER_TAP_MAX_DRAG_PX {
-                if candidate.sticker_candidate.is_none() {
-                    direct_turn_input.mouse_candidate = None;
-                    orbit.mouse_drag_active = true;
-                    orbit.snap_target = None;
-                }
+            if should_begin_mouse_orbit(
+                MouseButton::Left,
+                candidate.max_distance,
+                candidate.sticker_candidate.is_some(),
+            ) {
+                direct_turn_input.mouse_candidate = None;
+                orbit.mouse_drag_button = Some(MouseButton::Left);
+                orbit.snap_target = None;
             }
-        }
-
-        if orbit.mouse_drag_active {
-            orbit.snap_target = None;
-            orbit.auto_spin = false;
-            orbit.yaw += mouse_delta.x * 0.008;
-            orbit.pitch = (orbit.pitch + mouse_delta.y * 0.006).clamp(-1.15, 1.15);
         }
     }
 
+    if orbit
+        .mouse_drag_button
+        .is_some_and(|button| buttons.pressed(button))
+    {
+        orbit.snap_target = None;
+        orbit.auto_spin = false;
+        orbit.yaw += mouse_delta.x * 0.008;
+        orbit.pitch = (orbit.pitch + mouse_delta.y * 0.006).clamp(-1.15, 1.15);
+    }
+
     if buttons.just_released(MouseButton::Left) {
-        if orbit.mouse_drag_active {
-            orbit.mouse_drag_active = false;
+        if orbit.mouse_drag_button == Some(MouseButton::Left) {
+            orbit.mouse_drag_button = None;
             orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
         } else if let Some(candidate) = direct_turn_input.mouse_candidate.take() {
             let position = cursor_position.unwrap_or(candidate.start_position);
@@ -873,6 +917,13 @@ fn orbit_camera_input(
                 }
             }
         }
+    }
+
+    if buttons.just_released(MouseButton::Right)
+        && orbit.mouse_drag_button == Some(MouseButton::Right)
+    {
+        orbit.mouse_drag_button = None;
+        orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
     }
 
     for event in mouse_wheel.read() {
@@ -985,7 +1036,7 @@ fn orbit_camera_input(
         }
     }
 
-    if !orbit.auto_spin && !orbit.mouse_drag_active && !orbit.touch_drag_active {
+    if !orbit.auto_spin && orbit.mouse_drag_button.is_none() && !orbit.touch_drag_active {
         if let Some(target) = orbit.snap_target {
             let yaw_delta = shortest_angle_delta(orbit.yaw, target.x);
             let pitch_delta = target.y - orbit.pitch;
@@ -999,6 +1050,18 @@ fn orbit_camera_input(
                 orbit.snap_target = None;
             }
         }
+    }
+}
+
+fn should_begin_mouse_orbit(
+    button: MouseButton,
+    max_distance: f32,
+    has_sticker_candidate: bool,
+) -> bool {
+    match button {
+        MouseButton::Right => true,
+        MouseButton::Left => max_distance > POINTER_TAP_MAX_DRAG_PX && !has_sticker_candidate,
+        _ => false,
     }
 }
 
@@ -1037,8 +1100,13 @@ fn keyboard_turn_shortcuts(keys: Res<'_, ButtonInput<KeyCode>>) {
         (KeyCode::KeyB, Face::Back),
     ] {
         if keys.just_pressed(key) {
-            if let Some(turn) = keyboard_shortcut_turn(face, rotation, order, wide_turn, keyboard_selected_layer(&keys))
-            {
+            if let Some(turn) = keyboard_shortcut_turn(
+                face,
+                rotation,
+                order,
+                wide_turn,
+                keyboard_selected_layer(&keys),
+            ) {
                 let _ = update_runtime(|runtime| runtime.apply_turn(turn));
             }
         }
@@ -1118,8 +1186,12 @@ fn slice_turn_from_sticker_drag(
     };
 
     let drag_direction = drag.normalize();
-    let clockwise_score =
-        drag_direction.dot(projected_turn_motion(camera, camera_transform, candidate.world_center, clockwise)?);
+    let clockwise_score = drag_direction.dot(projected_turn_motion(
+        camera,
+        camera_transform,
+        candidate.world_center,
+        clockwise,
+    )?);
     let counter_clockwise_score = drag_direction.dot(projected_turn_motion(
         camera,
         camera_transform,
@@ -1154,7 +1226,9 @@ fn cube_surface_hit(
     order: u8,
     pointer_position: Vec2,
 ) -> Option<CubeSurfaceHit> {
-    let ray = camera.viewport_to_world(camera_transform, pointer_position).ok()?;
+    let ray = camera
+        .viewport_to_world(camera_transform, pointer_position)
+        .ok()?;
     cube_surface_hit_from_ray(
         ray.origin,
         ray.direction.as_vec3(),
@@ -1162,7 +1236,11 @@ fn cube_surface_hit(
     )
 }
 
-fn cube_surface_hit_from_ray(origin: Vec3, direction: Vec3, half_extent: f32) -> Option<CubeSurfaceHit> {
+fn cube_surface_hit_from_ray(
+    origin: Vec3,
+    direction: Vec3,
+    half_extent: f32,
+) -> Option<CubeSurfaceHit> {
     let axes = [
         (origin.x, direction.x, Vec3::X),
         (origin.y, direction.y, Vec3::Y),
@@ -1218,11 +1296,32 @@ fn surface_hit_candidate(
     let order_usize = usize::from(order);
     let half_extent = virtual_cube_half_extent(order);
     let surface_span = half_extent * 2.0;
-    let row = surface_axis_index(surface_hit.face, surface_hit.point, order_usize, surface_span, true);
-    let col = surface_axis_index(surface_hit.face, surface_hit.point, order_usize, surface_span, false);
+    let row = surface_axis_index(
+        surface_hit.face,
+        surface_hit.point,
+        order_usize,
+        surface_span,
+        true,
+    );
+    let col = surface_axis_index(
+        surface_hit.face,
+        surface_hit.point,
+        order_usize,
+        surface_span,
+        false,
+    );
     let cubie = sticker_cubie_coord(surface_hit.face, row, col, order_usize);
-    let world_center = virtual_surface_center(surface_hit.face, row, col, order_usize, surface_span, half_extent);
-    let projected_center = camera.world_to_viewport(camera_transform, world_center).ok()?;
+    let world_center = virtual_surface_center(
+        surface_hit.face,
+        row,
+        col,
+        order_usize,
+        surface_span,
+        half_extent,
+    );
+    let projected_center = camera
+        .world_to_viewport(camera_transform, world_center)
+        .ok()?;
     let half_cell = surface_span / order.max(1) as f32 * 0.5;
     let col_axis = sticker_col_direction(surface_hit.face);
     let row_axis = sticker_row_direction(surface_hit.face);
@@ -1270,7 +1369,8 @@ fn surface_hit_candidate(
         return None;
     }
 
-    let projected_corners = projected_corners.map(|corner| corner.expect("checked projected surface corner"));
+    let projected_corners =
+        projected_corners.map(|corner| corner.expect("checked projected surface corner"));
     let radius = projected_center.distance(projected_corners[0]) * FACE_TAP_RADIUS_SCALE;
     if radius <= f32::EPSILON {
         return None;
@@ -1296,7 +1396,13 @@ fn virtual_cube_half_extent(order: u8) -> f32 {
     cube_face_offset(order) - VIRTUAL_SURFACE_INSET
 }
 
-fn surface_axis_index(face: Face, point: Vec3, order: usize, surface_span: f32, is_row: bool) -> usize {
+fn surface_axis_index(
+    face: Face,
+    point: Vec3,
+    order: usize,
+    surface_span: f32,
+    is_row: bool,
+) -> usize {
     let axis = if is_row {
         sticker_row_direction(face)
     } else {
@@ -1366,7 +1472,9 @@ fn projected_turn_motion(
     world_point: Vec3,
     turn: TurnCommand,
 ) -> Option<Vec2> {
-    let projected_start = camera.world_to_viewport(camera_transform, world_point).ok()?;
+    let projected_start = camera
+        .world_to_viewport(camera_transform, world_point)
+        .ok()?;
     let direction = turn_rotation_angle(turn).signum();
     if direction.abs() <= f32::EPSILON {
         return None;
@@ -1639,7 +1747,8 @@ fn sticker_transform(
     face_offset: f32,
     sticker_mesh: &Handle<Mesh>,
 ) -> (Vec3, Quat, Handle<Mesh>) {
-    let (translation, rotation) = sticker_world_transform(face, row, col, order, face_span, face_offset);
+    let (translation, rotation) =
+        sticker_world_transform(face, row, col, order, face_span, face_offset);
     (translation, rotation, sticker_mesh.clone())
 }
 
@@ -1806,11 +1915,12 @@ mod tests {
         RuntimeBridge, ScreenStickerCandidate, cube_surface_hit_from_ray, cubie_matches_turn,
         decode_face, decode_rotation, face_outward_normal, format_turn, keyboard_shortcut_turn,
         nearest_orbit_snap, normalize_base_path, normalize_canvas_selector, reset_cube,
-        slice_face_from_sticker_drag, slice_start_layer, sticker_rotation, surface_axis_index,
-        turn_rotation_angle, virtual_cube_half_extent, virtual_surface_center,
+        should_begin_mouse_orbit, slice_face_from_sticker_drag, slice_start_layer,
+        sticker_rotation, surface_axis_index, turn_rotation_angle, virtual_cube_half_extent,
+        virtual_surface_center,
     };
+    use bevy::prelude::{MouseButton, UVec3, Vec2, Vec3};
     use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
-    use bevy::prelude::{UVec3, Vec2, Vec3};
 
     fn sample_sticker_candidate(face: Face, cubie: UVec3) -> ScreenStickerCandidate {
         ScreenStickerCandidate {
@@ -1925,7 +2035,10 @@ mod tests {
             -std::f32::consts::FRAC_PI_2
         );
         assert_eq!(
-            turn_rotation_angle(TurnCommand::outer(Face::Back, RotationAmount::CounterClockwise)),
+            turn_rotation_angle(TurnCommand::outer(
+                Face::Back,
+                RotationAmount::CounterClockwise
+            )),
             std::f32::consts::FRAC_PI_2
         );
     }
@@ -1947,6 +2060,19 @@ mod tests {
     }
 
     #[test]
+    fn right_drag_always_starts_mouse_orbit() {
+        assert!(should_begin_mouse_orbit(MouseButton::Right, 0.0, true));
+        assert!(should_begin_mouse_orbit(MouseButton::Right, 12.0, false));
+    }
+
+    #[test]
+    fn left_drag_only_orbits_when_blank_space_moves_past_threshold() {
+        assert!(!should_begin_mouse_orbit(MouseButton::Left, 12.0, true));
+        assert!(!should_begin_mouse_orbit(MouseButton::Left, 4.0, false));
+        assert!(should_begin_mouse_orbit(MouseButton::Left, 12.0, false));
+    }
+
+    #[test]
     fn keyboard_shortcut_can_target_inner_layers() {
         let turn = keyboard_shortcut_turn(Face::Right, RotationAmount::Clockwise, 4, false, 2)
             .expect("second layer should be valid on 4x4");
@@ -1956,11 +2082,14 @@ mod tests {
 
     #[test]
     fn keyboard_shortcut_can_expand_to_wide_turns() {
-        let turn = keyboard_shortcut_turn(Face::Front, RotationAmount::CounterClockwise, 4, true, 1)
-            .expect("wide outer turn should be valid on 4x4");
+        let turn =
+            keyboard_shortcut_turn(Face::Front, RotationAmount::CounterClockwise, 4, true, 1)
+                .expect("wide outer turn should be valid on 4x4");
         assert_eq!(turn.start_layer, 0);
         assert_eq!(turn.width, 2);
-        assert!(keyboard_shortcut_turn(Face::Front, RotationAmount::Clockwise, 2, true, 2).is_none());
+        assert!(
+            keyboard_shortcut_turn(Face::Front, RotationAmount::Clockwise, 2, true, 2).is_none()
+        );
     }
 
     #[test]
@@ -1969,7 +2098,14 @@ mod tests {
         let face = slice_face_from_sticker_drag(candidate, Vec2::new(36.0, 0.0));
 
         assert_eq!(face, Some(Face::Up));
-        assert_eq!(slice_start_layer(face.expect("front drag should map to up"), candidate.cubie, 4), 1);
+        assert_eq!(
+            slice_start_layer(
+                face.expect("front drag should map to up"),
+                candidate.cubie,
+                4
+            ),
+            1
+        );
     }
 
     #[test]
@@ -1979,7 +2115,11 @@ mod tests {
 
         assert_eq!(face, Some(Face::Right));
         assert_eq!(
-            slice_start_layer(face.expect("front drag should map to right"), candidate.cubie, 4),
+            slice_start_layer(
+                face.expect("front drag should map to right"),
+                candidate.cubie,
+                4
+            ),
             1
         );
     }
@@ -2027,5 +2167,4 @@ mod tests {
 
         assert_eq!((row, col), (0, 0));
     }
-
 }

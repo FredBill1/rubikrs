@@ -85,8 +85,9 @@ app.innerHTML = `
           <p class="stage-label">drag / orbit / zoom</p>
           <button type="button" class="stage-info" aria-label="Show stage controls help">i</button>
           <p class="stage-hint">
-            Drag a visible sticker to flick its slice, drag empty space to orbit, and scroll or pinch to zoom.
-            Keyboard: U R F D L B, 2..9 for layer selection, Alt for wide turns, Shift for inverse, Ctrl for 180,
+            Left drag on a sticker turns the cube, left drag on empty space orbits, right drag always orbits,
+            and two-finger gestures orbit plus zoom. Keyboard: U R F D L B, 2..9 for layer selection, Alt for
+            wide turns, Shift for inverse, Ctrl for 180,
             Backspace undo, Enter redo.
           </p>
         </div>
