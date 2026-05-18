@@ -77,28 +77,13 @@ let nextSolveRequestId = 0
 
 app.innerHTML = `
   <div class="shell">
-    <header class="masthead">
-      <div>
-        <p class="eyebrow">rubikrs</p>
-        <h1>Rust-first 3D cube.</h1>
-      </div>
-      <div class="status-block">
-        <span class="status-pill" data-tone="booting" data-boot-pill>booting</span>
-        <div class="status-inline">
-          <span data-status-order>3x3</span>
-          <span><strong data-status-moves>0</strong> moves</span>
-          <span><strong data-status-timer>00:00.0</strong></span>
-        </div>
-        <p class="status-copy" data-boot-copy>Preparing the wasm runtime and canvas bridge.</p>
-      </div>
-    </header>
-
     <main class="layout">
       <section class="stage-card" aria-label="Rubik preview stage">
         <div class="stage-grid" aria-hidden="true"></div>
         <canvas id="rubik-canvas" class="stage-canvas" aria-label="Rubik runtime canvas"></canvas>
         <div class="stage-caption">
           <p class="stage-label">drag / orbit / zoom</p>
+          <button type="button" class="stage-info" aria-label="Show stage controls help">i</button>
           <p class="stage-hint">
             Drag a visible sticker to flick its slice, drag empty space to orbit, and scroll or pinch to zoom.
             Keyboard: U R F D L B, 2..9 for layer selection, Alt for wide turns, Shift for inverse, Ctrl for 180,
@@ -140,8 +125,6 @@ app.innerHTML = `
               </label>
               <button type="button" data-action="scramble">scramble</button>
             </div>
-
-            <p class="history-line" data-status-history>—</p>
           </div>
         </section>
 
@@ -215,6 +198,33 @@ app.innerHTML = `
         </section>
       </aside>
     </main>
+
+    <footer class="status-bar" aria-label="Runtime status">
+      <div class="status-bar-track">
+        <span class="eyebrow">rubikrs</span>
+        <span class="status-pill" data-tone="booting" data-boot-pill>booting</span>
+        <span class="status-segment">
+          <span class="status-key">order</span>
+          <strong data-status-order>3x3</strong>
+        </span>
+        <span class="status-segment">
+          <span class="status-key">moves</span>
+          <strong data-status-moves>0</strong>
+        </span>
+        <span class="status-segment">
+          <span class="status-key">timer</span>
+          <strong data-status-timer>00:00.0</strong>
+        </span>
+        <span class="status-segment status-segment--detail">
+          <span class="status-key">runtime</span>
+          <span class="status-copy" data-boot-copy>Preparing the wasm runtime and canvas bridge.</span>
+        </span>
+        <span class="status-segment status-segment--history">
+          <span class="status-key">recent</span>
+          <span class="history-line" data-status-history>—</span>
+        </span>
+      </div>
+    </footer>
   </div>
 `
 
