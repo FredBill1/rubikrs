@@ -28,6 +28,7 @@ bevy = { version = "0.18.1", default-features = false, features = [
   "reflect_auto_register",
   "std",
   "touch",
+  "x11",
   "webgl2",
 ] }
 console_error_panic_hook = "0.1.7"

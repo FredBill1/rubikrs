@@ -72,7 +72,6 @@ The solver flow is split between the shell and `solver-worker`:
 
 The web build is designed around GitHub Pages:
 
-- Vite `base` comes from `RUBIK_BASE_PATH`
 - the wasm build script compiles both Rust entrypoints with `wasm-pack`, injects `--cfg getrandom_backend="wasm_js"`, and writes the generated bindings into the Vite source tree
 - Pages and CI both install Node 22, install `wasm-pack`, build the web app from `apps/web`, and target `wasm32-unknown-unknown`
 

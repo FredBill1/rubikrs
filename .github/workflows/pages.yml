@@ -66,8 +66,6 @@ jobs:
 
       - name: Build site
         working-directory: apps/web
-        env:
-          RUBIK_BASE_PATH: /${{ github.event.repository.name }}/
         run: npm run build
 
       - name: Upload Pages artifact
