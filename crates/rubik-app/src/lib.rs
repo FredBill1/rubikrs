@@ -994,7 +994,7 @@ fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
 
     commands.spawn((
         Camera3d::default(),
-        Tonemapping::None,
+        Tonemapping::TonyMcMapface,
         Transform::from_xyz(-3.85, 3.15, 6.45).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
