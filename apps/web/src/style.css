@@ -312,15 +312,12 @@ select {
 }
 
 .telemetry {
-  display: grid;
-  grid-auto-rows: max-content;
+  position: relative;
   min-height: 0;
-  gap: 14px;
   overflow-x: hidden;
   overflow-y: auto;
   padding-right: 6px;
   margin-right: -4px;
-  align-content: start;
 }
 
 .panel {
@@ -373,6 +370,87 @@ select {
 
 .body-copy {
   margin: 12px 0 0;
+}
+
+[data-solver-detail] {
+  max-height: 8em;
+  overflow-y: auto;
+  word-break: break-word;
+}
+
+.telemetry-panels {
+  display: grid;
+  grid-auto-rows: max-content;
+  gap: 14px;
+  min-height: 0;
+}
+
+.stage-toggle {
+  pointer-events: auto;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.3rem;
+  min-height: 2.3rem;
+  height: 2.3rem;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid rgba(246, 191, 66, 0.28);
+  background: rgba(7, 11, 19, 0.8);
+  backdrop-filter: blur(10px);
+  color: var(--accent);
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.stage-toggle--landscape {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+}
+
+.stage-toggle--portrait {
+  display: none;
+}
+
+.stage-toggle:hover,
+.stage-toggle:focus-visible {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.toggle-arrow {
+  display: block;
+  width: 10px;
+  height: 10px;
+  background: currentColor;
+  clip-path: polygon(20% 0, 100% 50%, 20% 100%);
+  transition: transform 200ms ease;
+}
+
+.layout.collapsed-telemetry .toggle-arrow {
+  transform: rotate(180deg);
+}
+
+@media (orientation: portrait), (max-width: 1080px) {
+  .toggle-arrow {
+    transform: rotate(90deg);
+  }
+
+  .layout.collapsed-telemetry .toggle-arrow {
+    transform: rotate(270deg);
+  }
+}
+
+.telemetry.collapsed {
+  display: none;
+}
+
+.layout.collapsed-telemetry {
+  grid-template-columns: 1fr !important;
 }
 
 .control-cluster {
@@ -559,6 +637,11 @@ textarea {
     grid-template-rows: minmax(0, 1fr) auto;
   }
 
+  .layout.collapsed-telemetry {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: 1fr !important;
+  }
+
   .telemetry {
     display: grid;
     grid-auto-flow: column;
@@ -567,6 +650,22 @@ textarea {
     overflow-y: hidden;
     padding: 0 0 8px;
     margin: 0;
+  }
+
+  .telemetry-panels {
+    display: contents;
+  }
+
+  .stage-toggle {
+    position: static;
+  }
+
+  .stage-toggle--landscape {
+    display: none;
+  }
+
+  .stage-toggle--portrait {
+    display: flex;
   }
 
   .action-row--stacked {

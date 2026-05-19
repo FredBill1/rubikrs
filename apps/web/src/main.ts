@@ -81,9 +81,15 @@ app.innerHTML = `
       <section class="stage-card" aria-label="Rubik preview stage">
         <div class="stage-grid" aria-hidden="true"></div>
         <canvas id="rubik-canvas" class="stage-canvas" aria-label="Rubik runtime canvas"></canvas>
+        <button type="button" class="stage-toggle stage-toggle--landscape" aria-label="Toggle telemetry panel" title="Toggle telemetry panel">
+          <span class="toggle-arrow"/>
+        </button>
         <div class="stage-caption">
           <p class="stage-label">drag / orbit / zoom</p>
           <button type="button" class="stage-info" aria-label="Show stage controls help">i</button>
+          <button type="button" class="stage-toggle stage-toggle--portrait" aria-label="Toggle telemetry panel" title="Toggle telemetry panel">
+            <span class="toggle-arrow"/>
+          </button>
           <p class="stage-hint">
             Drag a sticker to turn the cube, drag empty space to orbit, right drag or two-finger drag always
             orbit, and pinch zooms. Keyboard: U R F D L B, 2..9 for layer selection, Alt for wide turns, Shift
@@ -94,6 +100,7 @@ app.innerHTML = `
       </section>
 
       <aside class="telemetry">
+        <div class="telemetry-panels">
         <section class="panel">
           <p class="panel-kicker">cube controls</p>
           <div class="control-cluster">
@@ -198,6 +205,7 @@ app.innerHTML = `
           </div>
         </section>
 
+        </div>
       </aside>
     </main>
 
@@ -249,6 +257,19 @@ const solverDetail = document.querySelector<HTMLElement>('[data-solver-detail]')
 const solveButton = document.querySelector<HTMLButtonElement>('[data-action="solve"]')
 const cancelSolveButton = document.querySelector<HTMLButtonElement>('[data-action="cancel-solve"]')
 const stageCanvas = document.querySelector<HTMLCanvasElement>('#rubik-canvas')
+const telemetryToggles = document.querySelectorAll<HTMLButtonElement>('.stage-toggle')
+const telemetry = document.querySelector<HTMLElement>('.telemetry')
+const layout = document.querySelector<HTMLElement>('.layout')
+
+for (const toggle of telemetryToggles) {
+  toggle.addEventListener('click', () => {
+    telemetry?.classList.toggle('collapsed')
+    layout?.classList.toggle('collapsed-telemetry')
+    requestAnimationFrame(() => {
+      window.dispatchEvent(new Event('resize'))
+    })
+  })
+}
 
 stageCanvas?.addEventListener('contextmenu', (event) => {
   event.preventDefault()
