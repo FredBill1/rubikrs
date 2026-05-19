@@ -161,6 +161,24 @@ app.innerHTML = `
         </section>
 
         <section class="panel">
+          <p class="panel-kicker">solver</p>
+          <div class="control-cluster">
+            <div class="action-row action-row--stacked">
+              <label class="field field--inline">
+                <span>search depth</span>
+                <input data-solve-depth type="number" min="1" max="8" value="5" />
+              </label>
+              <div class="action-row action-row--pair">
+                <button type="button" data-action="solve">solve</button>
+                <button type="button" data-action="cancel-solve">cancel</button>
+              </div>
+            </div>
+            <p class="history-line" data-solver-status>idle</p>
+            <p class="body-copy" data-solver-detail>No solve request in flight.</p>
+          </div>
+        </section>
+
+        <section class="panel">
           <p class="panel-kicker">import / export</p>
           <div class="control-cluster">
             <div class="action-row">
@@ -180,23 +198,6 @@ app.innerHTML = `
           </div>
         </section>
 
-        <section class="panel">
-          <p class="panel-kicker">solver</p>
-          <div class="control-cluster">
-            <div class="action-row action-row--stacked">
-              <label class="field field--inline">
-                <span>search depth</span>
-                <input data-solve-depth type="number" min="1" max="8" value="5" />
-              </label>
-              <div class="action-row action-row--pair">
-                <button type="button" data-action="solve">solve</button>
-                <button type="button" data-action="cancel-solve">cancel</button>
-              </div>
-            </div>
-            <p class="history-line" data-solver-status>idle</p>
-            <p class="body-copy" data-solver-detail>No solve request in flight.</p>
-          </div>
-        </section>
       </aside>
     </main>
 
