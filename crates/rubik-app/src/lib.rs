@@ -54,8 +54,10 @@ struct OrbitRig {
     touch_drag_mode: TouchOrbitMode,
     touch_mouse_suppression_secs: f32,
     snap_target: Option<Vec2>,
-    previous_single_touch_position: Option<Vec2>,
-    previous_touch_center: Option<Vec2>,
+    touch_start_yaw: f32,
+    touch_start_pitch: f32,
+    touch_start_position: Option<Vec2>,
+    touch_start_center: Option<Vec2>,
     previous_pinch_distance: Option<f32>,
 }
 
@@ -249,8 +251,10 @@ impl Default for OrbitRig {
             touch_drag_mode: TouchOrbitMode::Idle,
             touch_mouse_suppression_secs: 0.0,
             snap_target: None,
-            previous_single_touch_position: None,
-            previous_touch_center: None,
+            touch_start_yaw: 0.0,
+            touch_start_pitch: 0.0,
+            touch_start_position: None,
+            touch_start_center: None,
             previous_pinch_distance: None,
         }
     }
@@ -438,25 +442,17 @@ fn should_reset_single_touch_gesture(
 
 fn set_touch_orbit_mode(orbit: &mut OrbitRig, mode: TouchOrbitMode) {
     orbit.touch_drag_mode = mode;
-    orbit.previous_single_touch_position = None;
-    orbit.previous_touch_center = None;
+    orbit.touch_start_position = None;
+    orbit.touch_start_center = None;
     orbit.previous_pinch_distance = None;
     orbit.snap_target = None;
 }
 
 fn clear_touch_orbit_state(orbit: &mut OrbitRig) {
     orbit.touch_drag_mode = TouchOrbitMode::Idle;
-    orbit.previous_single_touch_position = None;
-    orbit.previous_touch_center = None;
+    orbit.touch_start_position = None;
+    orbit.touch_start_center = None;
     orbit.previous_pinch_distance = None;
-}
-
-fn position_delta(previous_position: &mut Option<Vec2>, current_position: Vec2) -> Vec2 {
-    previous_position
-        .replace(current_position)
-        .map_or(Vec2::ZERO, |previous_position| {
-            current_position - previous_position
-        })
 }
 
 fn should_emulate_two_finger_touch(shift_pressed: bool, active_touch_count: usize) -> bool {
@@ -1470,7 +1466,9 @@ fn orbit_camera_input(
                     TouchOrbitMode::SingleFinger { id } if id == touch.id
                 ) {
                     set_touch_orbit_mode(&mut orbit, TouchOrbitMode::SingleFinger { id: touch.id });
-                    orbit.previous_single_touch_position = Some(touch.position);
+                    orbit.touch_start_yaw = orbit.yaw;
+                    orbit.touch_start_pitch = orbit.pitch;
+                    orbit.touch_start_position = Some(touch.position);
                     publish_touch_diagnostic(
                         "emulate-2f",
                         primary_window,
@@ -1532,7 +1530,9 @@ fn orbit_camera_input(
                 if should_begin_touch_orbit {
                     direct_turn_input.touch_candidate = None;
                     set_touch_orbit_mode(&mut orbit, TouchOrbitMode::SingleFinger { id: touch.id });
-                    orbit.previous_single_touch_position = Some(touch.position);
+                    orbit.touch_start_yaw = orbit.yaw;
+                    orbit.touch_start_pitch = orbit.pitch;
+                    orbit.touch_start_position = Some(touch.position);
                     publish_touch_diagnostic(
                         "orbit",
                         primary_window,
@@ -1549,11 +1549,13 @@ fn orbit_camera_input(
                 orbit.touch_drag_mode,
                 TouchOrbitMode::SingleFinger { id } if id == touch.id
             ) {
-                let delta =
-                    position_delta(&mut orbit.previous_single_touch_position, touch.position);
-                if delta.length_squared() > 0.0 {
-                    orbit.yaw += delta.x * 0.008;
-                    orbit.pitch = (orbit.pitch + delta.y * 0.006).clamp(-1.15, 1.15);
+                if let Some(start_pos) = orbit.touch_start_position {
+                    let displacement = touch.position - start_pos;
+                    if displacement.length_squared() > 0.0 {
+                        orbit.yaw = orbit.touch_start_yaw + displacement.x * 0.008;
+                        orbit.pitch = (orbit.touch_start_pitch + displacement.y * 0.006)
+                            .clamp(-1.15, 1.15);
+                    }
                 }
             }
         }
@@ -1563,13 +1565,19 @@ fn orbit_camera_input(
             direct_turn_input.touch_candidate = None;
             if orbit.touch_drag_mode != TouchOrbitMode::MultiFinger {
                 set_touch_orbit_mode(&mut orbit, TouchOrbitMode::MultiFinger);
+                orbit.touch_start_yaw = orbit.yaw;
+                orbit.touch_start_pitch = orbit.pitch;
+                orbit.touch_start_center = Some((first.position + second.position) * 0.5);
             }
 
             let center = (first.position + second.position) * 0.5;
-            let delta = position_delta(&mut orbit.previous_touch_center, center);
-            if delta.length_squared() > 0.0 {
-                orbit.yaw += delta.x * 0.006;
-                orbit.pitch = (orbit.pitch + delta.y * 0.0045).clamp(-1.15, 1.15);
+            if let Some(start_center) = orbit.touch_start_center {
+                let displacement = center - start_center;
+                if displacement.length_squared() > 0.0 {
+                    orbit.yaw = orbit.touch_start_yaw + displacement.x * 0.006;
+                    orbit.pitch = (orbit.touch_start_pitch + displacement.y * 0.0045)
+                        .clamp(-1.15, 1.15);
+                }
             }
 
             let pinch_distance = first.position.distance(second.position);
@@ -1578,7 +1586,6 @@ fn orbit_camera_input(
                 orbit.radius = (orbit.radius * (-zoom_delta).exp()).clamp(2.9, 9.4);
             }
 
-            orbit.previous_touch_center = Some(center);
             orbit.previous_pinch_distance = Some(pinch_distance);
         }
     }
@@ -2465,7 +2472,7 @@ mod tests {
         TOUCH_MOUSE_SUPPRESSION_SECS, TouchOrbitMode, cube_surface_hit_from_ray,
         clear_cube_visuals, cubie_matches_turn, decode_face, decode_rotation,
         face_outward_normal, format_turn, keyboard_shortcut_turn, nearest_orbit_snap,
-        normalize_base_path, normalize_canvas_selector, normalize_touch_position, position_delta,
+        normalize_base_path, normalize_canvas_selector, normalize_touch_position,
         reset_cube, set_touch_orbit_mode, should_begin_mouse_orbit,
         should_emulate_two_finger_touch, should_reset_single_touch_gesture,
         slice_face_from_sticker_drag, slice_start_layer, sticker_rotation, surface_axis_index,
@@ -2678,38 +2685,36 @@ mod tests {
     #[test]
     fn entering_multi_touch_orbit_clears_stale_touch_history() {
         let mut orbit = OrbitRig::default();
-        orbit.previous_single_touch_position = Some(Vec2::new(12.0, 18.0));
-        orbit.previous_touch_center = Some(Vec2::new(32.0, 48.0));
+        orbit.touch_start_position = Some(Vec2::new(12.0, 18.0));
+        orbit.touch_start_center = Some(Vec2::new(32.0, 48.0));
         orbit.previous_pinch_distance = Some(120.0);
 
         set_touch_orbit_mode(&mut orbit, TouchOrbitMode::MultiFinger);
 
         assert_eq!(orbit.touch_drag_mode, TouchOrbitMode::MultiFinger);
-        assert_eq!(orbit.previous_single_touch_position, None);
-        assert_eq!(orbit.previous_touch_center, None);
+        assert_eq!(orbit.touch_start_position, None);
+        assert_eq!(orbit.touch_start_center, None);
         assert_eq!(orbit.previous_pinch_distance, None);
     }
 
     #[test]
-    fn position_delta_is_zero_when_position_does_not_change() {
-        let mut previous = Some(Vec2::new(24.0, 36.0));
+    fn touch_orbit_yaw_uses_absolute_displacement_from_start() {
+        let mut orbit = OrbitRig::default();
+        orbit.yaw = 1.0;
+        orbit.pitch = 0.3;
+        orbit.touch_drag_mode = TouchOrbitMode::SingleFinger { id: 0 };
+        orbit.touch_start_yaw = 1.0;
+        orbit.touch_start_pitch = 0.3;
+        orbit.touch_start_position = Some(Vec2::new(100.0, 200.0));
 
-        assert_eq!(
-            position_delta(&mut previous, Vec2::new(24.0, 36.0)),
-            Vec2::ZERO
-        );
-        assert_eq!(previous, Some(Vec2::new(24.0, 36.0)));
-    }
+        let displacement = Vec2::new(150.0, 180.0) - Vec2::new(100.0, 200.0);
+        let expected_yaw = 1.0 + displacement.x * 0.008;
+        let expected_pitch = (0.3 + displacement.y * 0.006).clamp(-1.15, 1.15);
 
-    #[test]
-    fn position_delta_uses_explicit_position_difference() {
-        let mut previous = Some(Vec2::new(24.0, 36.0));
-
-        assert_eq!(
-            position_delta(&mut previous, Vec2::new(34.0, 30.0)),
-            Vec2::new(10.0, -6.0)
-        );
-        assert_eq!(previous, Some(Vec2::new(34.0, 30.0)));
+        assert!((orbit.yaw - 1.0).abs() < 0.001);
+        assert!((orbit.pitch - 0.3).abs() < 0.001);
+        assert_eq!(expected_yaw, 1.0 + 50.0 * 0.008);
+        assert_eq!(expected_pitch, 0.18);
     }
 
     #[test]
@@ -2724,7 +2729,7 @@ mod tests {
         let orbit = OrbitRig::default();
 
         assert_eq!(orbit.touch_mouse_suppression_secs, 0.0);
-        assert_eq!(orbit.previous_single_touch_position, None);
+        assert_eq!(orbit.touch_start_position, None);
         assert!(TOUCH_MOUSE_SUPPRESSION_SECS > 0.0);
     }
 
