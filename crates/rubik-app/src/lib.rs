@@ -58,6 +58,9 @@ struct OrbitRig {
     touch_start_pitch: f32,
     touch_start_position: Option<Vec2>,
     touch_start_center: Option<Vec2>,
+    mouse_start_yaw: f32,
+    mouse_start_pitch: f32,
+    mouse_start_position: Option<Vec2>,
     previous_pinch_distance: Option<f32>,
 }
 
@@ -255,6 +258,9 @@ impl Default for OrbitRig {
             touch_start_pitch: 0.0,
             touch_start_position: None,
             touch_start_center: None,
+            mouse_start_yaw: 0.0,
+            mouse_start_pitch: 0.0,
+            mouse_start_position: None,
             previous_pinch_distance: None,
         }
     }
@@ -1303,6 +1309,7 @@ fn orbit_camera_input(
     if suppress_mouse {
         direct_turn_input.mouse_candidate = None;
         orbit.mouse_drag_button = None;
+        orbit.mouse_start_position = None;
     } else {
         if buttons.just_pressed(MouseButton::Left) {
             direct_turn_input.mouse_candidate =
@@ -1314,6 +1321,7 @@ fn orbit_camera_input(
                     }),
                 });
             orbit.mouse_drag_button = None;
+            orbit.mouse_start_position = None;
             orbit.snap_target = None;
             orbit.auto_spin = false;
         }
@@ -1321,6 +1329,9 @@ fn orbit_camera_input(
         if buttons.just_pressed(MouseButton::Right) {
             direct_turn_input.mouse_candidate = None;
             orbit.mouse_drag_button = Some(MouseButton::Right);
+            orbit.mouse_start_yaw = orbit.yaw;
+            orbit.mouse_start_pitch = orbit.pitch;
+            orbit.mouse_start_position = cursor_position;
             orbit.snap_target = None;
             orbit.auto_spin = false;
         }
@@ -1341,6 +1352,9 @@ fn orbit_camera_input(
                 ) {
                     direct_turn_input.mouse_candidate = None;
                     orbit.mouse_drag_button = Some(MouseButton::Left);
+                    orbit.mouse_start_yaw = orbit.yaw;
+                    orbit.mouse_start_pitch = orbit.pitch;
+                    orbit.mouse_start_position = cursor_position;
                     orbit.snap_target = None;
                 }
             }
@@ -1352,13 +1366,22 @@ fn orbit_camera_input(
         {
             orbit.snap_target = None;
             orbit.auto_spin = false;
-            orbit.yaw += mouse_delta.x * 0.008;
-            orbit.pitch = (orbit.pitch + mouse_delta.y * 0.006).clamp(-1.15, 1.15);
+            if let (Some(start_pos), Some(current_pos)) =
+                (orbit.mouse_start_position, cursor_position)
+            {
+                let displacement = current_pos - start_pos;
+                if displacement.length_squared() > 0.0 {
+                    orbit.yaw = orbit.mouse_start_yaw + displacement.x * 0.008;
+                    orbit.pitch = (orbit.mouse_start_pitch + displacement.y * 0.006)
+                        .clamp(-1.15, 1.15);
+                }
+            }
         }
 
         if buttons.just_released(MouseButton::Left) {
             if orbit.mouse_drag_button == Some(MouseButton::Left) {
                 orbit.mouse_drag_button = None;
+                orbit.mouse_start_position = None;
                 orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
             } else if let Some(candidate) = direct_turn_input.mouse_candidate.take() {
                 let position = cursor_position.unwrap_or(candidate.start_position);
@@ -1385,6 +1408,7 @@ fn orbit_camera_input(
             && orbit.mouse_drag_button == Some(MouseButton::Right)
         {
             orbit.mouse_drag_button = None;
+            orbit.mouse_start_position = None;
             orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
         }
     }
