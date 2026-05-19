@@ -1,6 +1,6 @@
 # AGENTS.md for `rubikrs`
 
-This file is for future agent sessions working in this repository. After reading it, you should be able to pick the right place to make a change, run the right verification commands, and preserve the Rust-first architecture instead of accidentally moving core behavior into the web shell.
+`rubikrs` is a Rust and WebAssembly project for simulating and solving Rubik's Cubes on GitHub Pages. This file is for future agent sessions working in this repository. After reading it, you should be able to pick the right place to make a change, run the right verification commands, and preserve the Rust-first architecture instead of accidentally moving core behavior into the web shell.
 
 ## Build, test, and check commands
 
@@ -24,6 +24,7 @@ Run these from `apps/web`.
 | Build wasm packages only | `npm run build:wasm` | Compiles both Rust wasm entrypoints into the generated Vite source tree. |
 | Start local dev shell | `npm run dev` | Runs a dev wasm build first, then starts Vite. |
 | Production build | `npm run build` | Runs wasm build, TypeScript compile, and Vite build. |
+| Development build | `npm run build:dev` | Builds wasm and TypeScript without WASM or Vite optimizations for faster iteration. |
 | TypeScript check | `npm run check` | This repository does not define a separate JS/TS lint script. |
 | Preview built site | `npm run preview` | Useful after `npm run build`. |
 
@@ -62,9 +63,9 @@ The shell treats the runtime as authoritative. It also watches `scene_revision` 
 
 The solver flow is split between the shell and `solver-worker`:
 
-- the shell partitions the six outer faces across a worker pool for exact-depth search
-- 3x3 requests escalate to a Rust-side fallback after shallow search is exhausted
-- NxN requests can use recorded turn history as a feasible inverse-replay fallback
+- 2x2 uses One-Phase Search
+- 3x3 uses Kociemba's Two-Phase Algorithm
+- NxN uses reduction methods
 
 `solver-worker` returns camelCase JSON payloads because the shell replays them directly. For 3x3 center-slice states, the worker now normalizes the cube into a center-derived frame before solving, remaps the solution back into the runtime frame, and may append center-frame alignment turns so exported solved states stay canonical.
 
@@ -75,7 +76,7 @@ The web build is designed around GitHub Pages:
 - the wasm build script compiles both Rust entrypoints with `wasm-pack`, injects `--cfg getrandom_backend="wasm_js"`, and writes the generated bindings into the Vite source tree
 - Pages and CI both install Node 22, install `wasm-pack`, build the web app from `apps/web`, and target `wasm32-unknown-unknown`
 
-Because Pages is the deployment target, the architecture assumes ordinary web workers and message passing. Do not introduce `SharedArrayBuffer`, wasm threads, or concurrency designs that depend on cross-origin isolation.
+Because GitHub Pages is the deployment target, which does not support `SharedArrayBuffer` or wasm threads, the architecture assumes ordinary web workers and message passing. We therefore use multiple single-threaded web workers for parallelism.
 
 ## Key repository conventions
 
@@ -85,5 +86,6 @@ Because Pages is the deployment target, the architecture assumes ordinary web wo
 - **Respect solver cancellation and scene revisions.** Any feature that changes cube state while solving must keep the stale-result protections intact.
 - **Direct manipulation is surface-based, not sticker-polygon-based.** Pointer picking now uses a virtual outer cube surface, then maps the hit point into a face grid. Blank-space drags should still orbit; only cube-surface drags should turn slices.
 - **Bevy is intentionally trimmed for web delivery.** The workspace enables an explicit Bevy feature set with `webgl2` instead of relying on the default desktop-oriented stack.
-- **NxN support depends on `start_layer` and `width` everywhere.** Keyboard shortcuts, DOM controls, scramble generation, runtime animation, and solver replay all assume inner and wide turns are expressed through that shared turn shape rather than special-case move types.
-- **The current 3x3 solver is not the final promised optimal solver.** The exact-depth worker search plus fallback path is the current implementation. Preserve behavior, but do not document or assume it is the final long-term solving architecture.
+- **NxN support depends on `start_layer` and `width` everywhere.** Keyboard shortcuts, DOM controls, scramble generation and runtime animation all assume inner and wide turns are expressed through that shared turn shape rather than special-case move types.
+- **Document ADR and design decisions in `docs`. Update `AGENTS.md` when necessary.** Always keep documentation up to date after making any changes.
+- **Make Git commits with clear messages after any change.**
