@@ -45,6 +45,7 @@ Benchmark parameters:
 | Baseline | Benchmark pipeline + lazy solver worker startup | 447.6 | 176.6 | 192.3 | 8.8 |
 | Iteration 1 | Avoid per-frame full state clones when scene revision is unchanged; cache cubie/sticker slots in the visual pool | 453.9 | 177.6 | 196.1 | 8.9 |
 | Iteration 2 | Remove the always-running 1080p stage scan animation so the compositor is not repainting a full translucent overlay every frame | 565.4 | 201.7 | 217.4 | 8.2 |
+| Iteration 3 | Disable directional shadow casting only while a turn animation is active, then restore it immediately when the cube settles | 476.8 | 242.4 | 270.3 | 5.7 |
 
 ## Change details
 
@@ -56,9 +57,10 @@ Iteration 1 stays quality-safe and only removes CPU overhead in Rust:
 
 ## Result
 
-The benchmarked continuous 17x17 median throughput has improved in two measured steps so far:
+The benchmarked continuous 17x17 median throughput has improved in three measured steps so far:
 
 - **192.3 FPS -> 196.1 FPS** from Rust runtime-sync and visual-pool caching
 - **196.1 FPS -> 217.4 FPS** from removing the full-stage scanline compositor animation
+- **217.4 FPS -> 270.3 FPS** from skipping directional shadow rendering during active slice motion while restoring the original shadowed look as soon as the animation completes
 
-The current measured 1080p continuous-turn result is **217.4 FPS p50** with **201.7 FPS average**, and the benchmark still has verified headroom above refresh rate (`requestAnimationFrame` average **565.4 FPS** in the same browser session).
+The current measured 1080p continuous-turn result is **270.3 FPS p50** with **242.4 FPS average** on the benchmark machine, and the benchmark still has verified headroom above refresh rate (`requestAnimationFrame` average **476.8 FPS** in the same browser session).
