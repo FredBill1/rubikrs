@@ -3,7 +3,7 @@
 ## Decisions captured during the first implementation slice
 
 - Keep TypeScript intentionally thin and do not let it own the 3D runtime.
-- Build `rubik-app` with Bevy and enable both `webgl2` and `webgpu` so the browser slice picks its best available rendering backend (WebGPU when available, WebGL2 as fallback).
+- Build `rubik-app` with Bevy and enable only `webgpu` feature
 - Generate wasm into the Vite source tree during the build step instead of copying artifacts into `public/`, which keeps the app on Vite's asset pipeline and avoids stale unversioned wasm assets on Pages deploys.
 - Treat `solver-worker` as a dedicated wasm entrypoint from day one, even before solve logic exists, so the worker-pool architecture is encoded in the workspace layout.
 - Pin the shared sticker schema to canonical `U, R, F, D, L, B` face order with row-major scan order as viewed from outside each face.
