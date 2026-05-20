@@ -8,6 +8,7 @@ use bevy::{
         mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
         touch::Touches,
     },
+    light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, ShadowFilteringMethod},
     prelude::*,
     window::{Window, WindowPlugin},
 };
@@ -1021,15 +1022,22 @@ pub fn apply_turn(face_code: u8, rotation_code: u8, start_layer: u8, width: u8) 
     })
 }
 
-fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
+fn setup_scene(
+    mut commands: Commands<'_, '_>,
+    config: Res<'_, ShellConfig>,
+    mut directional_shadow_map: ResMut<'_, DirectionalLightShadowMap>,
+) {
     info!(
         "booting Bevy runtime on {} with canvas {}",
         config.base_path, config.canvas_selector
     );
 
+    directional_shadow_map.size = 2048;
+
     commands.spawn((
         Camera3d::default(),
         Tonemapping::TonyMcMapface,
+        ShadowFilteringMethod::Gaussian,
         Transform::from_xyz(-3.85, 3.15, 6.45).looking_at(Vec3::ZERO, Vec3::Y),
         AmbientLight {
             color: Color::srgb(1.0, 1.0, 1.0),
@@ -1042,7 +1050,7 @@ fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
         PointLight {
             intensity: 1_100_000.0,
             range: 42.0,
-            shadows_enabled: true,
+            shadows_enabled: false,
             ..default()
         },
         Transform::from_xyz(5.5, 8.5, 5.5),
@@ -1054,6 +1062,14 @@ fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
             shadows_enabled: true,
             ..default()
         },
+        CascadeShadowConfigBuilder {
+            num_cascades: 1,
+            minimum_distance: 0.1,
+            maximum_distance: 25.0,
+            first_cascade_far_bound: 10.0,
+            overlap_proportion: 0.2,
+        }
+        .build(),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.78, 0.92, 0.0)),
     ));
 }
