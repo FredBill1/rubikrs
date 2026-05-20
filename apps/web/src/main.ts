@@ -87,15 +87,15 @@ app.innerHTML = `
         <div class="stage-caption">
           <p class="stage-label">drag / orbit / zoom</p>
           <button type="button" class="stage-info" aria-label="Show stage controls help">i</button>
-          <button type="button" class="stage-toggle stage-toggle--portrait" aria-label="Toggle telemetry panel" title="Toggle telemetry panel">
-            <span class="toggle-arrow"/>
-          </button>
           <p class="stage-hint">
             Drag a sticker to turn the cube, drag empty space to orbit, right drag or two-finger drag always
             orbit, and pinch zooms. Keyboard: U R F D L B, 2..9 for layer selection, Alt for wide turns, Shift
             for inverse, Ctrl for 180,
             Backspace undo, Enter redo.
           </p>
+          <button type="button" class="stage-toggle stage-toggle--portrait" aria-label="Toggle telemetry panel" title="Toggle telemetry panel">
+            <span class="toggle-arrow"/>
+          </button>
         </div>
       </section>
 
