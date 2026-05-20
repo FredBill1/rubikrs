@@ -39,6 +39,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 wasm-bindgen = "0.2.105"
 
+[patch.crates-io]
+bevy_render = { path = "patches/bevy_render" }
+
 [profile.dev]
 opt-level = 1
 
