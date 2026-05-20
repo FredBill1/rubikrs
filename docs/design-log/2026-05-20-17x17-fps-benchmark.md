@@ -49,6 +49,7 @@ Benchmark parameters:
 | Iteration 4 | Remove Bevy's `debug` feature from the shared production dependency set so release wasm no longer carries debug-only engine code paths (average of two confirmation runs) | 598.4 | 288.2 | 312.5 | 4.6 |
 | Iteration 5 | Skip the full `apply_cube_state_to_pool` reset when the visual pool already matches the pending animation source revision, so ordinary turn starts stop rewriting every sticker before reparenting the animated subset (average of two confirmation runs) | 575.4 | 299.4 | 307.8 | 3.8 |
 | Iteration 6 | Cache the current sticker visual state in `CubeVisualPool` so turn-start slice selection no longer scans all sticker entities through ECS queries before reparenting the animated subset (average of two confirmation runs) | 573.8 | 302.4 | 312.5 | 3.8 |
+| Iteration 7 | Replace 1,734 per-sticker render entities with persistent static/animated vertex-colored merged sticker meshes, eliminating per-sticker ECS transform propagation and render extraction entirely (average of two confirmation runs) | 601.5 | 658.6 | 714.3 | 1.7 |
 
 ## Change details
 
@@ -83,6 +84,14 @@ Iteration 6 trims the remaining turn-start sticker selection overhead without ch
 - `begin_turn_animation()` can select the animated sticker subset from that cached state instead of querying every sticker entity just to read its current cubie position
 - `animate_turn_visuals()` updates the cached sticker state only for the animated subset when a turn completes, so the cache stays authoritative without reintroducing a full-pool rewrite
 
+Iteration 7 merges sticker rendering into the same pattern used for bodies:
+
+- the 17x17 shell now has only two sticker mesh entities: one under the root and one under the pivot, each using a single white `StandardMaterial` with per-vertex `ATTRIBUTE_COLOR` data
+- the six per-color `StandardMaterial` handles and the `build_sticker_material_palette`/`sticker_material_handle` helpers are removed entirely since all colors are now baked into the mesh geometry
+- `partition_sticker_visuals()` and `apply_sticker_mesh_partition()` mirror the already-established body mesh partition API so the sticker mesh is rebuilt at animation boundaries only
+- `animate_turn_visuals()` now updates `sticker_visual_states` in place (no ECS queries) and then calls `restore_resting_sticker_meshes()` to bake the post-turn sticker layout back into the static mesh
+- the 1,734 per-sticker entities are completely removed — only the two batch mesh entities remain
+
 ## Result
 
 The benchmarked continuous 17x17 throughput has improved in six measured steps so far:
@@ -93,5 +102,6 @@ The benchmarked continuous 17x17 throughput has improved in six measured steps s
 - **307.8 FPS -> 312.5 FPS** p50 from removing Bevy's production `debug` feature, with average throughput rising from **285.0 FPS -> 288.2 FPS**
 - **288.2 FPS -> 299.4 FPS** average from skipping redundant turn-start pool resets, while p95 frame time improved from **4.6 ms -> 3.8 ms**
 - **299.4 FPS -> 302.4 FPS** average from caching sticker visual state outside ECS queries, keeping both confirmation runs above the 300 FPS target
+- **302.4 FPS -> 658.6 FPS** average from merging per-sticker entities into two vertex-colored sticker mesh entities, while p95 frame time improved from **3.8 ms -> 1.7 ms**
 
-The current measured 1080p continuous-turn result is **302.4 FPS average** and **312.5 FPS p50** across two confirmation runs, with both runs clearing the 300 FPS target on average. The benchmark still has verified headroom above refresh rate (`requestAnimationFrame` average **573.8 FPS** in the same browser session).
+The current measured 1080p continuous-turn result is **658.6 FPS average** and **714.3 FPS p50** across two confirmation runs, clearing the **400 FPS target** by a wide margin. The benchmark now approaches the uncapped requestAnimationFrame ceiling (`requestAnimationFrame` average **601.5 FPS** in the same browser session).

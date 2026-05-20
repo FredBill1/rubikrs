@@ -117,13 +117,16 @@ struct CubeVisualPool {
     pivot_entity: Option<Entity>,
     static_body_entity: Option<Entity>,
     animated_body_entity: Option<Entity>,
-    sticker_entities: Vec<Entity>,
+    static_sticker_entity: Option<Entity>,
+    animated_sticker_entity: Option<Entity>,
     sticker_visual_states: Vec<StickerVisual>,
+    sticker_colors: Vec<StickerColor>,
     body_mesh_handles: Option<(Handle<Mesh>, Handle<Mesh>)>,
     body_mesh_template: Option<BodyMeshTemplate>,
+    sticker_mesh_handles: Option<(Handle<Mesh>, Handle<Mesh>)>,
+    sticker_mesh_template: Option<BodyMeshTemplate>,
     cubie_slots: Vec<UVec3>,
     sticker_slots: Vec<StickerSlotSpec>,
-    sticker_materials: Option<[Handle<StandardMaterial>; 6]>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,7 +183,7 @@ struct ActiveTurnAnimation {
     scene_revision: u64,
     pivot_entity: Entity,
     turn: TurnCommand,
-    animated_stickers: Vec<(usize, Entity)>,
+    animated_stickers: Vec<usize>,
     angle_radians: f32,
     axis: Vec3,
     elapsed_secs: f32,
@@ -1111,16 +1114,6 @@ fn sync_cube_visuals(
     mut materials: ResMut<'_, Assets<StandardMaterial>>,
     mut pool: ResMut<'_, CubeVisualPool>,
     mut sync_state: ResMut<'_, VisualSyncState>,
-    mut sticker_visuals: Query<
-        '_,
-        '_,
-        (
-            &mut StickerVisual,
-            &mut Transform,
-            &mut MeshMaterial3d<StandardMaterial>,
-        ),
-        Without<CubieBodyVisual>,
-    >,
     mut pivots: Query<
         '_,
         '_,
@@ -1200,17 +1193,14 @@ fn sync_cube_visuals(
     if let Some((from_state, turn)) = pending_animation {
         if !pool_matches_pending_animation_source(&sync_state, snapshot.scene_revision) {
             apply_cube_state_to_pool(
-                &mut commands,
                 &mut meshes,
                 &mut pool,
                 &from_state,
-                &mut sticker_visuals,
                 &mut pivots,
                 &mut visibilities,
             );
         }
         sync_state.active_animation = begin_turn_animation(
-            &mut commands,
             &mut meshes,
             &pool,
             order,
@@ -1232,11 +1222,9 @@ fn sync_cube_visuals(
     }
 
     apply_cube_state_to_pool(
-        &mut commands,
         &mut meshes,
         &mut pool,
         &snapshot.state,
-        &mut sticker_visuals,
         &mut pivots,
         &mut visibilities,
     );
@@ -1247,16 +1235,9 @@ fn sync_cube_visuals(
 
 fn animate_turn_visuals(
     time: Res<'_, Time>,
-    mut commands: Commands<'_, '_>,
     mut meshes: ResMut<'_, Assets<Mesh>>,
     mut pool: ResMut<'_, CubeVisualPool>,
     mut sync_state: ResMut<'_, VisualSyncState>,
-    mut sticker_visuals: Query<
-        '_,
-        '_,
-        (&mut StickerVisual, &mut Transform),
-        Without<CubieBodyVisual>,
-    >,
     mut pivots: Query<
         '_,
         '_,
@@ -1301,33 +1282,17 @@ fn animate_turn_visuals(
         animation.clone()
     };
 
-    let Some(root_entity) = pool.root_entity else {
-        sync_state.active_animation = None;
-        sync_state.rendered_revision = 0;
-        sync_state.completed_animation_revision = None;
-        with_runtime_mut(|runtime| runtime.set_animation_active(false));
-        return;
-    };
     let order = pool.order.expect("pool root implies order");
-    restore_resting_body_meshes(&mut meshes, &pool, &mut visibilities);
-
-    for (index, entity) in &completed_animation.animated_stickers {
-        if let Ok((mut visual, mut transform)) = sticker_visuals.get_mut(*entity) {
-            let rotated = rotate_sticker_visual_for_turn(order, completed_animation.turn, *visual);
-            *visual = rotated;
-            pool.sticker_visual_states[*index] = rotated;
-            let (translation, rotation) = sticker_world_transform(
-                rotated.face,
-                usize::from(rotated.row),
-                usize::from(rotated.col),
-                usize::from(order),
-                CUBE_FACE_SPAN,
-                cube_face_offset(order),
-            );
-            *transform = Transform::from_translation(translation).with_rotation(rotation);
-            commands.entity(*entity).insert(ChildOf(root_entity));
-        }
+    for index in &completed_animation.animated_stickers {
+        let rotated = rotate_sticker_visual_for_turn(
+            order,
+            completed_animation.turn,
+            pool.sticker_visual_states[*index],
+        );
+        pool.sticker_visual_states[*index] = rotated;
     }
+    restore_resting_body_meshes(&mut meshes, &pool, &mut visibilities);
+    restore_resting_sticker_meshes(&mut meshes, &pool, &mut visibilities);
 
     sync_state.active_animation = None;
     sync_state.rendered_revision = completed_animation.scene_revision;
@@ -1352,12 +1317,8 @@ fn pool_matches_pending_animation_source(
         && sync_state.rendered_revision.saturating_add(1) == pending_scene_revision
 }
 
-fn cubie_body_mesh_template(cubie_body_size: f32) -> BodyMeshTemplate {
-    let mesh = Mesh::from(Cuboid::new(
-        cubie_body_size,
-        cubie_body_size,
-        cubie_body_size,
-    ));
+fn cuboid_mesh_template(width: f32, height: f32, depth: f32) -> BodyMeshTemplate {
+    let mesh = Mesh::from(Cuboid::new(width, height, depth));
     let positions = mesh
         .attribute(Mesh::ATTRIBUTE_POSITION)
         .and_then(|values| values.as_float3())
@@ -1482,6 +1443,163 @@ fn restore_resting_body_meshes(
     apply_body_mesh_partition(meshes, pool, &pool.cubie_slots, &[], visibilities);
 }
 
+fn merged_sticker_mesh(
+    template: &BodyMeshTemplate,
+    stickers: &[(StickerVisual, StickerColor)],
+    order: usize,
+    face_span: f32,
+    face_offset: f32,
+) -> Mesh {
+    let vertices_per_sticker = template.positions.len();
+    let mut positions = Vec::with_capacity(vertices_per_sticker * stickers.len());
+    let mut normals = Vec::with_capacity(template.normals.len() * stickers.len());
+    let mut colors = Vec::with_capacity(vertices_per_sticker * stickers.len());
+    let mut indices = Vec::with_capacity(template.indices.len() * stickers.len());
+
+    for (sticker_index, (visual, color)) in stickers.iter().copied().enumerate() {
+        let (translation, rotation) = sticker_world_transform(
+            visual.face,
+            usize::from(visual.row),
+            usize::from(visual.col),
+            order,
+            face_span,
+            face_offset,
+        );
+        positions.extend(template.positions.iter().map(|position| {
+            let rotated = rotation * Vec3::new(position[0], position[1], position[2]);
+            [
+                rotated.x + translation.x,
+                rotated.y + translation.y,
+                rotated.z + translation.z,
+            ]
+        }));
+        normals.extend(template.normals.iter().map(|normal| {
+            let rotated = rotation * Vec3::new(normal[0], normal[1], normal[2]);
+            [rotated.x, rotated.y, rotated.z]
+        }));
+        colors.extend(std::iter::repeat_n(
+            color_for_sticker(color).to_linear().to_f32_array(),
+            vertices_per_sticker,
+        ));
+        let base_index = (sticker_index * vertices_per_sticker) as u32;
+        indices.extend(template.indices.iter().map(|index| base_index + index));
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+fn partition_sticker_visuals(
+    sticker_visual_states: &[StickerVisual],
+    sticker_colors: &[StickerColor],
+    order: u8,
+    animation_turn: Option<TurnCommand>,
+) -> (
+    Vec<(StickerVisual, StickerColor)>,
+    Vec<(StickerVisual, StickerColor)>,
+    Vec<usize>,
+) {
+    let mut static_stickers = Vec::with_capacity(sticker_visual_states.len());
+    let mut animated_stickers = Vec::new();
+    let mut animated_indices = Vec::new();
+
+    for (index, (visual, color)) in sticker_visual_states
+        .iter()
+        .copied()
+        .zip(sticker_colors.iter().copied())
+        .enumerate()
+    {
+        if animation_turn.is_some_and(|turn| cubie_matches_turn(order, turn, visual.cubie)) {
+            animated_stickers.push((visual, color));
+            animated_indices.push(index);
+        } else {
+            static_stickers.push((visual, color));
+        }
+    }
+
+    (static_stickers, animated_stickers, animated_indices)
+}
+
+fn apply_sticker_mesh_partition(
+    meshes: &mut Assets<Mesh>,
+    pool: &CubeVisualPool,
+    static_stickers: &[(StickerVisual, StickerColor)],
+    animated_stickers: &[(StickerVisual, StickerColor)],
+    visibilities: &mut Query<'_, '_, &mut Visibility>,
+) {
+    let Some(order) = pool.order.map(usize::from) else {
+        return;
+    };
+    let Some((static_sticker_mesh, animated_sticker_mesh)) = pool.sticker_mesh_handles.as_ref()
+    else {
+        return;
+    };
+    let Some(template) = pool.sticker_mesh_template.as_ref() else {
+        return;
+    };
+    let face_offset = cube_face_offset(order as u8);
+
+    if let Some(mesh) = meshes.get_mut(static_sticker_mesh) {
+        *mesh = merged_sticker_mesh(
+            template,
+            static_stickers,
+            order,
+            CUBE_FACE_SPAN,
+            face_offset,
+        );
+    }
+    if let Some(mesh) = meshes.get_mut(animated_sticker_mesh) {
+        *mesh = merged_sticker_mesh(
+            template,
+            animated_stickers,
+            order,
+            CUBE_FACE_SPAN,
+            face_offset,
+        );
+    }
+
+    if let Some(entity) = pool.static_sticker_entity {
+        if let Ok(mut visibility) = visibilities.get_mut(entity) {
+            *visibility = Visibility::Visible;
+        }
+    }
+    if let Some(entity) = pool.animated_sticker_entity {
+        if let Ok(mut visibility) = visibilities.get_mut(entity) {
+            *visibility = if animated_stickers.is_empty() {
+                Visibility::Hidden
+            } else {
+                Visibility::Visible
+            };
+        }
+    }
+}
+
+fn restore_resting_sticker_meshes(
+    meshes: &mut Assets<Mesh>,
+    pool: &CubeVisualPool,
+    visibilities: &mut Query<'_, '_, &mut Visibility>,
+) {
+    let (static_stickers, animated_stickers, _) = partition_sticker_visuals(
+        &pool.sticker_visual_states,
+        &pool.sticker_colors,
+        pool.order.unwrap_or_default(),
+        None,
+    );
+    apply_sticker_mesh_partition(
+        meshes,
+        pool,
+        &static_stickers,
+        &animated_stickers,
+        visibilities,
+    );
+}
+
 fn cube_visual_pool_needs_rebuild(
     pool: &CubeVisualPool,
     order: u8,
@@ -1494,16 +1612,19 @@ fn cube_visual_pool_needs_rebuild(
         || pool.pivot_entity.is_none()
         || pool.static_body_entity.is_none()
         || pool.animated_body_entity.is_none()
+        || pool.static_sticker_entity.is_none()
+        || pool.animated_sticker_entity.is_none()
         || pool
             .root_entity
             .is_some_and(|entity| existing_visual_roots.get(entity).is_err())
-        || pool.sticker_entities.len() != expected_stickers
         || pool.sticker_visual_states.len() != expected_stickers
+        || pool.sticker_colors.len() != expected_stickers
         || pool.sticker_slots.len() != expected_stickers
         || pool.cubie_slots.len() != expected_cubies
         || pool.body_mesh_handles.is_none()
         || pool.body_mesh_template.is_none()
-        || pool.sticker_materials.is_none()
+        || pool.sticker_mesh_handles.is_none()
+        || pool.sticker_mesh_template.is_none()
 }
 
 fn spawn_cube_visual_pool(
@@ -1521,9 +1642,16 @@ fn spawn_cube_visual_pool(
     let sticker_depth = 0.06_f32;
     let cubie_body_size = step * 0.92;
     let face_offset = cube_face_offset(state.order.get());
-    let sticker_materials = build_sticker_material_palette(materials);
+    let sticker_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        metallic: 0.06,
+        perceptual_roughness: 0.21,
+        ..default()
+    });
     let cubie_slots = surface_cubies(order);
-    let body_mesh_template = cubie_body_mesh_template(cubie_body_size);
+    let body_mesh_template =
+        cuboid_mesh_template(cubie_body_size, cubie_body_size, cubie_body_size);
+    let sticker_mesh_template = cuboid_mesh_template(sticker_size, sticker_size, sticker_depth);
     let (static_body_cubies, animated_body_cubies) =
         partition_body_cubies(&cubie_slots, state.order.get(), animation_turn);
     let static_body_mesh = meshes.add(merged_cubie_body_mesh(
@@ -1583,10 +1711,45 @@ fn spawn_cube_visual_pool(
         ..default()
     });
 
-    let sticker_mesh = meshes.add(Cuboid::new(sticker_size, sticker_size, sticker_depth));
     let sticker_slots = (0..state.stickers.len())
         .map(|index| sticker_slot_from_index(index, order))
         .collect::<Vec<_>>();
+    let sticker_visual_states = sticker_slots
+        .iter()
+        .copied()
+        .map(|slot| StickerVisual {
+            face: slot.face,
+            row: slot.row as u8,
+            col: slot.col as u8,
+            cubie: slot.cubie,
+        })
+        .collect::<Vec<_>>();
+    let sticker_colors = state.stickers.to_vec();
+    let (static_stickers, animated_stickers, animated_sticker_indices) = partition_sticker_visuals(
+        &sticker_visual_states,
+        &sticker_colors,
+        state.order.get(),
+        animation_turn,
+    );
+    let static_sticker_mesh = meshes.add(merged_sticker_mesh(
+        &sticker_mesh_template,
+        &static_stickers,
+        order,
+        face_span,
+        face_offset,
+    ));
+    let animated_sticker_mesh_seed = if animated_stickers.is_empty() {
+        static_stickers.as_slice()
+    } else {
+        animated_stickers.as_slice()
+    };
+    let animated_sticker_mesh = meshes.add(merged_sticker_mesh(
+        &sticker_mesh_template,
+        animated_sticker_mesh_seed,
+        order,
+        face_span,
+        face_offset,
+    ));
     let static_body_entity = commands
         .spawn((
             CubeVisual,
@@ -1610,59 +1773,52 @@ fn spawn_cube_visual_pool(
             ChildOf(pivot),
         ))
         .id();
-    let mut pool = CubeVisualPool {
+    let static_sticker_entity = commands
+        .spawn((
+            CubeVisual,
+            Mesh3d(static_sticker_mesh.clone()),
+            MeshMaterial3d(sticker_material.clone()),
+            Transform::default(),
+            ChildOf(root),
+        ))
+        .id();
+    let animated_sticker_entity = commands
+        .spawn((
+            CubeVisual,
+            Mesh3d(animated_sticker_mesh.clone()),
+            MeshMaterial3d(sticker_material),
+            Transform::default(),
+            if animated_stickers.is_empty() {
+                Visibility::Hidden
+            } else {
+                Visibility::Visible
+            },
+            ChildOf(pivot),
+        ))
+        .id();
+    let pool = CubeVisualPool {
         order: Some(state.order.get()),
         root_entity: Some(root),
         pivot_entity: Some(pivot),
         static_body_entity: Some(static_body_entity),
         animated_body_entity: Some(animated_body_entity),
-        sticker_entities: Vec::with_capacity(sticker_slots.len()),
-        sticker_visual_states: Vec::with_capacity(sticker_slots.len()),
+        static_sticker_entity: Some(static_sticker_entity),
+        animated_sticker_entity: Some(animated_sticker_entity),
+        sticker_visual_states,
+        sticker_colors,
         body_mesh_handles: Some((static_body_mesh, animated_body_mesh)),
         body_mesh_template: Some(body_mesh_template),
+        sticker_mesh_handles: Some((static_sticker_mesh, animated_sticker_mesh)),
+        sticker_mesh_template: Some(sticker_mesh_template),
         cubie_slots: cubie_slots.clone(),
         sticker_slots: sticker_slots.clone(),
-        sticker_materials: Some(sticker_materials.clone()),
     };
-    let mut animated_stickers = Vec::new();
-
-    for (index, slot) in sticker_slots.iter().copied().enumerate() {
-        let is_animated = animation_turn
-            .is_some_and(|turn| cubie_matches_turn(state.order.get(), turn, slot.cubie));
-        let target_parent = if is_animated { pivot } else { root };
-        let visual = StickerVisual {
-            face: slot.face,
-            row: slot.row as u8,
-            col: slot.col as u8,
-            cubie: slot.cubie,
-        };
-        let (translation, rotation) =
-            sticker_world_transform(slot.face, slot.row, slot.col, order, face_span, face_offset);
-        let entity = commands
-            .spawn((
-                CubeVisual,
-                visual,
-                Mesh3d(sticker_mesh.clone()),
-                MeshMaterial3d(sticker_material_handle(
-                    &sticker_materials,
-                    state.stickers[index],
-                )),
-                Transform::from_translation(translation).with_rotation(rotation),
-                ChildOf(target_parent),
-            ))
-            .id();
-        if is_animated {
-            animated_stickers.push((index, entity));
-        }
-        pool.sticker_entities.push(entity);
-        pool.sticker_visual_states.push(visual);
-    }
 
     let active_animation = animation_turn.map(|turn| ActiveTurnAnimation {
         scene_revision,
         pivot_entity: pivot,
         turn,
-        animated_stickers,
+        animated_stickers: animated_sticker_indices,
         angle_radians: turn_rotation_angle(turn),
         axis: turn_rotation_axis(turn.face),
         elapsed_secs: 0.0,
@@ -1672,20 +1828,9 @@ fn spawn_cube_visual_pool(
 }
 
 fn apply_cube_state_to_pool(
-    commands: &mut Commands<'_, '_>,
     meshes: &mut ResMut<'_, Assets<Mesh>>,
     pool: &mut CubeVisualPool,
     state: &CubeState,
-    sticker_visuals: &mut Query<
-        '_,
-        '_,
-        (
-            &mut StickerVisual,
-            &mut Transform,
-            &mut MeshMaterial3d<StandardMaterial>,
-        ),
-        Without<CubieBodyVisual>,
-    >,
     pivots: &mut Query<
         '_,
         '_,
@@ -1698,57 +1843,32 @@ fn apply_cube_state_to_pool(
     >,
     visibilities: &mut Query<'_, '_, &mut Visibility>,
 ) {
-    let Some(root_entity) = pool.root_entity else {
-        return;
-    };
     let Some(pivot_entity) = pool.pivot_entity else {
         return;
     };
-    let Some(sticker_materials) = pool.sticker_materials.as_ref() else {
-        return;
-    };
-    let order = usize::from(state.order.get());
-    let face_offset = cube_face_offset(state.order.get());
 
     if let Ok(mut pivot_transform) = pivots.get_mut(pivot_entity) {
         *pivot_transform = Transform::default();
     }
     restore_resting_body_meshes(meshes, pool, visibilities);
-
-    for (((entity, slot), visual_state), color) in pool
-        .sticker_entities
-        .iter()
-        .copied()
+    for (visual_state, slot) in pool
+        .sticker_visual_states
+        .iter_mut()
         .zip(pool.sticker_slots.iter().copied())
-        .zip(pool.sticker_visual_states.iter_mut())
-        .zip(state.stickers.iter().copied())
     {
-        if let Ok((mut visual, mut transform, mut material)) = sticker_visuals.get_mut(entity) {
-            let next_visual = StickerVisual {
-                face: slot.face,
-                row: slot.row as u8,
-                col: slot.col as u8,
-                cubie: slot.cubie,
-            };
-            *visual_state = next_visual;
-            *visual = next_visual;
-            let (translation, rotation) = sticker_world_transform(
-                slot.face,
-                slot.row,
-                slot.col,
-                order,
-                CUBE_FACE_SPAN,
-                face_offset,
-            );
-            *transform = Transform::from_translation(translation).with_rotation(rotation);
-            material.0 = sticker_material_handle(sticker_materials, color);
-            commands.entity(entity).insert(ChildOf(root_entity));
-        }
+        *visual_state = StickerVisual {
+            face: slot.face,
+            row: slot.row as u8,
+            col: slot.col as u8,
+            cubie: slot.cubie,
+        };
     }
+    pool.sticker_colors.clear();
+    pool.sticker_colors.extend(state.stickers.iter().copied());
+    restore_resting_sticker_meshes(meshes, pool, visibilities);
 }
 
 fn begin_turn_animation(
-    commands: &mut Commands<'_, '_>,
     meshes: &mut ResMut<'_, Assets<Mesh>>,
     pool: &CubeVisualPool,
     order: u8,
@@ -1779,22 +1899,21 @@ fn begin_turn_animation(
         &animated_body_cubies,
         visibilities,
     );
+    let (static_stickers, animated_stickers, animated_sticker_indices) = partition_sticker_visuals(
+        &pool.sticker_visual_states,
+        &pool.sticker_colors,
+        order,
+        Some(turn),
+    );
+    apply_sticker_mesh_partition(
+        meshes,
+        pool,
+        &static_stickers,
+        &animated_stickers,
+        visibilities,
+    );
 
-    let mut animated_stickers = Vec::new();
-    for (index, (entity, visual)) in pool
-        .sticker_entities
-        .iter()
-        .copied()
-        .zip(pool.sticker_visual_states.iter().copied())
-        .enumerate()
-    {
-        if cubie_matches_turn(order, turn, visual.cubie) {
-            commands.entity(entity).insert(ChildOf(pivot_entity));
-            animated_stickers.push((index, entity));
-        }
-    }
-
-    if animated_body_cubies.is_empty() && animated_stickers.is_empty() {
+    if animated_body_cubies.is_empty() && animated_sticker_indices.is_empty() {
         return None;
     }
 
@@ -1802,7 +1921,7 @@ fn begin_turn_animation(
         scene_revision,
         pivot_entity,
         turn,
-        animated_stickers,
+        animated_stickers: animated_sticker_indices,
         angle_radians: turn_rotation_angle(turn),
         axis: turn_rotation_axis(turn.face),
         elapsed_secs: 0.0,
@@ -2623,64 +2742,6 @@ fn cube_face_offset(order: u8) -> f32 {
     cube_size / 2.0 + 0.03
 }
 
-fn build_sticker_material_palette(
-    materials: &mut ResMut<'_, Assets<StandardMaterial>>,
-) -> [Handle<StandardMaterial>; 6] {
-    [
-        materials.add(StandardMaterial {
-            base_color: color_for_sticker(StickerColor::White),
-            metallic: 0.06,
-            perceptual_roughness: 0.21,
-            ..default()
-        }),
-        materials.add(StandardMaterial {
-            base_color: color_for_sticker(StickerColor::Red),
-            metallic: 0.06,
-            perceptual_roughness: 0.21,
-            ..default()
-        }),
-        materials.add(StandardMaterial {
-            base_color: color_for_sticker(StickerColor::Green),
-            metallic: 0.06,
-            perceptual_roughness: 0.21,
-            ..default()
-        }),
-        materials.add(StandardMaterial {
-            base_color: color_for_sticker(StickerColor::Yellow),
-            metallic: 0.06,
-            perceptual_roughness: 0.21,
-            ..default()
-        }),
-        materials.add(StandardMaterial {
-            base_color: color_for_sticker(StickerColor::Orange),
-            metallic: 0.06,
-            perceptual_roughness: 0.21,
-            ..default()
-        }),
-        materials.add(StandardMaterial {
-            base_color: color_for_sticker(StickerColor::Blue),
-            metallic: 0.06,
-            perceptual_roughness: 0.21,
-            ..default()
-        }),
-    ]
-}
-
-fn sticker_material_handle(
-    sticker_materials: &[Handle<StandardMaterial>; 6],
-    color: StickerColor,
-) -> Handle<StandardMaterial> {
-    sticker_materials[match color {
-        StickerColor::White => 0,
-        StickerColor::Red => 1,
-        StickerColor::Green => 2,
-        StickerColor::Yellow => 3,
-        StickerColor::Orange => 4,
-        StickerColor::Blue => 5,
-    }]
-    .clone()
-}
-
 fn surface_cubie_count(order: usize) -> usize {
     order.pow(3) - order.saturating_sub(2).pow(3)
 }
@@ -3230,10 +3291,10 @@ mod tests {
         CUBE_FACE_SPAN, CanvasTouchSpace, CubeVisual, CubeVisualPool, CubeVisualRoot, OrbitRig,
         RuntimeBridge, ScreenStickerCandidate, StickerVisual, TOUCH_MOUSE_SUPPRESSION_SECS,
         TouchOrbitMode, TurnAnimationPivot, VisualSyncState, animate_turn_visuals,
-        clear_cube_visuals, cube_surface_hit_from_ray, cubie_body_mesh_template,
-        cubie_matches_turn, decode_face, decode_rotation, face_outward_normal, format_turn,
-        keyboard_shortcut_turn, merged_cubie_body_mesh, nearest_orbit_snap, normalize_base_path,
-        normalize_canvas_selector, normalize_touch_position, partition_body_cubies, reset_cube,
+        clear_cube_visuals, cube_surface_hit_from_ray, cubie_matches_turn, cuboid_mesh_template,
+        decode_face, decode_rotation, face_outward_normal, format_turn, keyboard_shortcut_turn,
+        merged_cubie_body_mesh, nearest_orbit_snap, normalize_base_path, normalize_canvas_selector,
+        normalize_touch_position, partition_body_cubies, reset_cube,
         rotate_sticker_visual_for_turn, set_touch_orbit_mode, should_begin_mouse_orbit,
         should_emulate_two_finger_touch, should_reset_single_touch_gesture,
         slice_face_from_sticker_drag, slice_start_layer, sticker_cubie_coord, sticker_rotation,
@@ -3427,7 +3488,7 @@ mod tests {
 
     #[test]
     fn merged_cubie_body_mesh_reuses_template_per_requested_body() {
-        let template = cubie_body_mesh_template(1.0);
+        let template = cuboid_mesh_template(1.0, 1.0, 1.0);
         let mesh = merged_cubie_body_mesh(
             &template,
             &[UVec3::new(0, 0, 0), UVec3::new(2, 1, 0)],
