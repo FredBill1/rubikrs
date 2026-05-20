@@ -8,7 +8,10 @@ use bevy::{
         mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
         touch::Touches,
     },
+    light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, ShadowFilteringMethod},
+    log::{DEFAULT_FILTER, Level, LogPlugin},
     prelude::*,
+    render::renderer::RenderAdapterInfo,
     window::{Window, WindowPlugin},
 };
 use rubik_core::{
@@ -899,16 +902,32 @@ pub fn start_app(canvas_id: &str, base_path: &str) {
         .insert_resource(DirectTurnInputState::default())
         .insert_resource(CubeVisualPool::default())
         .insert_resource(VisualSyncState::default())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "rubikrs // bevy runtime".to_owned(),
-                canvas: Some(canvas_selector),
-                fit_canvas_to_parent: true,
-                prevent_default_event_handling: false,
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(LogPlugin {
+                    filter: format!(
+                        "{DEFAULT_FILTER},\
+bevy_render::renderer=warn,\
+bevy_render::batching::gpu_preprocessing=warn,\
+bevy_core_pipeline::oit=error,\
+bevy_pbr::ssao=error,\
+bevy_pbr::atmosphere=error,\
+bevy_pbr::light_probe::generate=warn"
+                    ),
+                    level: Level::INFO,
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "rubikrs // bevy runtime".to_owned(),
+                        canvas: Some(canvas_selector),
+                        fit_canvas_to_parent: true,
+                        prevent_default_event_handling: false,
+                        ..default()
+                    }),
+                    ..default()
+                }),
+        )
         .add_systems(Startup, setup_scene)
         .add_systems(
             Update,
@@ -1021,15 +1040,29 @@ pub fn apply_turn(face_code: u8, rotation_code: u8, start_layer: u8, width: u8) 
     })
 }
 
-fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
+fn setup_scene(
+    mut commands: Commands<'_, '_>,
+    config: Res<'_, ShellConfig>,
+    adapter_info: Option<Res<'_, RenderAdapterInfo>>,
+    mut directional_shadow_map: ResMut<'_, DirectionalLightShadowMap>,
+) {
     info!(
         "booting Bevy runtime on {} with canvas {}",
         config.base_path, config.canvas_selector
     );
 
+    let is_webgl2 = adapter_info
+        .as_deref()
+        .is_some_and(|info| format!("{:?}", info.backend) == "Gl");
+
+    if is_webgl2 {
+        directional_shadow_map.size = 2048;
+    }
+
     commands.spawn((
         Camera3d::default(),
         Tonemapping::TonyMcMapface,
+        ShadowFilteringMethod::Gaussian,
         Transform::from_xyz(-3.85, 3.15, 6.45).looking_at(Vec3::ZERO, Vec3::Y),
         AmbientLight {
             color: Color::srgb(1.0, 1.0, 1.0),
@@ -1042,7 +1075,7 @@ fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
         PointLight {
             intensity: 1_100_000.0,
             range: 42.0,
-            shadows_enabled: true,
+            shadows_enabled: !is_webgl2,
             ..default()
         },
         Transform::from_xyz(5.5, 8.5, 5.5),
@@ -1053,6 +1086,18 @@ fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
             illuminance: 8_000.0,
             shadows_enabled: true,
             ..default()
+        },
+        if is_webgl2 {
+            CascadeShadowConfigBuilder {
+                num_cascades: 1,
+                minimum_distance: 0.1,
+                maximum_distance: 25.0,
+                first_cascade_far_bound: 10.0,
+                overlap_proportion: 0.2,
+            }
+            .build()
+        } else {
+            CascadeShadowConfigBuilder::default().build()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.78, 0.92, 0.0)),
     ));
