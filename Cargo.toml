@@ -23,7 +23,6 @@ bevy = { version = "0.18.1", default-features = false, features = [
   "bevy_shader",
   "bevy_window",
   "bevy_winit",
-  "debug",
   "png",
   "reflect_auto_register",
   "std",
