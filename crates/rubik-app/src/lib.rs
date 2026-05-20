@@ -1257,7 +1257,7 @@ fn animate_turn_visuals(
         } else {
             animation.elapsed_secs / animation.duration_secs
         };
-        let eased = ease_out_cubic(progress);
+        let eased = ease_in_out_cubic(progress);
         pivot_transform.rotation =
             Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
 
@@ -2647,9 +2647,14 @@ fn face_outward_normal(face: Face) -> Vec3 {
     }
 }
 
-fn ease_out_cubic(progress: f32) -> f32 {
-    let inverse = 1.0 - progress.clamp(0.0, 1.0);
-    1.0 - inverse * inverse * inverse
+fn ease_in_out_cubic(progress: f32) -> f32 {
+    let t = progress.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        let f = 2.0 * t - 2.0;
+        1.0 + 0.5 * f * f * f
+    }
 }
 
 fn normalize_angle(angle: f32) -> f32 {
