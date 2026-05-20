@@ -46,6 +46,8 @@
 - Stop trusting `Touch::delta()` as the authoritative orbit increment for web device emulation. The runtime now derives single-finger orbit motion from explicit normalized position differences so a blank-space drag stops rotating immediately when the emulated touch stops moving instead of replaying a stale delta every frame.
 - Treat `Shift` + one active emulated touch as a DevTools-only stand-in for a two-finger camera gesture. When that modifier is held, the runtime skips single-finger sticker-turn candidacy and forces the gesture down the orbit path so clicking the cube during Shift-based device emulation behaves like a two-finger drag instead of a direct cube manipulation.
 - Only despawn rendered cube visuals from the `CubeVisualRoot`. The old cleanup loop queued `despawn()` for every `CubeVisual`, including parents and descendants in the same hierarchy, which made Bevy log noisy "Entity despawned" command errors during normal turns even though the scene still recovered.
+- Large-order rendering cannot afford a full Bevy entity rebuild on every turn. `rubik-app` now keeps a persistent cube-visual pool per order, reuses the same cubie/sticker entities across revisions, and updates slot transforms in place instead of despawning and respawning the whole cube for every animated move.
+- Sticker materials must be shared by color, not allocated per sticker instance. Reusing one shell material plus a six-color sticker palette lets Bevy batch the render path far more aggressively on 13x13+ and makes large-order interaction improvements come from Rust-side scene ownership instead of shell-side shortcuts.
 
 ## Next risks to validate
 
