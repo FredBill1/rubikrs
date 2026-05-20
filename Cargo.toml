@@ -29,9 +29,9 @@ bevy = { version = "0.18.1", default-features = false, features = [
   "std",
   "touch",
   "x11",
-  "webgpu",
+  "webgl2",
   "tonemapping_luts",
-  "zstd_rust"
+  "zstd_rust",
 ] }
 console_error_panic_hook = "0.1.7"
 js-sys = "0.3.82"
