@@ -933,7 +933,6 @@ pub fn start_app(canvas_id: &str, base_path: &str) {
                 canvas_face_tap_input,
                 animate_turn_visuals,
                 sync_cube_visuals,
-                sync_animation_shadow_quality,
             )
                 .chain(),
         )
@@ -1091,18 +1090,6 @@ fn setup_scene(
         .build(),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.78, 0.92, 0.0)),
     ));
-}
-
-fn sync_animation_shadow_quality(
-    sync_state: Res<'_, VisualSyncState>,
-    mut lights: Query<'_, '_, &mut DirectionalLight>,
-) {
-    let enable_shadows = sync_state.active_animation.is_none();
-    for mut light in &mut lights {
-        if light.shadows_enabled != enable_shadows {
-            light.shadows_enabled = enable_shadows;
-        }
-    }
 }
 
 fn sync_cube_visuals(
