@@ -224,7 +224,6 @@ select {
   content: '';
   background:
     linear-gradient(180deg, transparent 0%, rgba(246, 191, 66, 0.03) 46%, transparent 100%);
-  animation: scan 7s linear infinite;
 }
 
 .stage-canvas {
@@ -616,15 +615,6 @@ textarea {
 .status-bar-track::-webkit-scrollbar-thumb {
   background: rgba(246, 191, 66, 0.42);
   border: 2px solid rgba(9, 13, 21, 0.9);
-}
-
-@keyframes scan {
-  from {
-    transform: translateY(-100%);
-  }
-  to {
-    transform: translateY(100%);
-  }
 }
 
 @media (orientation: portrait), (max-width: 1080px) {
