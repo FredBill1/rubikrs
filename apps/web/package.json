@@ -10,9 +10,12 @@
     "build": "npm run build:wasm && tsc && vite build",
     "build:dev": "npm run build:wasm:dev && tsc && vite build",
     "check": "tsc --noEmit",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "benchmark:fps": "playwright test --config=playwright.fps.config.ts",
+    "benchmark:fps:headed": "playwright test --config=playwright.fps.config.ts --headed"
   },
   "devDependencies": {
+    "@playwright/test": "^1.55.0",
     "typescript": "~6.0.2",
     "vite": "^8.0.12"
   }

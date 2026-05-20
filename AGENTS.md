@@ -27,6 +27,7 @@ Run these from `apps/web`.
 | Development build | `npm run build:dev` | Builds wasm and TypeScript without WASM or Vite optimizations for faster iteration. |
 | TypeScript check | `npm run check` | This repository does not define a separate JS/TS lint script. |
 | Preview built site | `npm run preview` | Useful after `npm run build`. |
+| 17x17 FPS benchmark | `npm run benchmark:fps` | Builds the production web app, serves it with Vite preview, and runs the Playwright 1080p continuous-turn benchmark. |
 
 ## High-level architecture
 

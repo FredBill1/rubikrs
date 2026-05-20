@@ -44,10 +44,52 @@ type SolveWorkerResponse = {
   message: string
 }
 
+type FrameBenchmarkSummary = {
+  label: string
+  warmupFrames: number
+  sampledFrames: number
+  durationMs: number
+  averageFrameTimeMs: number
+  p50FrameTimeMs: number
+  p95FrameTimeMs: number
+  p99FrameTimeMs: number
+  averageFps: number
+  p50Fps: number
+  minFps: number
+  maxFps: number
+}
+
+type TurnBenchmarkSummary = FrameBenchmarkSummary & {
+  order: number
+  seed: number
+  maxWidth: number
+  turnsApplied: number
+  renderer: string
+}
+
+type BenchmarkSampleOptions = {
+  label?: string
+  warmupFrames?: number
+  sampleFrames?: number
+}
+
+type TurnBenchmarkOptions = BenchmarkSampleOptions & {
+  order?: number
+  seed?: number
+  maxWidth?: number
+}
+
+type RubikBenchmarkController = {
+  waitForReady: () => Promise<void>
+  measureAnimationFrameRate: (options?: BenchmarkSampleOptions) => Promise<FrameBenchmarkSummary>
+  runContinuousTurns: (options?: TurnBenchmarkOptions) => Promise<TurnBenchmarkSummary>
+}
+
 type RubikWasmModule = {
   default: () => Promise<unknown>
   start_app: (canvasId: string, basePath: string) => void
   runtime_status_json: () => string
+  animation_active?: () => boolean
   export_cube_state: () => string
   export_turn_history_json: () => string
   import_cube_state: (json: string) => boolean
@@ -57,6 +99,12 @@ type RubikWasmModule = {
   redo_turn: () => boolean
   scramble_cube: (length: number, seed: number | bigint) => boolean
   apply_turn: (faceCode: number, rotationCode: number, startLayer: number, width: number) => boolean
+}
+
+declare global {
+  interface Window {
+    __rubikrsBenchmark?: RubikBenchmarkController
+  }
 }
 
 const app = document.querySelector<HTMLDivElement>('#app')
@@ -74,6 +122,7 @@ let solverWorkers: Worker[] = []
 let activeSolveRequestId: number | null = null
 let activeSolveSceneRevision: number | null = null
 let nextSolveRequestId = 0
+let cachedRuntimeStatus: RuntimeStatus | null = null
 
 app.innerHTML = `
   <div class="shell">
@@ -334,6 +383,18 @@ function parseRuntimeStatus(raw: string): RuntimeStatus | null {
   }
 }
 
+function readRuntimeStatus(): RuntimeStatus | null {
+  if (!runtime) {
+    return cachedRuntimeStatus
+  }
+
+  const parsed = parseRuntimeStatus(runtime.runtime_status_json())
+  if (parsed) {
+    cachedRuntimeStatus = parsed
+  }
+  return parsed ?? cachedRuntimeStatus
+}
+
 function renderRuntimeStatus(status: RuntimeStatus | null): void {
   if (!status) {
     return
@@ -358,7 +419,7 @@ function syncStatus(): void {
     return
   }
 
-  const status = parseRuntimeStatus(runtime.runtime_status_json())
+  const status = readRuntimeStatus()
   if (!status) {
     return
   }
@@ -372,6 +433,25 @@ function syncStatus(): void {
   }
 
   renderRuntimeStatus(status)
+}
+
+function startStatusPolling(): void {
+  if (statusPollHandle !== null) {
+    window.clearInterval(statusPollHandle)
+  }
+
+  statusPollHandle = window.setInterval(() => {
+    syncStatus()
+  }, 100)
+}
+
+function stopStatusPolling(): boolean {
+  const wasRunning = statusPollHandle !== null
+  if (statusPollHandle !== null) {
+    window.clearInterval(statusPollHandle)
+    statusPollHandle = null
+  }
+  return wasRunning
 }
 
 function updateBootState(tone: BootTone, label: string, detail: string): void {
@@ -456,11 +536,246 @@ function syncSolveControls(): void {
 }
 
 function currentSceneRevision(): number | null {
-  if (!runtime) {
-    return null
+  return cachedRuntimeStatus?.scene_revision ?? readRuntimeStatus()?.scene_revision ?? null
+}
+
+function nextAnimationFrame(): Promise<number> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(resolve)
+  })
+}
+
+function percentile(sortedValues: number[], ratio: number): number {
+  if (sortedValues.length === 0) {
+    return 0
   }
 
-  return parseRuntimeStatus(runtime.runtime_status_json())?.scene_revision ?? null
+  const index = Math.min(
+    sortedValues.length - 1,
+    Math.max(0, Math.round((sortedValues.length - 1) * ratio))
+  )
+  return sortedValues[index]
+}
+
+function summarizeFrameDeltas(
+  label: string,
+  warmupFrames: number,
+  deltas: number[]
+): FrameBenchmarkSummary {
+  const sorted = [...deltas].sort((left, right) => left - right)
+  const durationMs = deltas.reduce((sum, delta) => sum + delta, 0)
+  const averageFrameTimeMs = durationMs / Math.max(1, deltas.length)
+  const p50FrameTimeMs = percentile(sorted, 0.5)
+  const p95FrameTimeMs = percentile(sorted, 0.95)
+  const p99FrameTimeMs = percentile(sorted, 0.99)
+  const minFrameTimeMs = sorted[0] ?? averageFrameTimeMs
+  const maxFrameTimeMs = sorted[sorted.length - 1] ?? averageFrameTimeMs
+
+  return {
+    label,
+    warmupFrames,
+    sampledFrames: deltas.length,
+    durationMs,
+    averageFrameTimeMs,
+    p50FrameTimeMs,
+    p95FrameTimeMs,
+    p99FrameTimeMs,
+    averageFps: 1000 / Math.max(averageFrameTimeMs, Number.EPSILON),
+    p50Fps: 1000 / Math.max(p50FrameTimeMs, Number.EPSILON),
+    minFps: 1000 / Math.max(maxFrameTimeMs, Number.EPSILON),
+    maxFps: 1000 / Math.max(minFrameTimeMs, Number.EPSILON),
+  }
+}
+
+async function captureFrameSummary(
+  label: string,
+  warmupFrames: number,
+  sampleFrames: number,
+  onFrame?: () => void
+): Promise<FrameBenchmarkSummary> {
+  return new Promise((resolve) => {
+    const deltas: number[] = []
+    let previousNow: number | null = null
+    let observedFrames = 0
+
+    const sample = (now: number): void => {
+      if (previousNow !== null) {
+        const delta = Math.max(0.0001, now - previousNow)
+        if (observedFrames >= warmupFrames) {
+          deltas.push(delta)
+        }
+        observedFrames += 1
+      }
+
+      previousNow = now
+      onFrame?.()
+
+      if (deltas.length >= sampleFrames) {
+        resolve(summarizeFrameDeltas(label, warmupFrames, deltas))
+        return
+      }
+
+      window.requestAnimationFrame(sample)
+    }
+
+    window.requestAnimationFrame(sample)
+  })
+}
+
+function createMulberry32(seed: number): () => number {
+  let state = seed >>> 0
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let result = Math.imul(state ^ (state >>> 15), 1 | state)
+    result ^= result + Math.imul(result ^ (result >>> 7), 61 | result)
+    return ((result ^ (result >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+function nextRandomTurn(
+  order: number,
+  maxWidth: number,
+  nextRandom: () => number
+): {
+  faceCode: number
+  rotationCode: number
+  startLayer: number
+  width: number
+} {
+  const boundedMaxWidth = Math.max(1, Math.min(maxWidth, order - 1))
+  const width = 1 + Math.floor(nextRandom() * boundedMaxWidth)
+  const startLayer = Math.floor(nextRandom() * Math.max(1, order - width + 1))
+  const rotations = [0, 1, 2] as const
+
+  return {
+    faceCode: Math.floor(nextRandom() * 6),
+    rotationCode: rotations[Math.floor(nextRandom() * rotations.length)] ?? 0,
+    startLayer,
+    width,
+  }
+}
+
+function detectWebGlRenderer(): string {
+  if (!stageCanvas) {
+    return 'canvas unavailable'
+  }
+
+  const context = stageCanvas.getContext('webgl2')
+  if (!context) {
+    return 'webgl2 unavailable'
+  }
+
+  const debugInfo = context.getExtension('WEBGL_debug_renderer_info')
+  if (debugInfo) {
+    const renderer = context.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)
+    if (typeof renderer === 'string' && renderer.length > 0) {
+      return renderer
+    }
+  }
+
+  const fallbackRenderer = context.getParameter(context.RENDERER)
+  return typeof fallbackRenderer === 'string' && fallbackRenderer.length > 0
+    ? fallbackRenderer
+    : 'unknown renderer'
+}
+
+function createBenchmarkController(module: RubikWasmModule): RubikBenchmarkController {
+  function isAnimationActive(): boolean {
+    return module.animation_active?.() ?? readRuntimeStatus()?.animation_active ?? false
+  }
+
+  async function waitForReady(): Promise<void> {
+    while (!readRuntimeStatus()) {
+      await nextAnimationFrame()
+    }
+  }
+
+  async function waitForAnimationIdle(): Promise<void> {
+    while (isAnimationActive()) {
+      await nextAnimationFrame()
+    }
+  }
+
+  async function prepareOrder(order: number): Promise<void> {
+    cancelActiveSolve('Benchmark run cancelled the in-flight solve request.')
+
+    const currentOrder = readRuntimeStatus()?.order ?? null
+    if (currentOrder !== order) {
+      module.set_cube_order(order)
+    } else {
+      module.reset_cube()
+    }
+
+    syncSolveControls()
+    syncStatus()
+    await waitForAnimationIdle()
+  }
+
+  return {
+    waitForReady,
+    async measureAnimationFrameRate(options = {}) {
+      await waitForReady()
+
+      return captureFrameSummary(
+        options.label ?? 'requestAnimationFrame',
+        options.warmupFrames ?? 120,
+        options.sampleFrames ?? 420
+      )
+    },
+    async runContinuousTurns(options = {}) {
+      await waitForReady()
+
+      const order = options.order ?? 17
+      const seed = options.seed ?? 20260520
+      const maxWidth = options.maxWidth ?? 2
+      const resumeStatusPolling = stopStatusPolling()
+
+      try {
+        await prepareOrder(order)
+
+        const nextRandom = createMulberry32(seed)
+        let turnsApplied = 0
+        const summary = await captureFrameSummary(
+          options.label ?? `${order}x${order}-continuous-turns`,
+          options.warmupFrames ?? 240,
+          options.sampleFrames ?? 1200,
+          () => {
+            if (isAnimationActive()) {
+              return
+            }
+
+            const turn = nextRandomTurn(order, maxWidth, nextRandom)
+            if (
+              module.apply_turn(
+                turn.faceCode,
+                turn.rotationCode,
+                turn.startLayer,
+                turn.width
+              )
+            ) {
+              turnsApplied += 1
+            }
+          }
+        )
+
+        const result: TurnBenchmarkSummary = {
+          ...summary,
+          order,
+          seed,
+          maxWidth,
+          turnsApplied,
+          renderer: detectWebGlRenderer(),
+        }
+
+        return result
+      } finally {
+        if (resumeStatusPolling) {
+          startStatusPolling()
+        }
+        syncStatus()
+      }
+    },
+  }
 }
 
 function activeSolveLaneCount(): number {
@@ -924,16 +1239,9 @@ async function bootstrapRuntime(): Promise<void> {
     updateBootState('booting', 'starting bevy', 'Binding the runtime to #rubik-canvas.')
     runtime.start_app('rubik-canvas', basePath)
     bindShellControls(runtime)
-    ensureSolverWorkers(activeSolveLaneCount())
+    window.__rubikrsBenchmark = createBenchmarkController(runtime)
     syncStatus()
-
-    if (statusPollHandle !== null) {
-      window.clearInterval(statusPollHandle)
-    }
-
-    statusPollHandle = window.setInterval(() => {
-      syncStatus()
-    }, 100)
+    startStatusPolling()
 
     updateBootState(
       'ready',
@@ -942,6 +1250,7 @@ async function bootstrapRuntime(): Promise<void> {
     )
   } catch (error) {
     console.error(error)
+    window.__rubikrsBenchmark = undefined
 
     const detail = error instanceof Error ? error.message : 'Unknown bootstrap error'
     updateBootState('fault', 'boot fault', detail)

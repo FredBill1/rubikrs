@@ -107,6 +107,8 @@ struct CubeVisualPool {
     pivot_entity: Option<Entity>,
     cubie_entities: Vec<Entity>,
     sticker_entities: Vec<Entity>,
+    cubie_slots: Vec<UVec3>,
+    sticker_slots: Vec<StickerSlotSpec>,
     sticker_materials: Option<[Handle<StandardMaterial>; 6]>,
 }
 
@@ -145,6 +147,11 @@ struct RuntimeSnapshot {
     state: CubeState,
     scene_revision: u64,
     transition: Option<RuntimeTransition>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeSceneMeta {
+    scene_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -687,6 +694,12 @@ impl RuntimeBridge {
         }
     }
 
+    fn scene_meta(&self) -> RuntimeSceneMeta {
+        RuntimeSceneMeta {
+            scene_revision: self.scene_revision,
+        }
+    }
+
     fn status(&self) -> RuntimeStatus {
         RuntimeStatus {
             order: self.engine.order().get(),
@@ -934,6 +947,11 @@ pub fn runtime_status_json() -> String {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub fn animation_active() -> bool {
+    with_runtime(|runtime| runtime.animation_active)
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn export_cube_state() -> String {
     with_runtime(|runtime| {
         runtime
@@ -1108,6 +1126,25 @@ fn sync_cube_visuals(
     >,
     existing_visual_roots: Query<'_, '_, Entity, With<CubeVisualRoot>>,
 ) {
+    let scene_meta = with_runtime(|runtime| runtime.scene_meta());
+
+    if let Some(active) = &sync_state.active_animation {
+        if scene_meta.scene_revision == active.scene_revision {
+            with_runtime_mut(|runtime| runtime.set_animation_active(true));
+            return;
+        }
+
+        sync_state.active_animation = None;
+        sync_state.rendered_revision = 0;
+        sync_state.completed_animation_revision = None;
+        with_runtime_mut(|runtime| runtime.set_animation_active(false));
+    }
+
+    if scene_meta.scene_revision == sync_state.rendered_revision {
+        with_runtime_mut(|runtime| runtime.set_animation_active(false));
+        return;
+    }
+
     let snapshot = with_runtime(|runtime| runtime.snapshot());
     let order = snapshot.state.order.get();
     let pending_animation = snapshot
@@ -1122,23 +1159,6 @@ fn sync_cube_visuals(
                 transition.animation.expect("filtered animation transition"),
             )
         });
-
-    if let Some(active) = &sync_state.active_animation {
-        if snapshot.scene_revision == active.scene_revision {
-            with_runtime_mut(|runtime| runtime.set_animation_active(true));
-            return;
-        }
-
-        sync_state.active_animation = None;
-        sync_state.rendered_revision = 0;
-        sync_state.completed_animation_revision = None;
-        with_runtime_mut(|runtime| runtime.set_animation_active(false));
-    }
-
-    if snapshot.scene_revision == sync_state.rendered_revision {
-        with_runtime_mut(|runtime| runtime.set_animation_active(false));
-        return;
-    }
 
     if cube_visual_pool_needs_rebuild(&pool, order, &existing_visual_roots) {
         clear_cube_visuals(&mut commands, &existing_visual_roots);
@@ -1328,12 +1348,15 @@ fn cube_visual_pool_needs_rebuild(
     existing_visual_roots: &Query<'_, '_, Entity, With<CubeVisualRoot>>,
 ) -> bool {
     let expected_stickers = Face::ALL.len() * usize::from(order) * usize::from(order);
+    let expected_cubies = surface_cubie_count(usize::from(order));
     pool.order != Some(order)
         || pool.root_entity.is_none()
         || pool.pivot_entity.is_none()
         || pool.root_entity.is_some_and(|entity| existing_visual_roots.get(entity).is_err())
         || pool.sticker_entities.len() != expected_stickers
-        || pool.cubie_entities.len() != surface_cubies(usize::from(order)).len()
+        || pool.sticker_slots.len() != expected_stickers
+        || pool.cubie_entities.len() != expected_cubies
+        || pool.cubie_slots.len() != expected_cubies
         || pool.sticker_materials.is_none()
 }
 
@@ -1399,19 +1422,24 @@ fn spawn_cube_visual_pool(
         cubie_body_size,
     ));
     let sticker_mesh = meshes.add(Cuboid::new(sticker_size, sticker_size, sticker_depth));
-    let surface_cubies = surface_cubies(order);
+    let cubie_slots = surface_cubies(order);
+    let sticker_slots = (0..state.stickers.len())
+        .map(|index| sticker_slot_from_index(index, order))
+        .collect::<Vec<_>>();
     let mut pool = CubeVisualPool {
         order: Some(state.order.get()),
         root_entity: Some(root),
         pivot_entity: Some(pivot),
-        cubie_entities: Vec::with_capacity(surface_cubies.len()),
-        sticker_entities: Vec::with_capacity(Face::ALL.len() * order * order),
+        cubie_entities: Vec::with_capacity(cubie_slots.len()),
+        sticker_entities: Vec::with_capacity(sticker_slots.len()),
+        cubie_slots: cubie_slots.clone(),
+        sticker_slots: sticker_slots.clone(),
         sticker_materials: Some(sticker_materials.clone()),
     };
     let mut animated_cubies = Vec::new();
     let mut animated_stickers = Vec::new();
 
-    for cubie in surface_cubies {
+    for cubie in cubie_slots {
         let is_animated =
             animation_turn.is_some_and(|turn| cubie_matches_turn(state.order.get(), turn, cubie));
         let target_parent = if is_animated { pivot } else { root };
@@ -1431,8 +1459,7 @@ fn spawn_cube_visual_pool(
         pool.cubie_entities.push(entity);
     }
 
-    for index in 0..state.stickers.len() {
-        let slot = sticker_slot_from_index(index, order);
+    for (index, slot) in sticker_slots.iter().copied().enumerate() {
         let is_animated = animation_turn
             .is_some_and(|turn| cubie_matches_turn(state.order.get(), turn, slot.cubie));
         let target_parent = if is_animated { pivot } else { root };
@@ -1526,17 +1553,27 @@ fn apply_cube_state_to_pool(
         *pivot_transform = Transform::default();
     }
 
-    for (entity, cubie) in pool.cubie_entities.iter().zip(surface_cubies(order)) {
-        if let Ok((mut visual, mut transform)) = cubie_visuals.get_mut(*entity) {
+    for (entity, cubie) in pool
+        .cubie_entities
+        .iter()
+        .copied()
+        .zip(pool.cubie_slots.iter().copied())
+    {
+        if let Ok((mut visual, mut transform)) = cubie_visuals.get_mut(entity) {
             visual.cubie = cubie;
             *transform = Transform::from_translation(cubie_body_translation(cubie, order, CUBE_FACE_SPAN));
-            commands.entity(*entity).insert(ChildOf(root_entity));
+            commands.entity(entity).insert(ChildOf(root_entity));
         }
     }
 
-    for (index, entity) in pool.sticker_entities.iter().enumerate() {
-        if let Ok((mut visual, mut transform, mut material)) = sticker_visuals.get_mut(*entity) {
-            let slot = sticker_slot_from_index(index, order);
+    for ((entity, slot), color) in pool
+        .sticker_entities
+        .iter()
+        .copied()
+        .zip(pool.sticker_slots.iter().copied())
+        .zip(state.stickers.iter().copied())
+    {
+        if let Ok((mut visual, mut transform, mut material)) = sticker_visuals.get_mut(entity) {
             *visual = StickerVisual {
                 face: slot.face,
                 row: slot.row as u8,
@@ -1552,8 +1589,8 @@ fn apply_cube_state_to_pool(
                 face_offset,
             );
             *transform = Transform::from_translation(translation).with_rotation(rotation);
-            material.0 = sticker_material_handle(sticker_materials, state.stickers[index]);
-            commands.entity(*entity).insert(ChildOf(root_entity));
+            material.0 = sticker_material_handle(sticker_materials, color);
+            commands.entity(entity).insert(ChildOf(root_entity));
         }
     }
 }
@@ -2504,21 +2541,25 @@ fn sticker_material_handle(
     .clone()
 }
 
+fn surface_cubie_count(order: usize) -> usize {
+    order.pow(3) - order.saturating_sub(2).pow(3)
+}
+
 fn surface_cubies(order: usize) -> Vec<UVec3> {
-    let mut surface_cubies = BTreeSet::new();
-    for face in Face::ALL {
-        for row in 0..order {
-            for col in 0..order {
-                let cubie = sticker_cubie_coord(face, row, col, order);
-                surface_cubies.insert((cubie.x, cubie.y, cubie.z));
+    let mut cubies = Vec::with_capacity(surface_cubie_count(order));
+    let max = order.saturating_sub(1);
+    for x in 0..order {
+        for y in 0..order {
+            for z in 0..order {
+                if x != 0 && x != max && y != 0 && y != max && z != 0 && z != max {
+                    continue;
+                }
+
+                cubies.push(UVec3::new(x as u32, y as u32, z as u32));
             }
         }
     }
-
-    surface_cubies
-        .into_iter()
-        .map(|(x, y, z)| UVec3::new(x, y, z))
-        .collect()
+    cubies
 }
 
 fn sticker_slot_from_index(index: usize, order: usize) -> StickerSlotSpec {
