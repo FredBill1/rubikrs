@@ -47,6 +47,7 @@ Benchmark parameters:
 | Iteration 2 | Remove the always-running 1080p stage scan animation so the compositor is not repainting a full translucent overlay every frame | 565.4 | 201.7 | 217.4 | 8.2 |
 | Iteration 3 | Replace 1,538 per-cubie body render entities with persistent static/animated merged body meshes and update them only at animation boundaries (average of two confirmation runs) | 571.6 | 285.0 | 307.8 | 4.8 |
 | Iteration 4 | Remove Bevy's `debug` feature from the shared production dependency set so release wasm no longer carries debug-only engine code paths (average of two confirmation runs) | 598.4 | 288.2 | 312.5 | 4.6 |
+| Iteration 5 | Skip the full `apply_cube_state_to_pool` reset when the visual pool already matches the pending animation source revision, so ordinary turn starts stop rewriting every sticker before reparenting the animated subset (average of two confirmation runs) | 575.4 | 299.4 | 307.8 | 3.8 |
 
 ## Change details
 
@@ -69,13 +70,20 @@ Iteration 4 is a build-configuration cleanup rather than a runtime behavior chan
 - the generated `rubik_app_bg.wasm` shrank from roughly **51.7 MB** to **50.2 MB** raw in the benchmark build
 - the runtime keeps the same lighting, shadows, animation timing, and shell behavior while shipping less engine code to the browser
 
+Iteration 5 removes a redundant sticker/body reset at the start of ordinary animated turns:
+
+- when the rendered visual pool is already at the immediately previous revision, `sync_cube_visuals` now skips the full `apply_cube_state_to_pool(from_state)` pass
+- that avoids rewriting every sticker transform/material and re-restoring the body mesh immediately before `begin_turn_animation()` reparents only the affected slice
+- the optimization preserves the same runtime state model and animation output, but cuts a large per-turn CPU spike from the average-frame path
+
 ## Result
 
-The benchmarked continuous 17x17 median throughput has improved in two measured steps so far:
+The benchmarked continuous 17x17 throughput has improved in five measured steps so far:
 
 - **192.3 FPS -> 196.1 FPS** from Rust runtime-sync and visual-pool caching
 - **196.1 FPS -> 217.4 FPS** from removing the full-stage scanline compositor animation
 - **217.4 FPS -> 307.8 FPS** p50 from merged body-mesh batching, with average throughput rising from **201.7 FPS -> 285.0 FPS**
 - **307.8 FPS -> 312.5 FPS** p50 from removing Bevy's production `debug` feature, with average throughput rising from **285.0 FPS -> 288.2 FPS**
+- **288.2 FPS -> 299.4 FPS** average from skipping redundant turn-start pool resets, while p95 frame time improved from **4.6 ms -> 3.8 ms**
 
-The current measured 1080p continuous-turn result is **312.5 FPS p50** with **288.2 FPS average** across two confirmation runs, and the benchmark still has verified headroom above refresh rate (`requestAnimationFrame` average **598.4 FPS** in the same browser session).
+The current measured 1080p continuous-turn result is **299.4 FPS average** and **307.8 FPS p50** across two confirmation runs, with one of those runs clearing **302.4 FPS average**. The benchmark still has verified headroom above refresh rate (`requestAnimationFrame` average **575.4 FPS** in the same browser session).

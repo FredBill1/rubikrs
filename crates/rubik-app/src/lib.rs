@@ -1197,15 +1197,17 @@ fn sync_cube_visuals(
     }
 
     if let Some((from_state, turn)) = pending_animation {
-        apply_cube_state_to_pool(
-            &mut commands,
-            &mut meshes,
-            &pool,
-            &from_state,
-            &mut sticker_visuals,
-            &mut pivots,
-            &mut visibilities,
-        );
+        if !pool_matches_pending_animation_source(&sync_state, snapshot.scene_revision) {
+            apply_cube_state_to_pool(
+                &mut commands,
+                &mut meshes,
+                &pool,
+                &from_state,
+                &mut sticker_visuals,
+                &mut pivots,
+                &mut visibilities,
+            );
+        }
         sync_state.active_animation = begin_turn_animation(
             &mut commands,
             &mut meshes,
@@ -1339,6 +1341,14 @@ fn clear_cube_visuals(
     for entity in existing_visual_roots.iter() {
         commands.entity(entity).despawn();
     }
+}
+
+fn pool_matches_pending_animation_source(
+    sync_state: &VisualSyncState,
+    pending_scene_revision: u64,
+) -> bool {
+    sync_state.rendered_revision != 0
+        && sync_state.rendered_revision.saturating_add(1) == pending_scene_revision
 }
 
 fn cubie_body_mesh_template(cubie_body_size: f32) -> BodyMeshTemplate {
@@ -3370,6 +3380,23 @@ mod tests {
     fn surface_cubies_only_counts_visible_shell_positions() {
         assert_eq!(surface_cubies(3).len(), 26);
         assert_eq!(surface_cubies(17).len(), 1_538);
+    }
+
+    #[test]
+    fn pending_animation_source_match_requires_adjacent_rendered_revision() {
+        let matching = VisualSyncState {
+            rendered_revision: 41,
+            ..Default::default()
+        };
+        let missing = VisualSyncState::default();
+        let skipped = VisualSyncState {
+            rendered_revision: 39,
+            ..Default::default()
+        };
+
+        assert!(super::pool_matches_pending_animation_source(&matching, 42));
+        assert!(!super::pool_matches_pending_animation_source(&missing, 42));
+        assert!(!super::pool_matches_pending_animation_source(&skipped, 42));
     }
 
     #[test]
