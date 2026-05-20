@@ -27,7 +27,7 @@ Run these from `apps/web`.
 | Development build | `npm run build:dev` | Builds wasm and TypeScript without WASM or Vite optimizations for faster iteration. |
 | TypeScript check | `npm run check` | This repository does not define a separate JS/TS lint script. |
 | Preview built site | `npm run preview` | Useful after `npm run build`. |
-| 17x17 FPS benchmark | `npm run benchmark:fps` | Builds the production web app, serves it with Vite preview, and runs the Playwright 1080p continuous-turn benchmark. |
+| 17x17 FPS benchmark | `npm run benchmark:fps` | Builds the production web app, serves it with Vite preview, and runs the Playwright 1080p benchmark covering raw rAF, single-turn continuous stress, and batched parallel-turn stress. |
 
 ## High-level architecture
 
@@ -59,6 +59,14 @@ The Bevy runtime exposes a wasm API that the shell calls directly:
 - user actions flow back through wasm entrypoints such as `apply_turn`, `scramble_cube`, `set_cube_order`, `undo_turn`, and `redo_turn`
 
 The shell treats the runtime as authoritative. It also watches `scene_revision` so any direct runtime change cancels in-flight solve work instead of replaying stale solver output onto a newer cube state.
+
+### Turn queue and parallel animation
+
+`apply_turn` now enqueues every turn into `RuntimeBridge.turn_queue` (a `VecDeque`). When no animation is active, `process_queue_head` dequeues a **compatible batch** — consecutive turns on the same face whose layer ranges `[start_layer, start_layer+width-1]` do not overlap. Compatible batch turns animate in parallel via temporary per-turn pivot entities (`begin_turn_batch_animation`). Incompatible turns wait in the queue until the active batch finishes.
+
+- Single-turn path (benchmarks, manual turns): unchanged — uses the pool's single pivot entity.
+- Multi-turn batch path (solve replay): spawns temporary pivots + animated body/sticker entities per turn, despawns them on completion.
+- The shell polls `queue_idle()` (new wasm export) to wait for all queued turns to drain, instead of fire-and-forget loops.
 
 ### Solver orchestration
 

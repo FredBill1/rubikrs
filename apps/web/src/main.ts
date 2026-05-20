@@ -79,10 +79,17 @@ type TurnBenchmarkOptions = BenchmarkSampleOptions & {
   maxWidth?: number
 }
 
+type BatchedTurnBenchmarkOptions = BenchmarkSampleOptions & {
+  order?: number
+  seed?: number
+  batchSize?: number
+}
+
 type RubikBenchmarkController = {
   waitForReady: () => Promise<void>
   measureAnimationFrameRate: (options?: BenchmarkSampleOptions) => Promise<FrameBenchmarkSummary>
   runContinuousTurns: (options?: TurnBenchmarkOptions) => Promise<TurnBenchmarkSummary>
+  runBatchedTurns: (options?: BatchedTurnBenchmarkOptions) => Promise<TurnBenchmarkSummary>
 }
 
 type RubikWasmModule = {
@@ -90,6 +97,7 @@ type RubikWasmModule = {
   start_app: (canvasId: string, basePath: string) => void
   runtime_status_json: () => string
   animation_active?: () => boolean
+  queue_idle?: () => boolean
   export_cube_state: () => string
   export_turn_history_json: () => string
   import_cube_state: (json: string) => boolean
@@ -775,6 +783,61 @@ function createBenchmarkController(module: RubikWasmModule): RubikBenchmarkContr
         syncStatus()
       }
     },
+    async runBatchedTurns(options = {}) {
+      await waitForReady()
+
+      const order = options.order ?? 17
+      const seed = options.seed ?? 20260520
+      const batchSize = Math.min(options.batchSize ?? 4, Math.floor(order / 2))
+      const resumeStatusPolling = stopStatusPolling()
+
+      try {
+        await prepareOrder(order)
+
+        let turnsApplied = 0
+
+        const summary = await captureFrameSummary(
+          options.label ?? `${order}x${order}-batched-turns-${batchSize}`,
+          options.warmupFrames ?? 240,
+          options.sampleFrames ?? 1200,
+          () => {
+            if (isAnimationActive() || !module.queue_idle?.()) {
+              return
+            }
+
+            const faceCode = 1 // R face
+            for (let i = 0; i < batchSize; i += 1) {
+              const startLayer = i * 2
+              if (startLayer >= order) {
+                break
+              }
+              const rotationCode = (i % 2 === 0) ? 1 : 2  // alternate CW/CCW
+              if (
+                module.apply_turn(faceCode, rotationCode, startLayer, 1)
+              ) {
+                turnsApplied += 1
+              }
+            }
+          }
+        )
+
+        const result: TurnBenchmarkSummary = {
+          ...summary,
+          order,
+          seed,
+          maxWidth: batchSize,
+          turnsApplied,
+          renderer: detectWebGlRenderer(),
+        }
+
+        return result
+      } finally {
+        if (resumeStatusPolling) {
+          startStatusPolling()
+        }
+        syncStatus()
+      }
+    },
   }
 }
 
@@ -852,6 +915,23 @@ function cancelActiveSolve(detail: string): void {
   finishSolveSession()
   terminateSolverWorkers()
   updateSolverState('cancelled', detail)
+}
+
+async function replaySolutionTurns(
+  module: RubikWasmModule,
+  turns: SolveTurn[],
+): Promise<void> {
+  for (const turn of turns) {
+    module.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
+  }
+
+  while (true) {
+    await nextAnimationFrame()
+    syncStatus()
+    if (module.queue_idle?.()) {
+      break
+    }
+  }
 }
 
 async function startSolve(module: RubikWasmModule): Promise<void> {
@@ -938,16 +1018,15 @@ async function startSolve(module: RubikWasmModule): Promise<void> {
       finishSolveSession()
 
       const notation = result.turns.map((turn) => turn.notation).join(' ')
-      for (const turn of result.turns) {
-        module.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
-      }
-      syncStatus()
-
       const suffix =
         result.turns.length > 0
           ? ` Applied ${result.turns.length} recorded inverse turn(s)${notation ? `: ${notation}.` : '.'}`
           : ' No turns were needed.'
       updateSolverState('solved', `${result.message}.${suffix}`)
+      syncStatus()
+      await replaySolutionTurns(module, result.turns)
+      syncStatus()
+
       return
     }
 
@@ -1027,11 +1106,6 @@ async function startSolve(module: RubikWasmModule): Promise<void> {
       finishSolveSession()
 
       const notation = solvedResult.turns.map((turn) => turn.notation).join(' ')
-      for (const turn of solvedResult.turns) {
-        module.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
-      }
-      syncStatus()
-
       const suffix =
         solvedResult.turns.length > 0
           ? ` Applied ${solvedResult.turns.length} turn(s) from the worker pool${notation ? `: ${notation}.` : '.'}`
@@ -1040,6 +1114,10 @@ async function startSolve(module: RubikWasmModule): Promise<void> {
         'solved',
         `${solvedResult.message}. Explored ${totalExplored.toLocaleString()} nodes across ${faceGroups.length} lane(s).${suffix}`
       )
+      syncStatus()
+      await replaySolutionTurns(module, solvedResult.turns)
+      syncStatus()
+
       return
     }
 
@@ -1099,16 +1177,15 @@ async function startSolve(module: RubikWasmModule): Promise<void> {
       finishSolveSession()
 
       const notation = fallbackResult.turns.map((turn) => turn.notation).join(' ')
-      for (const turn of fallbackResult.turns) {
-        module.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
-      }
-      syncStatus()
-
       const suffix =
         fallbackResult.turns.length > 0
           ? ` Applied ${fallbackResult.turns.length} fallback turn(s)${notation ? `: ${notation}.` : '.'}`
           : ' No turns were needed.'
       updateSolverState('solved', `${fallbackResult.message}.${suffix}`)
+      syncStatus()
+      await replaySolutionTurns(module, fallbackResult.turns)
+      syncStatus()
+
       return
     }
 

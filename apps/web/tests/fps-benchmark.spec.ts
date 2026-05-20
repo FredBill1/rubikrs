@@ -41,6 +41,14 @@ type BenchmarkController = {
     sampleFrames?: number
     maxWidth?: number
   }) => Promise<TurnBenchmarkSummary>
+  runBatchedTurns: (options?: {
+    label?: string
+    order?: number
+    seed?: number
+    warmupFrames?: number
+    sampleFrames?: number
+    batchSize?: number
+  }) => Promise<TurnBenchmarkSummary>
 }
 
 declare global {
@@ -86,6 +94,17 @@ test.describe('17x17 FPS benchmark', () => {
       expect(stress.p50Fps).toBeGreaterThanOrEqual(targetFps)
     }
 
+    const batched = await page.evaluate(() =>
+      window.__rubikrsBenchmark!.runBatchedTurns({
+        label: '17x17-batched-parallel-turns',
+        order: 17,
+        seed: 20260520,
+        warmupFrames: 240,
+        sampleFrames: 1200,
+        batchSize: 4,
+      })
+    )
+
     const output = {
       generatedAt: new Date().toISOString(),
       browserName: testInfo.project.name,
@@ -95,6 +114,7 @@ test.describe('17x17 FPS benchmark', () => {
       },
       raf,
       stress,
+      batched,
     }
 
     const outputDir = path.resolve(process.cwd(), 'benchmark-results')

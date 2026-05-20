@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{cell::RefCell, collections::BTreeSet};
+use std::{cell::RefCell, collections::{BTreeSet, VecDeque}};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -106,8 +106,9 @@ struct DirectTurnInputState {
 #[derive(Resource, Default)]
 struct VisualSyncState {
     rendered_revision: u64,
-    active_animation: Option<ActiveTurnAnimation>,
+    active_animations: Vec<ActiveTurnAnimation>,
     completed_animation_revision: Option<u64>,
+    temp_pivot_entities: Vec<Entity>,
 }
 
 #[derive(Resource, Default)]
@@ -137,6 +138,7 @@ struct RuntimeBridge {
     timer: RuntimeTimer,
     last_transition: Option<RuntimeTransition>,
     animation_active: bool,
+    turn_queue: VecDeque<TurnCommand>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,7 +177,7 @@ struct RuntimeSceneMeta {
 struct RuntimeTransition {
     scene_revision: u64,
     from_state: CubeState,
-    animation: Option<TurnCommand>,
+    animation: Vec<TurnCommand>,
 }
 
 #[derive(Debug, Clone)]
@@ -699,6 +701,7 @@ impl RuntimeBridge {
             timer: RuntimeTimer::default(),
             last_transition: None,
             animation_active: false,
+            turn_queue: VecDeque::new(),
         }
     }
 
@@ -756,7 +759,7 @@ impl RuntimeBridge {
             .sync(self.engine.move_count(), self.engine.is_solved());
     }
 
-    fn record_transition(&mut self, from_state: CubeState, animation: Option<TurnCommand>) {
+    fn record_transition(&mut self, from_state: CubeState, animation: Vec<TurnCommand>) {
         self.last_transition = Some(RuntimeTransition {
             scene_revision: self.scene_revision,
             from_state,
@@ -765,12 +768,91 @@ impl RuntimeBridge {
         self.animation_active = false;
     }
 
+    fn turn_layer_range(order: u8, turn: TurnCommand) -> (u8, u8) {
+        match turn.face {
+            Face::Up | Face::Right | Face::Front => {
+                let max_world = order.saturating_sub(1);
+                let max_layer = max_world.saturating_sub(turn.start_layer);
+                let min_layer = max_layer.saturating_sub(turn.width.saturating_sub(1));
+                (min_layer, max_layer)
+            }
+            Face::Down | Face::Left | Face::Back => {
+                let min_layer = turn.start_layer;
+                let max_layer = min_layer.saturating_add(turn.width.saturating_sub(1));
+                (min_layer, max_layer)
+            }
+        }
+    }
+
+    fn turns_share_axis(a: Face, b: Face) -> bool {
+        matches!(
+            (a, b),
+            (Face::Up, Face::Up)
+                | (Face::Up, Face::Down)
+                | (Face::Down, Face::Up)
+                | (Face::Down, Face::Down)
+                | (Face::Right, Face::Right)
+                | (Face::Right, Face::Left)
+                | (Face::Left, Face::Right)
+                | (Face::Left, Face::Left)
+                | (Face::Front, Face::Front)
+                | (Face::Front, Face::Back)
+                | (Face::Back, Face::Front)
+                | (Face::Back, Face::Back)
+        )
+    }
+
+    fn turns_compatible(order: u8, a: TurnCommand, b: TurnCommand) -> bool {
+        if !Self::turns_share_axis(a.face, b.face) {
+            return false;
+        }
+        let (a_min, a_max) = Self::turn_layer_range(order, a);
+        let (b_min, b_max) = Self::turn_layer_range(order, b);
+        a_max < b_min || b_max < a_min
+    }
+
+    fn dequeue_compatible_batch(&mut self) -> Vec<TurnCommand> {
+        let order = self.engine.order().get();
+        let mut batch: Vec<TurnCommand> = Vec::new();
+        while let Some(candidate) = self.turn_queue.front().copied() {
+            if batch
+                .iter()
+                .all(|t: &TurnCommand| Self::turns_compatible(order, *t, candidate))
+            {
+                batch.push(
+                    self.turn_queue
+                        .pop_front()
+                        .expect("front exists but pop failed"),
+                );
+            } else {
+                break;
+            }
+        }
+        batch
+    }
+
+    fn process_queue_head(&mut self) {
+        let batch = self.dequeue_compatible_batch();
+        if batch.is_empty() {
+            return;
+        }
+        let from_state = self.engine.state().clone();
+        for turn in &batch {
+            if self.engine.apply_turn(*turn).is_err() {
+                self.set_message(format!("Failed to apply queued turn {}.", format_turn(*turn)));
+                continue;
+            }
+        }
+        self.bump_scene();
+        self.record_transition(from_state, batch);
+    }
+
     fn set_order(&mut self, order: CubeOrder) {
         let from_state = self.engine.state().clone();
         self.engine = CubeEngine::new(order);
         self.timer.reset();
         self.bump_scene();
-        self.record_transition(from_state, None);
+        self.record_transition(from_state, Vec::new());
         self.set_message(format!("Switched to {}x{}.", order.get(), order.get()));
     }
 
@@ -779,18 +861,13 @@ impl RuntimeBridge {
         self.engine.reset();
         self.timer.reset();
         self.bump_scene();
-        self.record_transition(from_state, None);
+        self.record_transition(from_state, Vec::new());
         self.set_message("Reset cube to solved state.");
     }
 
     fn apply_turn(&mut self, turn: TurnCommand) -> Result<(), String> {
-        let from_state = self.engine.state().clone();
-        self.engine
-            .apply_turn(turn)
-            .map_err(|error| error.to_string())?;
-        self.bump_scene();
-        self.record_transition(from_state, Some(turn));
-        self.set_message(format!("Applied {}.", format_turn(turn)));
+        self.turn_queue.push_back(turn);
+        self.set_message(format!("Queued {}.", format_turn(turn)));
         Ok(())
     }
 
@@ -798,7 +875,7 @@ impl RuntimeBridge {
         let from_state = self.engine.state().clone();
         let turn = self.engine.undo().map_err(|error| error.to_string())?;
         self.bump_scene();
-        self.record_transition(from_state, Some(turn.inverse()));
+        self.record_transition(from_state, vec![turn.inverse()]);
         self.set_message(format!("Undid {}.", format_turn(turn)));
         Ok(())
     }
@@ -807,7 +884,7 @@ impl RuntimeBridge {
         let from_state = self.engine.state().clone();
         let turn = self.engine.redo().map_err(|error| error.to_string())?;
         self.bump_scene();
-        self.record_transition(from_state, Some(turn));
+        self.record_transition(from_state, vec![turn]);
         self.set_message(format!("Redid {}.", format_turn(turn)));
         Ok(())
     }
@@ -819,7 +896,7 @@ impl RuntimeBridge {
             .scramble_with_seed(length.max(1), seed)
             .map_err(|error| error.to_string())?;
         self.bump_scene();
-        self.record_transition(from_state, None);
+        self.record_transition(from_state, Vec::new());
         self.set_message(format!(
             "Applied scramble ({} turns, seed {}).",
             scramble.len(),
@@ -834,7 +911,7 @@ impl RuntimeBridge {
         self.engine = CubeEngine::from_state(state).map_err(|error| error.to_string())?;
         self.timer.reset();
         self.bump_scene();
-        self.record_transition(from_state, None);
+        self.record_transition(from_state, Vec::new());
         self.set_message(format!(
             "Imported {}x{} sticker state.",
             self.engine.order().get(),
@@ -965,6 +1042,11 @@ pub fn runtime_status_json() -> String {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn animation_active() -> bool {
     with_runtime(|runtime| runtime.animation_active)
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub fn queue_idle() -> bool {
+    with_runtime(|runtime| runtime.turn_queue.is_empty() && !runtime.animation_active)
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -1129,18 +1211,39 @@ fn sync_cube_visuals(
 ) {
     let scene_meta = with_runtime(|runtime| runtime.scene_meta());
 
-    if let Some(active) = &sync_state.active_animation {
-        if scene_meta.scene_revision == active.scene_revision {
+    if !sync_state.active_animations.is_empty() {
+        let all_match = sync_state
+            .active_animations
+            .iter()
+            .any(|a| a.scene_revision == scene_meta.scene_revision);
+        if all_match {
             with_runtime_mut(|runtime| runtime.set_animation_active(true));
             return;
         }
 
-        sync_state.active_animation = None;
+        for &entity in &sync_state.temp_pivot_entities {
+            commands.entity(entity).despawn();
+        }
+        sync_state.active_animations.clear();
+        sync_state.temp_pivot_entities.clear();
         sync_state.rendered_revision = 0;
         sync_state.completed_animation_revision = None;
         with_runtime_mut(|runtime| runtime.set_animation_active(false));
     }
 
+    if scene_meta.scene_revision == sync_state.rendered_revision {
+        let should_drain = with_runtime(|runtime| {
+            !runtime.turn_queue.is_empty() && !runtime.animation_active
+        });
+        if should_drain {
+            with_runtime_mut(|runtime| runtime.process_queue_head());
+        } else {
+            with_runtime_mut(|runtime| runtime.set_animation_active(false));
+            return;
+        }
+    }
+
+    let scene_meta = with_runtime(|runtime| runtime.scene_meta());
     if scene_meta.scene_revision == sync_state.rendered_revision {
         with_runtime_mut(|runtime| runtime.set_animation_active(false));
         return;
@@ -1148,49 +1251,45 @@ fn sync_cube_visuals(
 
     let snapshot = with_runtime(|runtime| runtime.snapshot());
     let order = snapshot.state.order.get();
-    let pending_animation = snapshot
+    let pending_turns: Option<(CubeState, Vec<TurnCommand>)> = snapshot
         .transition
         .as_ref()
         .filter(|transition| transition.scene_revision == snapshot.scene_revision)
-        .filter(|transition| transition.animation.is_some())
+        .filter(|transition| !transition.animation.is_empty())
         .filter(|_| sync_state.completed_animation_revision != Some(snapshot.scene_revision))
-        .map(|transition| {
-            (
-                transition.from_state.clone(),
-                transition.animation.expect("filtered animation transition"),
-            )
-        });
+        .map(|transition| (transition.from_state.clone(), transition.animation.clone()));
 
     if cube_visual_pool_needs_rebuild(&pool, order, &existing_visual_roots) {
         clear_cube_visuals(&mut commands, &existing_visual_roots);
-        let source_state = pending_animation
+        let source_state = pending_turns
             .as_ref()
             .map(|(state, _)| state)
             .unwrap_or(&snapshot.state);
-        let animation_turn = pending_animation.as_ref().map(|(_, turn)| *turn);
-        let (new_pool, new_animation) = spawn_cube_visual_pool(
+        let animation_turns = pending_turns.as_ref().map(|(_, turns)| turns.clone());
+        let (new_pool, new_animations) = spawn_cube_visual_pool(
             &mut commands,
             &mut meshes,
             &mut materials,
             source_state,
-            animation_turn,
+            animation_turns,
             snapshot.scene_revision,
         );
         *pool = new_pool;
-        sync_state.active_animation = new_animation;
+        sync_state.active_animations = new_animations;
+        sync_state.temp_pivot_entities.clear();
         sync_state.completed_animation_revision = None;
-        sync_state.rendered_revision = if sync_state.active_animation.is_some() {
-            0
-        } else {
+        sync_state.rendered_revision = if sync_state.active_animations.is_empty() {
             snapshot.scene_revision
+        } else {
+            0
         };
         with_runtime_mut(|runtime| {
-            runtime.set_animation_active(sync_state.active_animation.is_some())
+            runtime.set_animation_active(!sync_state.active_animations.is_empty())
         });
         return;
     }
 
-    if let Some((from_state, turn)) = pending_animation {
+    if let Some((from_state, turns)) = pending_turns {
         if !pool_matches_pending_animation_source(&sync_state, snapshot.scene_revision) {
             apply_cube_state_to_pool(
                 &mut meshes,
@@ -1200,23 +1299,26 @@ fn sync_cube_visuals(
                 &mut visibilities,
             );
         }
-        sync_state.active_animation = begin_turn_animation(
+        begin_turn_batch_animation(
+            &mut commands,
             &mut meshes,
+            &mut materials,
             &pool,
             order,
-            turn,
+            &turns,
             snapshot.scene_revision,
             &mut pivots,
             &mut visibilities,
+            &mut sync_state,
         );
         sync_state.completed_animation_revision = None;
-        sync_state.rendered_revision = if sync_state.active_animation.is_some() {
-            0
-        } else {
+        sync_state.rendered_revision = if sync_state.active_animations.is_empty() {
             snapshot.scene_revision
+        } else {
+            0
         };
         with_runtime_mut(|runtime| {
-            runtime.set_animation_active(sync_state.active_animation.is_some())
+            runtime.set_animation_active(!sync_state.active_animations.is_empty())
         });
         return;
     }
@@ -1235,6 +1337,7 @@ fn sync_cube_visuals(
 
 fn animate_turn_visuals(
     time: Res<'_, Time>,
+    mut commands: Commands<'_, '_>,
     mut meshes: ResMut<'_, Assets<Mesh>>,
     mut pool: ResMut<'_, CubeVisualPool>,
     mut sync_state: ResMut<'_, VisualSyncState>,
@@ -1250,54 +1353,88 @@ fn animate_turn_visuals(
     >,
     mut visibilities: Query<'_, '_, &mut Visibility>,
 ) {
-    let completed_animation = {
-        let Some(animation) = sync_state.active_animation.as_mut() else {
-            return;
-        };
+    if sync_state.active_animations.is_empty() {
+        return;
+    }
 
-        let Ok(mut pivot_transform) = pivots.get_mut(animation.pivot_entity) else {
-            sync_state.active_animation = None;
-            sync_state.rendered_revision = 0;
-            sync_state.completed_animation_revision = None;
-            with_runtime_mut(|runtime| runtime.set_animation_active(false));
-            return;
-        };
+    let delta = time.delta_secs();
+    let order = pool.order.expect("pool root implies order");
 
-        animation.elapsed_secs =
-            (animation.elapsed_secs + time.delta_secs()).min(animation.duration_secs);
-        let progress = if animation.duration_secs <= f32::EPSILON {
-            1.0
+    let mut completed_animations: Vec<ActiveTurnAnimation> = Vec::new();
+    let mut still_active: Vec<ActiveTurnAnimation> = Vec::new();
+
+    for mut animation in sync_state.active_animations.drain(..) {
+        if let Ok(mut pivot_transform) = pivots.get_mut(animation.pivot_entity) {
+            animation.elapsed_secs = (animation.elapsed_secs + delta).min(animation.duration_secs);
+            let progress = if animation.duration_secs <= f32::EPSILON {
+                1.0
+            } else {
+                animation.elapsed_secs / animation.duration_secs
+            };
+            let eased = ease_in_out_cubic(progress);
+            pivot_transform.rotation =
+                Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
+
+            if progress < 1.0 {
+                pivot_transform.rotation = Quat::from_axis_angle(
+                    animation.axis,
+                    animation.angle_radians * eased,
+                );
+                still_active.push(animation);
+            } else {
+                pivot_transform.rotation = Quat::IDENTITY;
+                completed_animations.push(animation);
+            }
         } else {
-            animation.elapsed_secs / animation.duration_secs
-        };
-        let eased = ease_in_out_cubic(progress);
-        pivot_transform.rotation =
-            Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
+            completed_animations.push(animation);
+        }
+    }
 
-        if progress < 1.0 {
-            return;
+    sync_state.active_animations = still_active;
+
+    if completed_animations.is_empty() {
+        return;
+    }
+
+    for animation in &completed_animations {
+        for index in &animation.animated_stickers {
+            let rotated = rotate_sticker_visual_for_turn(
+                order,
+                animation.turn,
+                pool.sticker_visual_states[*index],
+            );
+            pool.sticker_visual_states[*index] = rotated;
+        }
+    }
+
+    if sync_state.active_animations.is_empty() {
+        for &entity in &sync_state.temp_pivot_entities {
+            commands.entity(entity).despawn();
+        }
+        sync_state.temp_pivot_entities.clear();
+
+        if let Some(animated_body) = pool.animated_body_entity {
+            if let Ok(mut visibility) = visibilities.get_mut(animated_body) {
+                *visibility = Visibility::Hidden;
+            }
+        }
+        if let Some(animated_sticker) = pool.animated_sticker_entity {
+            if let Ok(mut visibility) = visibilities.get_mut(animated_sticker) {
+                *visibility = Visibility::Hidden;
+            }
         }
 
-        pivot_transform.rotation = Quat::IDENTITY;
-        animation.clone()
-    };
+        restore_resting_body_meshes(&mut meshes, &pool, &mut visibilities);
+        restore_resting_sticker_meshes(&mut meshes, &pool, &mut visibilities);
 
-    let order = pool.order.expect("pool root implies order");
-    for index in &completed_animation.animated_stickers {
-        let rotated = rotate_sticker_visual_for_turn(
-            order,
-            completed_animation.turn,
-            pool.sticker_visual_states[*index],
-        );
-        pool.sticker_visual_states[*index] = rotated;
+        let scene_revision = completed_animations[0].scene_revision;
+        sync_state.rendered_revision = scene_revision;
+        sync_state.completed_animation_revision = Some(scene_revision);
+        with_runtime_mut(|runtime| {
+            runtime.set_animation_active(false);
+            runtime.process_queue_head();
+        });
     }
-    restore_resting_body_meshes(&mut meshes, &pool, &mut visibilities);
-    restore_resting_sticker_meshes(&mut meshes, &pool, &mut visibilities);
-
-    sync_state.active_animation = None;
-    sync_state.rendered_revision = completed_animation.scene_revision;
-    sync_state.completed_animation_revision = Some(completed_animation.scene_revision);
-    with_runtime_mut(|runtime| runtime.set_animation_active(false));
 }
 
 fn clear_cube_visuals(
@@ -1632,9 +1769,10 @@ fn spawn_cube_visual_pool(
     meshes: &mut ResMut<'_, Assets<Mesh>>,
     materials: &mut ResMut<'_, Assets<StandardMaterial>>,
     state: &CubeState,
-    animation_turn: Option<TurnCommand>,
+    animation_turns: Option<Vec<TurnCommand>>,
     scene_revision: u64,
-) -> (CubeVisualPool, Option<ActiveTurnAnimation>) {
+) -> (CubeVisualPool, Vec<ActiveTurnAnimation>) {
+    let first_animation_turn = animation_turns.as_ref().and_then(|v| v.first().copied());
     let order = usize::from(state.order.get());
     let face_span = CUBE_FACE_SPAN;
     let step = face_span / order as f32;
@@ -1653,7 +1791,7 @@ fn spawn_cube_visual_pool(
         cuboid_mesh_template(cubie_body_size, cubie_body_size, cubie_body_size);
     let sticker_mesh_template = cuboid_mesh_template(sticker_size, sticker_size, sticker_depth);
     let (static_body_cubies, animated_body_cubies) =
-        partition_body_cubies(&cubie_slots, state.order.get(), animation_turn);
+        partition_body_cubies(&cubie_slots, state.order.get(), first_animation_turn);
     let static_body_mesh = meshes.add(merged_cubie_body_mesh(
         &body_mesh_template,
         &static_body_cubies,
@@ -1729,7 +1867,7 @@ fn spawn_cube_visual_pool(
         &sticker_visual_states,
         &sticker_colors,
         state.order.get(),
-        animation_turn,
+        first_animation_turn,
     );
     let static_sticker_mesh = meshes.add(merged_sticker_mesh(
         &sticker_mesh_template,
@@ -1814,17 +1952,20 @@ fn spawn_cube_visual_pool(
         sticker_slots: sticker_slots.clone(),
     };
 
-    let active_animation = animation_turn.map(|turn| ActiveTurnAnimation {
-        scene_revision,
-        pivot_entity: pivot,
-        turn,
-        animated_stickers: animated_sticker_indices,
-        angle_radians: turn_rotation_angle(turn),
-        axis: turn_rotation_axis(turn.face),
-        elapsed_secs: 0.0,
-        duration_secs: turn_animation_duration_secs(turn),
-    });
-    (pool, active_animation)
+    let active_animations: Vec<ActiveTurnAnimation> = first_animation_turn
+        .map(|turn| ActiveTurnAnimation {
+            scene_revision,
+            pivot_entity: pivot,
+            turn,
+            animated_stickers: animated_sticker_indices,
+            angle_radians: turn_rotation_angle(turn),
+            axis: turn_rotation_axis(turn.face),
+            elapsed_secs: 0.0,
+            duration_secs: turn_animation_duration_secs(turn),
+        })
+        .into_iter()
+        .collect();
+    (pool, active_animations)
 }
 
 fn apply_cube_state_to_pool(
@@ -1868,11 +2009,13 @@ fn apply_cube_state_to_pool(
     restore_resting_sticker_meshes(meshes, pool, visibilities);
 }
 
-fn begin_turn_animation(
+fn begin_turn_batch_animation(
+    commands: &mut Commands<'_, '_>,
     meshes: &mut ResMut<'_, Assets<Mesh>>,
+    materials: &mut ResMut<'_, Assets<StandardMaterial>>,
     pool: &CubeVisualPool,
     order: u8,
-    turn: TurnCommand,
+    turns: &[TurnCommand],
     scene_revision: u64,
     pivots: &mut Query<
         '_,
@@ -1885,48 +2028,250 @@ fn begin_turn_animation(
         ),
     >,
     visibilities: &mut Query<'_, '_, &mut Visibility>,
-) -> Option<ActiveTurnAnimation> {
-    let pivot_entity = pool.pivot_entity?;
-    if let Ok(mut pivot_transform) = pivots.get_mut(pivot_entity) {
-        *pivot_transform = Transform::default();
+    sync_state: &mut VisualSyncState,
+) {
+    if turns.is_empty() {
+        sync_state.active_animations.clear();
+        return;
     }
-    let (static_body_cubies, animated_body_cubies) =
-        partition_body_cubies(&pool.cubie_slots, order, Some(turn));
-    apply_body_mesh_partition(
-        meshes,
-        pool,
+
+    if turns.len() == 1 {
+        let turn = turns[0];
+        let pivot_entity = pool.pivot_entity.expect("pool has pivot");
+        if let Ok(mut pivot_transform) = pivots.get_mut(pivot_entity) {
+            *pivot_transform = Transform::default();
+        }
+        let (static_body_cubies, animated_body_cubies) =
+            partition_body_cubies(&pool.cubie_slots, order, Some(turn));
+        apply_body_mesh_partition(
+            meshes,
+            pool,
+            &static_body_cubies,
+            &animated_body_cubies,
+            visibilities,
+        );
+        let (static_stickers, animated_stickers, animated_sticker_indices) =
+            partition_sticker_visuals(
+                &pool.sticker_visual_states,
+                &pool.sticker_colors,
+                order,
+                Some(turn),
+            );
+        apply_sticker_mesh_partition(
+            meshes,
+            pool,
+            &static_stickers,
+            &animated_stickers,
+            visibilities,
+        );
+
+        if animated_body_cubies.is_empty() && animated_sticker_indices.is_empty() {
+            sync_state.active_animations.clear();
+            return;
+        }
+
+        sync_state.active_animations = vec![ActiveTurnAnimation {
+            scene_revision,
+            pivot_entity,
+            turn,
+            animated_stickers: animated_sticker_indices,
+            angle_radians: turn_rotation_angle(turn),
+            axis: turn_rotation_axis(turn.face),
+            elapsed_secs: 0.0,
+            duration_secs: turn_animation_duration_secs(turn),
+        }];
+        return;
+    }
+
+    let root_entity = pool.root_entity.expect("pool has root");
+    let face_span = CUBE_FACE_SPAN;
+    let body_template = pool.body_mesh_template.as_ref().expect("pool has body template");
+    let sticker_template = pool.sticker_mesh_template.as_ref().expect("pool has sticker template");
+    let face_offset = cube_face_offset(order);
+
+    if let Some(animated_body) = pool.animated_body_entity {
+        if let Ok(mut visibility) = visibilities.get_mut(animated_body) {
+            *visibility = Visibility::Hidden;
+        }
+    }
+    if let Some(animated_sticker) = pool.animated_sticker_entity {
+        if let Ok(mut visibility) = visibilities.get_mut(animated_sticker) {
+            *visibility = Visibility::Hidden;
+        }
+    }
+
+    let mut animated_cubies_set: Vec<UVec3> = Vec::new();
+    for &turn in turns {
+        for cubie in &pool.cubie_slots {
+            if cubie_matches_turn(order, turn, *cubie) {
+                if !animated_cubies_set.contains(cubie) {
+                    animated_cubies_set.push(*cubie);
+                }
+            }
+        }
+    }
+
+    let static_body_cubies: Vec<UVec3> = pool
+        .cubie_slots
+        .iter()
+        .filter(|c| !animated_cubies_set.contains(c))
+        .copied()
+        .collect();
+
+    let static_sticker_data: Vec<(StickerVisual, StickerColor)> = pool
+        .sticker_visual_states
+        .iter()
+        .zip(pool.sticker_colors.iter())
+        .filter(|(v, _)| !animated_cubies_set.contains(&v.cubie))
+        .map(|(v, c)| (*v, *c))
+        .collect();
+
+    let static_body_mesh_data = merged_cubie_body_mesh(
+        body_template,
         &static_body_cubies,
-        &animated_body_cubies,
-        visibilities,
+        order as usize,
+        face_span,
     );
-    let (static_stickers, animated_stickers, animated_sticker_indices) = partition_sticker_visuals(
-        &pool.sticker_visual_states,
-        &pool.sticker_colors,
-        order,
-        Some(turn),
-    );
-    apply_sticker_mesh_partition(
-        meshes,
-        pool,
-        &static_stickers,
-        &animated_stickers,
-        visibilities,
+    let static_sticker_mesh_data = merged_sticker_mesh(
+        sticker_template,
+        &static_sticker_data,
+        order as usize,
+        face_span,
+        face_offset,
     );
 
-    if animated_body_cubies.is_empty() && animated_sticker_indices.is_empty() {
-        return None;
+    if let Some((body_handle, _)) = pool.body_mesh_handles.as_ref() {
+        if let Some(body_mesh) = meshes.get_mut(body_handle) {
+            *body_mesh = static_body_mesh_data;
+        }
+    }
+    if let Some((sticker_handle, _)) = pool.sticker_mesh_handles.as_ref() {
+        if let Some(sticker_mesh) = meshes.get_mut(sticker_handle) {
+            *sticker_mesh = static_sticker_mesh_data;
+        }
     }
 
-    Some(ActiveTurnAnimation {
-        scene_revision,
-        pivot_entity,
-        turn,
-        animated_stickers: animated_sticker_indices,
-        angle_radians: turn_rotation_angle(turn),
-        axis: turn_rotation_axis(turn.face),
-        elapsed_secs: 0.0,
-        duration_secs: turn_animation_duration_secs(turn),
-    })
+    let shell_material = materials.add(StandardMaterial {
+        base_color: Color::srgb_u8(17, 21, 29),
+        metallic: 0.18,
+        perceptual_roughness: 0.58,
+        reflectance: 0.3,
+        ..default()
+    });
+    let sticker_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        metallic: 0.06,
+        perceptual_roughness: 0.21,
+        ..default()
+    });
+
+    let all_sticker_pairs: Vec<(StickerVisual, StickerColor)> = pool
+        .sticker_visual_states
+        .iter()
+        .zip(pool.sticker_colors.iter())
+        .map(|(v, c)| (*v, *c))
+        .collect();
+
+    let mut animations: Vec<ActiveTurnAnimation> = Vec::new();
+    let mut temp_entities: Vec<Entity> = Vec::new();
+
+    for &turn in turns {
+        let (_, animated_body_cubies) =
+            partition_body_cubies(&pool.cubie_slots, order, Some(turn));
+        let animated_body_mesh_data = if animated_body_cubies.is_empty() {
+            merged_cubie_body_mesh(body_template, &pool.cubie_slots, order as usize, face_span)
+        } else {
+            merged_cubie_body_mesh(body_template, &animated_body_cubies, order as usize, face_span)
+        };
+        let animated_body_handle = meshes.add(animated_body_mesh_data);
+
+        let (_, animated_sticker_data, animated_sticker_indices) = partition_sticker_visuals(
+            &pool.sticker_visual_states,
+            &pool.sticker_colors,
+            order,
+            Some(turn),
+        );
+        let animated_sticker_mesh_data = if animated_sticker_data.is_empty() {
+            merged_sticker_mesh(
+                sticker_template,
+                &all_sticker_pairs,
+                order as usize,
+                face_span,
+                face_offset,
+            )
+        } else {
+            merged_sticker_mesh(
+                sticker_template,
+                &animated_sticker_data,
+                order as usize,
+                face_span,
+                face_offset,
+            )
+        };
+        let animated_sticker_handle = meshes.add(animated_sticker_mesh_data);
+
+        let pivot_entity = commands
+            .spawn((
+                CubeVisual,
+                TurnAnimationPivot,
+                Name::new(format!("batch-anim-pivot-{}", animations.len())),
+                Transform::default(),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+                ViewVisibility::default(),
+                ChildOf(root_entity),
+            ))
+            .id();
+
+        let vis = if animated_body_cubies.is_empty() {
+            Visibility::Hidden
+        } else {
+            Visibility::Visible
+        };
+        commands.spawn((
+            CubeVisual,
+            Mesh3d(animated_body_handle.clone()),
+            MeshMaterial3d(shell_material.clone()),
+            Transform::default(),
+            vis,
+            ChildOf(pivot_entity),
+        ));
+
+        let sticker_vis = if animated_sticker_indices.is_empty() {
+            Visibility::Hidden
+        } else {
+            Visibility::Visible
+        };
+        commands.spawn((
+            CubeVisual,
+            Mesh3d(animated_sticker_handle.clone()),
+            MeshMaterial3d(sticker_material.clone()),
+            Transform::default(),
+            sticker_vis,
+            ChildOf(pivot_entity),
+        ));
+
+        temp_entities.push(pivot_entity);
+
+        if animated_sticker_indices.is_empty() {
+            continue;
+        }
+
+        animations.push(ActiveTurnAnimation {
+            scene_revision,
+            pivot_entity,
+            turn,
+            animated_stickers: animated_sticker_indices,
+            angle_radians: turn_rotation_angle(turn),
+            axis: turn_rotation_axis(turn.face),
+            elapsed_secs: 0.0,
+            duration_secs: turn_animation_duration_secs(turn),
+        });
+    }
+
+    sync_state.active_animations = animations;
+    sync_state.temp_pivot_entities = temp_entities;
 }
 
 fn orbit_camera_input(
@@ -2315,7 +2660,7 @@ fn canvas_face_tap_input(
     mut direct_turn_input: ResMut<'_, DirectTurnInputState>,
     sync_state: Res<'_, VisualSyncState>,
 ) {
-    if sync_state.active_animation.is_some() {
+    if !sync_state.active_animations.is_empty() {
         return;
     }
 
@@ -3380,11 +3725,12 @@ mod tests {
         let turn = TurnCommand::outer(Face::Front, RotationAmount::Clockwise);
 
         runtime.apply_turn(turn).expect("turn should apply");
+        runtime.process_queue_head();
 
         let transition = runtime.last_transition.expect("transition should exist");
         assert_eq!(transition.scene_revision, runtime.scene_revision);
         assert_eq!(transition.from_state, previous);
-        assert_eq!(transition.animation, Some(turn));
+        assert_eq!(transition.animation, vec![turn]);
     }
 
     #[test]
@@ -3392,13 +3738,14 @@ mod tests {
         let mut runtime = RuntimeBridge::new(CubeOrder::standard());
         let turn = TurnCommand::outer(Face::Right, RotationAmount::Clockwise);
         runtime.apply_turn(turn).expect("turn should apply");
+        runtime.process_queue_head();
         let scrambled = runtime.engine.state().clone();
 
         runtime.undo().expect("undo should apply");
 
         let transition = runtime.last_transition.expect("transition should exist");
         assert_eq!(transition.from_state, scrambled);
-        assert_eq!(transition.animation, Some(turn.inverse()));
+        assert_eq!(transition.animation, vec![turn.inverse()]);
     }
 
     #[test]
