@@ -247,7 +247,7 @@ impl Default for OrbitRig {
     fn default() -> Self {
         Self {
             yaw: 0.78,
-            pitch: 0.26,
+            pitch: 0.5,
             radius: 7.2,
             auto_spin: false,
             mouse_drag_button: None,
@@ -996,11 +996,16 @@ fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
         Camera3d::default(),
         Tonemapping::TonyMcMapface,
         Transform::from_xyz(-3.85, 3.15, 6.45).looking_at(Vec3::ZERO, Vec3::Y),
+        AmbientLight {
+            color: Color::srgb(1.0, 1.0, 1.0),
+            brightness: 200.0,
+            ..default()
+        },
     ));
 
     commands.spawn((
         PointLight {
-            intensity: 2_200_000.0,
+            intensity: 1_100_000.0,
             range: 42.0,
             shadows_enabled: true,
             ..default()
@@ -1010,7 +1015,7 @@ fn setup_scene(mut commands: Commands<'_, '_>, config: Res<'_, ShellConfig>) {
 
     commands.spawn((
         DirectionalLight {
-            illuminance: 16_000.0,
+            illuminance: 8_000.0,
             shadows_enabled: true,
             ..default()
         },
@@ -2102,7 +2107,7 @@ fn shortest_angle_delta(current: f32, target: f32) -> f32 {
 }
 
 fn nearest_orbit_snap(yaw: f32, pitch: f32) -> Option<Vec2> {
-    const SNAP_PITCHES: [f32; 2] = [0.26, -0.26];
+    const SNAP_PITCHES: [f32; 2] = [0.5, -0.5];
     const SNAP_THRESHOLD: f32 = 0.2;
     let snap_yaws = [
         std::f32::consts::FRAC_PI_4,
@@ -2639,9 +2644,9 @@ mod tests {
 
     #[test]
     fn orbit_snap_targets_nearby_isometric_views() {
-        let target = nearest_orbit_snap(0.81, 0.24).expect("should snap to a nearby view");
+        let target = nearest_orbit_snap(0.81, 0.48).expect("should snap to a nearby view");
         assert!((target.x - std::f32::consts::FRAC_PI_4).abs() < 0.05);
-        assert!((target.y - 0.26).abs() < 0.05);
+        assert!((target.y - 0.5).abs() < 0.05);
         assert!(nearest_orbit_snap(1.7, 0.24).is_none());
     }
 
