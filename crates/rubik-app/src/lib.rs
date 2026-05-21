@@ -804,13 +804,8 @@ impl RuntimeBridge {
         )
     }
 
-    fn turns_compatible(order: u8, a: TurnCommand, b: TurnCommand) -> bool {
-        if !Self::turns_share_axis(a.face, b.face) {
-            return false;
-        }
-        let (a_min, a_max) = Self::turn_layer_range(order, a);
-        let (b_min, b_max) = Self::turn_layer_range(order, b);
-        a_max < b_min || b_max < a_min
+    fn turns_compatible(_order: u8, a: TurnCommand, b: TurnCommand) -> bool {
+        Self::turns_share_axis(a.face, b.face)
     }
 
     fn dequeue_compatible_batch(&mut self) -> Vec<TurnCommand> {
@@ -831,6 +826,77 @@ impl RuntimeBridge {
             }
         }
         batch
+    }
+
+    fn merge_batch_turns(order: u8, turns: &[TurnCommand]) -> Vec<TurnCommand> {
+        if turns.len() <= 1 {
+            return turns.to_vec();
+        }
+
+        let canonical = turns[0].face;
+        let opposite = opposite_face(canonical);
+
+        let mut layer_net: Vec<i8> = vec![0; order as usize];
+        for &turn in turns {
+            let (min, max) = Self::turn_layer_range(order, turn);
+            let dir = rotation_direction_value(turn.rotation);
+            let normalized = if turn.face == canonical {
+                dir
+            } else if turn.face == opposite {
+                -dir
+            } else {
+                0
+            };
+            for l in min..=max {
+                layer_net[l as usize] += normalized;
+            }
+        }
+
+        let mut merged: Vec<TurnCommand> = Vec::new();
+        let mut i: u8 = 0;
+        while i < order {
+            let net = ((layer_net[i as usize] % 4) + 4) % 4;
+            if net != 0 {
+                let rot = match net {
+                    1 => RotationAmount::Clockwise,
+                    3 => RotationAmount::CounterClockwise,
+                    2 => RotationAmount::HalfTurn,
+                    _ => unreachable!(),
+                };
+                let start_abs = i;
+                let mut width: u8 = 1;
+                // Coalesce consecutive layers with the same net rotation
+                let mut j = i + 1;
+                while j < order {
+                    let next = ((layer_net[j as usize] % 4) + 4) % 4;
+                    if next == net {
+                        width += 1;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let abs_end = start_abs + width - 1;
+                let canonical_start = match canonical {
+                    Face::Up | Face::Right | Face::Front => {
+                        (order - 1).saturating_sub(abs_end)
+                    }
+                    Face::Down | Face::Left | Face::Back => {
+                        start_abs
+                    }
+                };
+                merged.push(TurnCommand {
+                    face: canonical,
+                    start_layer: canonical_start,
+                    width,
+                    rotation: rot,
+                });
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        merged
     }
 
     fn process_queue_head(&mut self) {
@@ -2059,6 +2125,14 @@ fn begin_turn_batch_animation(
         return;
     }
 
+    let turns = RuntimeBridge::merge_batch_turns(order, turns);
+    let turns = turns.as_slice();
+
+    if turns.is_empty() {
+        sync_state.active_animations.clear();
+        return;
+    }
+
     if turns.len() == 1 {
         let turn = turns[0];
         let pivot_entity = pool.pivot_entity.expect("pool has pivot");
@@ -3192,11 +3266,30 @@ fn axis_face_ivec(axis: IVec3) -> Face {
     }
 }
 
+fn opposite_face(face: Face) -> Face {
+    match face {
+        Face::Up => Face::Down,
+        Face::Down => Face::Up,
+        Face::Right => Face::Left,
+        Face::Left => Face::Right,
+        Face::Front => Face::Back,
+        Face::Back => Face::Front,
+    }
+}
+
 fn positive_turn_steps(rotation: RotationAmount) -> usize {
     match rotation {
         RotationAmount::Clockwise => 3,
         RotationAmount::HalfTurn => 2,
         RotationAmount::CounterClockwise => 1,
+    }
+}
+
+fn rotation_direction_value(rotation: RotationAmount) -> i8 {
+    match rotation {
+        RotationAmount::Clockwise => 1,
+        RotationAmount::HalfTurn => 2,
+        RotationAmount::CounterClockwise => -1,
     }
 }
 
