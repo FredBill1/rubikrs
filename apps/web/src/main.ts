@@ -98,6 +98,8 @@ type RubikWasmModule = {
   runtime_status_json: () => string
   animation_active?: () => boolean
   queue_idle?: () => boolean
+  turn_enqueue_count?: () => bigint
+  cancel_pending_work?: () => void
   export_cube_state: () => string
   export_turn_history_json: () => string
   import_cube_state: (json: string) => boolean
@@ -131,6 +133,9 @@ let activeSolveRequestId: number | null = null
 let activeSolveSceneRevision: number | null = null
 let nextSolveRequestId = 0
 let cachedRuntimeStatus: RuntimeStatus | null = null
+let solveAnimationActive = false
+let solveAnimationAborted = false
+let replayExpectedEnqueueCount: bigint | null = null
 
 app.innerHTML = `
   <div class="shell">
@@ -440,6 +445,18 @@ function syncStatus(): void {
     cancelActiveSolve('Direct runtime input changed the cube state and cancelled the in-flight solve request.')
   }
 
+  if (solveAnimationActive && replayExpectedEnqueueCount !== null) {
+    const currentCount = runtime.turn_enqueue_count?.()
+    if (currentCount !== undefined && currentCount > replayExpectedEnqueueCount) {
+      solveAnimationAborted = true
+      solveAnimationActive = false
+      replayExpectedEnqueueCount = null
+      runtime.cancel_pending_work?.()
+      syncSolveControls()
+      updateSolverState('cancelled', 'User input cancelled the in-flight solve animation.')
+    }
+  }
+
   renderRuntimeStatus(status)
 }
 
@@ -523,7 +540,7 @@ function syncTurnControls(order: number): void {
 function syncSolveControls(): void {
   const order = Number.parseInt(orderSelect?.value ?? '3', 10) || 3
   const cap = solveDepthCap(order)
-  const busy = activeSolveRequestId !== null
+  const busy = activeSolveRequestId !== null || solveAnimationActive
 
   if (solveDepth) {
     solveDepth.max = String(cap)
@@ -908,12 +925,21 @@ function finishSolveSession(): void {
 }
 
 function cancelActiveSolve(detail: string): void {
-  if (activeSolveRequestId === null) {
+  if (activeSolveRequestId === null && !solveAnimationActive) {
     return
   }
 
   finishSolveSession()
   terminateSolverWorkers()
+
+  if (solveAnimationActive) {
+    solveAnimationAborted = true
+    solveAnimationActive = false
+    replayExpectedEnqueueCount = null
+    syncSolveControls()
+  }
+
+  runtime?.cancel_pending_work?.()
   updateSolverState('cancelled', detail)
 }
 
@@ -921,17 +947,34 @@ async function replaySolutionTurns(
   module: RubikWasmModule,
   turns: SolveTurn[],
 ): Promise<void> {
+  solveAnimationActive = true
+  solveAnimationAborted = false
+  syncSolveControls()
+
   for (const turn of turns) {
+    if (solveAnimationAborted) {
+      break
+    }
     module.apply_turn(turn.faceCode, turn.rotationCode, turn.startLayer, turn.width)
   }
 
-  while (true) {
+  replayExpectedEnqueueCount = module.turn_enqueue_count?.() ?? 0n
+
+  while (!solveAnimationAborted) {
     await nextAnimationFrame()
     syncStatus()
+    if (solveAnimationAborted) {
+      break
+    }
     if (module.queue_idle?.()) {
       break
     }
   }
+
+  solveAnimationActive = false
+  solveAnimationAborted = false
+  replayExpectedEnqueueCount = null
+  syncSolveControls()
 }
 
 async function startSolve(module: RubikWasmModule): Promise<void> {

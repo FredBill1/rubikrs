@@ -139,6 +139,7 @@ struct RuntimeBridge {
     last_transition: Option<RuntimeTransition>,
     animation_active: bool,
     turn_queue: VecDeque<TurnCommand>,
+    turn_enqueue_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -702,6 +703,7 @@ impl RuntimeBridge {
             last_transition: None,
             animation_active: false,
             turn_queue: VecDeque::new(),
+            turn_enqueue_count: 0,
         }
     }
 
@@ -867,6 +869,8 @@ impl RuntimeBridge {
 
     fn apply_turn(&mut self, turn: TurnCommand) -> Result<(), String> {
         self.turn_queue.push_back(turn);
+        self.turn_enqueue_count += 1;
+        self.bump_scene();
         self.set_message(format!("Queued {}.", format_turn(turn)));
         Ok(())
     }
@@ -1047,6 +1051,21 @@ pub fn animation_active() -> bool {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn queue_idle() -> bool {
     with_runtime(|runtime| runtime.turn_queue.is_empty() && !runtime.animation_active)
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub fn turn_enqueue_count() -> u64 {
+    with_runtime(|runtime| runtime.turn_enqueue_count)
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub fn cancel_pending_work() {
+    with_runtime_mut(|runtime| {
+        runtime.turn_queue.clear();
+        runtime.last_transition = None;
+        runtime.animation_active = false;
+        runtime.scene_revision = runtime.scene_revision.wrapping_add(1);
+    });
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
