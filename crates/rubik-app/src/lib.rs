@@ -1401,7 +1401,6 @@ fn animate_turn_visuals(
                 );
                 still_active.push(animation);
             } else {
-                pivot_transform.rotation = Quat::IDENTITY;
                 completed_animations.push(animation);
             }
         } else {
@@ -1427,6 +1426,12 @@ fn animate_turn_visuals(
     }
 
     if sync_state.active_animations.is_empty() {
+        for animation in &completed_animations {
+            if let Ok(mut t) = pivots.get_mut(animation.pivot_entity) {
+                t.rotation = Quat::IDENTITY;
+            }
+        }
+
         for &entity in &sync_state.temp_pivot_entities {
             commands.entity(entity).despawn();
         }
