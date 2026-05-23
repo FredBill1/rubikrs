@@ -93,8 +93,8 @@ impl RotationAmount {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnCommand {
     pub face: Face,
-    pub start_layer: u8,
-    pub width: u8,
+    pub start_layer: u32,
+    pub width: u32,
     pub rotation: RotationAmount,
 }
 
@@ -122,8 +122,8 @@ impl TurnCommand {
             return Err(TurnCommandValidationError::ZeroWidth);
         }
 
-        let end = usize::from(self.start_layer) + usize::from(self.width);
-        if end > usize::from(order.get()) {
+        let end = self.start_layer as usize + self.width as usize;
+        if end > order.get() as usize {
             return Err(TurnCommandValidationError::OutOfBounds {
                 order: order.get(),
                 start_layer: self.start_layer,
@@ -154,7 +154,7 @@ pub struct CubeState {
 
 impl CubeState {
     pub fn solved(order: CubeOrder) -> Self {
-        let stickers_per_face = usize::from(order.get()) * usize::from(order.get());
+        let stickers_per_face = order.get() as usize * order.get() as usize;
         let stickers = Face::ALL
             .into_iter()
             .flat_map(|face| core::iter::repeat_n(face.solved_color(), stickers_per_face))
@@ -167,6 +167,43 @@ impl CubeState {
         }
     }
 
+    /// Returns a solved-state target where each face's uniform color is
+    /// determined by the true center sticker of `self`.
+    ///
+    /// For odd-order cubes: reads the center sticker of each face and fills
+    /// the entire face with that color. This supports non-standard color
+    /// schemes where centers may not be in their canonical positions.
+    ///
+    /// For even-order cubes: delegates to [`Self::solved`] because there is
+    /// no unique true center sticker.
+    pub fn solved_with_centers_from(&self) -> Self {
+        let order = self.order.get() as usize;
+        let face_size = order * order;
+
+        if order % 2 == 0 {
+            return Self::solved(self.order);
+        }
+
+        let mid = order / 2;
+        let center_offset = mid * order + mid;
+
+        let stickers: Vec<StickerColor> = Face::ALL
+            .into_iter()
+            .enumerate()
+            .flat_map(|(face_idx, _face)| {
+                let face_start = face_idx * face_size;
+                let center_color = self.stickers[face_start + center_offset];
+                core::iter::repeat_n(center_color, face_size)
+            })
+            .collect();
+
+        Self {
+            version: CUBE_STATE_SCHEMA_VERSION,
+            order: self.order,
+            stickers,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), CubeStateValidationError> {
         if self.version != CUBE_STATE_SCHEMA_VERSION {
             return Err(CubeStateValidationError::UnsupportedVersion {
@@ -175,7 +212,7 @@ impl CubeState {
             });
         }
 
-        let stickers_per_face = usize::from(self.order.get()) * usize::from(self.order.get());
+        let stickers_per_face = self.order.get() as usize * self.order.get() as usize;
         let expected_len = stickers_per_face * Face::ALL.len();
         if self.stickers.len() != expected_len {
             return Err(CubeStateValidationError::UnexpectedStickerCount {
@@ -284,12 +321,12 @@ impl std::error::Error for CubeStateParseError {}
 pub enum TurnCommandValidationError {
     ZeroWidth,
     OutOfBounds {
-        order: u8,
-        start_layer: u8,
-        width: u8,
+        order: u32,
+        start_layer: u32,
+        width: u32,
     },
     WholeCubeRotationUnsupported {
-        order: u8,
+        order: u32,
     },
 }
 

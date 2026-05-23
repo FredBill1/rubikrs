@@ -1,17 +1,22 @@
 [package]
-name = "solver-worker"
+name = "rubik-solver"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
-kewb = "0.4.3"
 rubik-core = { path = "../rubik-core" }
+rcube-rs = { path = "../rcube-rs" }
 serde.workspace = true
 serde_json.workspace = true
+lazy_static = "1"
+
+[[bin]]
+name = "generate_2x2_pdbs"
+path = "src/bin/generate_2x2_pdbs.rs"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook.workspace = true

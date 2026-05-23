@@ -2,15 +2,15 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const MIN_CUBE_ORDER: u8 = 2;
-pub const MAX_CUBE_ORDER: u8 = 17;
+pub const MIN_CUBE_ORDER: u32 = 2;
+pub const MAX_CUBE_ORDER: u32 = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct CubeOrder(u8);
+pub struct CubeOrder(u32);
 
 impl CubeOrder {
-    pub fn new(value: u8) -> Result<Self, CubeOrderError> {
+    pub fn new(value: u32) -> Result<Self, CubeOrderError> {
         if value < MIN_CUBE_ORDER {
             return Err(CubeOrderError::TooSmall {
                 attempted: value,
@@ -32,15 +32,15 @@ impl CubeOrder {
         Self(3)
     }
 
-    pub const fn get(self) -> u8 {
+    pub const fn get(self) -> u32 {
         self.0
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CubeOrderError {
-    TooSmall { attempted: u8, min: u8 },
-    TooLarge { attempted: u8, max: u8 },
+    TooSmall { attempted: u32, min: u32 },
+    TooLarge { attempted: u32, max: u32 },
 }
 
 impl fmt::Display for CubeOrderError {

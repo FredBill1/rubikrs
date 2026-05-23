@@ -50,7 +50,7 @@ impl CubeEngine {
     }
 
     pub fn is_solved(&self) -> bool {
-        self.current_state == CubeState::solved(self.current_state.order)
+        self.current_state == self.current_state.solved_with_centers_from()
     }
 
     pub fn apply_turn(&mut self, turn: TurnCommand) -> Result<(), CubeEngineError> {
@@ -113,7 +113,7 @@ pub fn generate_scramble(order: CubeOrder, length: usize, seed: u64) -> Vec<Turn
     let mut rng = DeterministicRng::new(seed);
     let mut scramble = Vec::with_capacity(length);
     let mut last_move_key = None;
-    let max_start_layer = usize::from(order.get().saturating_sub(1));
+    let max_start_layer = order.get().saturating_sub(1) as usize;
 
     while scramble.len() < length {
         let face = Face::ALL[rng.range(Face::ALL.len())];
@@ -122,11 +122,7 @@ pub fn generate_scramble(order: CubeOrder, length: usize, seed: u64) -> Vec<Turn
             1 => RotationAmount::HalfTurn,
             _ => RotationAmount::CounterClockwise,
         };
-        let start_layer = if order.get() <= 3 {
-            0
-        } else {
-            rng.range(max_start_layer + 1) as u8
-        };
+        let start_layer = rng.range(max_start_layer + 1) as u32;
         let move_key = (face, start_layer);
         if Some(move_key) == last_move_key {
             continue;
@@ -161,7 +157,7 @@ pub fn apply_turn_to_state_unchecked(
     scratch: &mut [StickerColor],
 ) -> Result<(), TurnCommandValidationError> {
     turn.validate_for(state.order)?;
-    let order = usize::from(state.order.get());
+    let order = state.order.get() as usize;
     apply_turn_to_items_with_scratch(&mut state.stickers, scratch, order, turn);
     Ok(())
 }
@@ -292,8 +288,8 @@ fn is_affected(sticker: StickerPosition, turn: TurnCommand, order: usize) -> boo
         Face::Back => sticker.z,
     };
 
-    let start = usize::from(turn.start_layer);
-    let end = start + usize::from(turn.width);
+    let start = turn.start_layer as usize;
+    let end = start + turn.width as usize;
     depth >= start && depth < end
 }
 
@@ -593,12 +589,15 @@ mod tests {
     }
 
     #[test]
-    fn three_by_three_scramble_stays_on_outer_layers() {
+    fn three_by_three_scramble_includes_middle_slices() {
         let scramble = generate_scramble(CubeOrder::standard(), 24, 21);
+        // All turns should have width=1 and start_layer in {0, 1}
+        assert!(scramble.iter().all(|turn| turn.width == 1 && turn.start_layer <= 2));
+        // Should include at least some middle-slice turns (probabilistic, but very likely
+        // with length 24 and 25% chance per move; seed 21 is deterministic)
         assert!(
-            scramble
-                .iter()
-                .all(|turn| turn.start_layer == 0 && turn.width == 1)
+            scramble.iter().any(|turn| turn.start_layer == 1),
+            "3x3 scramble should exercise middle-slice moves"
         );
     }
 

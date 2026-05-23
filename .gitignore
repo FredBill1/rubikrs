@@ -2,5 +2,6 @@
 /apps/web/node_modules
 /apps/web/dist
 /apps/web/src/generated/rubik_app
-/apps/web/src/generated/solver_worker
+/apps/web/src/generated/rubik_solver
 
+_ref/

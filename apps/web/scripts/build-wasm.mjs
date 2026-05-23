@@ -11,9 +11,9 @@ const crates = [
     outName: 'rubik_app',
   },
   {
-    crateDir: resolve(process.cwd(), '..', '..', 'crates', 'solver-worker'),
-    outDir: resolve(process.cwd(), 'src', 'generated', 'solver_worker'),
-    outName: 'solver_worker',
+    crateDir: resolve(process.cwd(), '..', '..', 'crates', 'rubik-solver'),
+    outDir: resolve(process.cwd(), 'src', 'generated', 'rubik_solver'),
+    outName: 'rubik_solver',
   },
 ]
 

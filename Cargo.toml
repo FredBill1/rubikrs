@@ -1,10 +1,11 @@
 [workspace]
-members = ["crates/rubik-app", "crates/rubik-core", "crates/solver-worker"]
+members = ["crates/rubik-app", "crates/rubik-core", "crates/rubik-solver", "crates/rcube-rs"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 bevy = { version = "0.18.1", default-features = false, features = [

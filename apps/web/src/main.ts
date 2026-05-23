@@ -29,9 +29,6 @@ type SolveWorkerRequest = {
   laneId: number
   order: number
   stateJson: string
-  targetDepth: number
-  allowedFaces: number[]
-  turnHistoryJson?: string
 }
 
 type SolveWorkerResponse = {
@@ -40,7 +37,6 @@ type SolveWorkerResponse = {
   laneId: number
   turns: SolveTurn[]
   explored: number
-  depthLimit: number
   message: string
 }
 
@@ -124,8 +120,6 @@ if (!app) {
 }
 
 const basePath = import.meta.env.BASE_URL
-const parallelLanes = Math.max(1, Math.min(8, Math.floor((navigator.hardwareConcurrency ?? 4) / 2)))
-const rootFaceCodes = [0, 1, 2, 3, 4, 5] as const
 let runtime: RubikWasmModule | null = null
 let statusPollHandle: number | null = null
 let solverWorkers: Worker[] = []
@@ -233,10 +227,6 @@ app.innerHTML = `
           <p class="panel-kicker">solver</p>
           <div class="control-cluster">
             <div class="action-row action-row--stacked">
-              <label class="field field--inline">
-                <span>search depth</span>
-                <input data-solve-depth type="number" min="1" max="8" value="5" />
-              </label>
               <div class="action-row action-row--pair">
                 <button type="button" data-action="solve">solve</button>
                 <button type="button" data-action="cancel-solve">cancel</button>
@@ -307,7 +297,6 @@ const scrambleLength = document.querySelector<HTMLInputElement>('[data-scramble-
 const scrambleSeed = document.querySelector<HTMLInputElement>('[data-scramble-seed]')
 const turnLayer = document.querySelector<HTMLInputElement>('[data-turn-layer]')
 const turnWide = document.querySelector<HTMLInputElement>('[data-turn-wide]')
-const solveDepth = document.querySelector<HTMLInputElement>('[data-solve-depth]')
 const importArea = document.querySelector<HTMLTextAreaElement>('[data-import-area]')
 const importFile = document.querySelector<HTMLInputElement>('[data-import-file]')
 const statusOrder = document.querySelector<HTMLElement>('[data-status-order]')
@@ -361,16 +350,6 @@ function formatTimer(elapsedMillis: number): string {
   const seconds = Math.floor((totalTenths % 600) / 10)
   const tenths = totalTenths % 10
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${tenths}`
-}
-
-function parseTurnHistoryLength(raw: string): number {
-  try {
-    const history = JSON.parse(raw) as unknown[]
-    return Array.isArray(history) ? history.length : 0
-  } catch (error) {
-    console.error(error)
-    return 0
-  }
 }
 
 function parseScrambleSeed(raw: string | undefined): bigint {
@@ -498,19 +477,6 @@ function updateSolverState(label: string, detail: string): void {
   }
 }
 
-function solveDepthCap(order: number): number {
-  if (order <= 2) {
-    return 8
-  }
-  if (order === 3) {
-    return 7
-  }
-  if (order <= 5) {
-    return 5
-  }
-  return 4
-}
-
 function currentTurnSelection(order: number): { startLayer: number; width: number } {
   const requestedLayer = Math.min(order, Math.max(1, Number.parseInt(turnLayer?.value ?? '1', 10) || 1))
   if (turnLayer) {
@@ -539,15 +505,7 @@ function syncTurnControls(order: number): void {
 
 function syncSolveControls(): void {
   const order = Number.parseInt(orderSelect?.value ?? '3', 10) || 3
-  const cap = solveDepthCap(order)
   const busy = activeSolveRequestId !== null || solveAnimationActive
-
-  if (solveDepth) {
-    solveDepth.max = String(cap)
-    const nextValue = Math.min(cap, Math.max(1, Number.parseInt(solveDepth.value || String(cap), 10) || cap))
-    solveDepth.value = String(nextValue)
-    solveDepth.disabled = busy
-  }
 
   if (solveButton) {
     solveButton.disabled = busy
@@ -858,20 +816,6 @@ function createBenchmarkController(module: RubikWasmModule): RubikBenchmarkContr
   }
 }
 
-function activeSolveLaneCount(): number {
-  return Math.max(1, Math.min(parallelLanes, rootFaceCodes.length))
-}
-
-function partitionRootFaces(laneCount: number): number[][] {
-  const groups = Array.from({ length: laneCount }, () => [] as number[])
-
-  rootFaceCodes.forEach((faceCode, index) => {
-    groups[index % laneCount].push(faceCode)
-  })
-
-  return groups.filter((group) => group.length > 0)
-}
-
 function terminateSolverWorkers(): void {
   for (const worker of solverWorkers) {
     worker.terminate()
@@ -927,6 +871,15 @@ function finishSolveSession(): void {
 function cancelActiveSolve(detail: string): void {
   if (activeSolveRequestId === null && !solveAnimationActive) {
     return
+  }
+
+  // Send cancel message to all workers before terminating
+  for (const worker of solverWorkers) {
+    try {
+      worker.postMessage({ kind: 'cancel' })
+    } catch {
+      // Worker may already be in a bad state
+    }
   }
 
   finishSolveSession()
@@ -991,259 +944,78 @@ async function startSolve(module: RubikWasmModule): Promise<void> {
     return
   }
 
-  const cap = solveDepthCap(order)
-  const maxDepth = Math.min(cap, Math.max(1, Number.parseInt(solveDepth?.value ?? '5', 10) || 5))
-  if (solveDepth) {
-    solveDepth.value = String(maxDepth)
-  }
-
   const requestId = ++nextSolveRequestId
   activeSolveRequestId = requestId
   activeSolveSceneRevision = currentSceneRevision()
   syncSolveControls()
   const stateJson = module.export_cube_state()
-  const turnHistoryJson = module.export_turn_history_json()
-  const turnHistoryLength = parseTurnHistoryLength(turnHistoryJson)
-  let totalExplored = 0
 
-  if (order !== 3 && turnHistoryLength > 0) {
-    const worker = ensureSolverWorkers(1)[0]
-    updateSolverState(
-      'solving',
-      `Replaying the inverse of ${turnHistoryLength} recorded turn(s) in a Rust wasm worker for ${order}x${order}.`
-    )
+  updateSolverState(
+    'solving',
+    `Sending ${order}x${order} state to a Rust wasm worker for solving.`
+  )
 
-    let result: SolveWorkerResponse
-    try {
-      result = await runSolveLane(worker, {
-        kind: 'solve',
-        requestId,
-        laneId: 0,
-        order,
-        stateJson,
-        targetDepth: 1,
-        allowedFaces: [...rootFaceCodes],
-        turnHistoryJson,
-      })
-    } catch (error) {
-      if (activeSolveRequestId !== requestId) {
-        return
-      }
-
-      finishSolveSession()
-      terminateSolverWorkers()
-      updateSolverState('worker fault', error instanceof Error ? error.message : 'unknown worker history failure')
-      return
-    }
-
+  let result: SolveWorkerResponse
+  try {
+    result = await runSolveLane(ensureSolverWorkers(1)[0], {
+      kind: 'solve',
+      requestId,
+      laneId: 0,
+      order,
+      stateJson,
+    })
+  } catch (error) {
     if (activeSolveRequestId !== requestId) {
-      return
-    }
-
-    const sceneRevision = currentSceneRevision()
-    if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
-      finishSolveSession()
-      updateSolverState(
-        'stale result discarded',
-        'The cube state changed while the worker was replaying recorded history, so the returned solution was ignored.'
-      )
-      return
-    }
-
-    if (result.kind === 'error') {
-      finishSolveSession()
-      terminateSolverWorkers()
-      updateSolverState('worker error', result.message)
-      return
-    }
-
-    if (result.kind === 'solved') {
-      finishSolveSession()
-
-      const notation = result.turns.map((turn) => turn.notation).join(' ')
-      const suffix =
-        result.turns.length > 0
-          ? ` Applied ${result.turns.length} recorded inverse turn(s)${notation ? `: ${notation}.` : '.'}`
-          : ' No turns were needed.'
-      updateSolverState('solved', `${result.message}.${suffix}`)
-      syncStatus()
-      await replaySolutionTurns(module, result.turns)
-      syncStatus()
-
       return
     }
 
     finishSolveSession()
-    updateSolverState(
-      'history unavailable',
-      'Recorded history could not solve the current state, so this NxN request still needs a deeper feasible solver.'
-    )
+    terminateSolverWorkers()
+    updateSolverState('worker fault', error instanceof Error ? error.message : 'unknown worker failure')
     return
-  }
-
-  const faceGroups = partitionRootFaces(activeSolveLaneCount())
-  const workers = ensureSolverWorkers(faceGroups.length)
-
-  for (let depth = 1; depth <= maxDepth; depth += 1) {
-    if (activeSolveRequestId !== requestId) {
-      return
-    }
-
-    updateSolverState(
-      'solving',
-      `Searching depth ${depth}/${maxDepth} for ${order}x${order} across ${faceGroups.length} worker lane(s).`
-    )
-
-    let results: SolveWorkerResponse[]
-    try {
-      results = await Promise.all(
-        faceGroups.map((allowedFaces, laneId) =>
-          runSolveLane(workers[laneId], {
-            kind: 'solve',
-            requestId,
-            laneId,
-            order,
-            stateJson,
-            targetDepth: depth,
-            allowedFaces,
-          })
-        )
-      )
-    } catch (error) {
-      if (activeSolveRequestId !== requestId) {
-        return
-      }
-
-      finishSolveSession()
-      terminateSolverWorkers()
-      updateSolverState('worker fault', error instanceof Error ? error.message : 'unknown worker pool failure')
-      return
-    }
-
-    if (activeSolveRequestId !== requestId) {
-      return
-    }
-
-    totalExplored += results.reduce((sum, result) => sum + result.explored, 0)
-
-    const sceneRevision = currentSceneRevision()
-    if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
-      finishSolveSession()
-      updateSolverState(
-        'stale result discarded',
-        'The cube state changed while the worker pool was searching, so the returned solution was ignored.'
-      )
-      return
-    }
-
-    const errorResult = results.find((result) => result.kind === 'error')
-    if (errorResult) {
-      finishSolveSession()
-      terminateSolverWorkers()
-      updateSolverState('worker error', errorResult.message)
-      return
-    }
-
-    const solvedResult = results.find((result) => result.kind === 'solved')
-    if (solvedResult) {
-      finishSolveSession()
-
-      const notation = solvedResult.turns.map((turn) => turn.notation).join(' ')
-      const suffix =
-        solvedResult.turns.length > 0
-          ? ` Applied ${solvedResult.turns.length} turn(s) from the worker pool${notation ? `: ${notation}.` : '.'}`
-          : ' No turns were needed.'
-      updateSolverState(
-        'solved',
-        `${solvedResult.message}. Explored ${totalExplored.toLocaleString()} nodes across ${faceGroups.length} lane(s).${suffix}`
-      )
-      syncStatus()
-      await replaySolutionTurns(module, solvedResult.turns)
-      syncStatus()
-
-      return
-    }
-
-    updateSolverState(
-      'searching next depth',
-      `Depth ${depth} finished with no solution. Explored ${totalExplored.toLocaleString()} nodes across ${faceGroups.length} lane(s) so far.`
-    )
   }
 
   if (activeSolveRequestId !== requestId) {
     return
   }
 
-  if (order === 3) {
+  const sceneRevision = currentSceneRevision()
+  if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
+    finishSolveSession()
     updateSolverState(
-      'fallback solving',
-      `Depth ${maxDepth} search finished unsolved. Escalating to a Rust two-phase 3x3 fallback in a dedicated worker.`
+      'stale result discarded',
+      'The cube state changed while the worker was solving, so the returned solution was ignored.'
     )
+    return
+  }
 
-    let fallbackResult: SolveWorkerResponse
-    try {
-      fallbackResult = await runSolveLane(ensureSolverWorkers(1)[0], {
-        kind: 'solve',
-        requestId,
-        laneId: 0,
-        order,
-        stateJson,
-        targetDepth: 0,
-        allowedFaces: [],
-      })
-    } catch (error) {
-      if (activeSolveRequestId !== requestId) {
-        return
-      }
+  if (result.kind === 'error') {
+    finishSolveSession()
+    terminateSolverWorkers()
+    updateSolverState('worker error', result.message)
+    return
+  }
 
-      finishSolveSession()
-      terminateSolverWorkers()
-      updateSolverState('worker fault', error instanceof Error ? error.message : 'unknown 3x3 fallback failure')
-      return
-    }
+  if (result.kind === 'solved') {
+    finishSolveSession()
 
-    if (activeSolveRequestId !== requestId) {
-      return
-    }
+    const notation = result.turns.map((turn) => turn.notation).join(' ')
+    const suffix =
+      result.turns.length > 0
+        ? ` Applied ${result.turns.length} turn(s)${notation ? `: ${notation}.` : '.'}`
+        : ' No turns were needed.'
+    updateSolverState('solved', `${result.message}.${suffix}`)
+    syncStatus()
+    await replaySolutionTurns(module, result.turns)
+    syncStatus()
 
-    const sceneRevision = currentSceneRevision()
-    if (activeSolveSceneRevision !== null && sceneRevision !== activeSolveSceneRevision) {
-      finishSolveSession()
-      updateSolverState(
-        'stale result discarded',
-        'The cube state changed while the 3x3 fallback worker was searching, so the returned solution was ignored.'
-      )
-      return
-    }
-
-    if (fallbackResult.kind === 'solved') {
-      finishSolveSession()
-
-      const notation = fallbackResult.turns.map((turn) => turn.notation).join(' ')
-      const suffix =
-        fallbackResult.turns.length > 0
-          ? ` Applied ${fallbackResult.turns.length} fallback turn(s)${notation ? `: ${notation}.` : '.'}`
-          : ' No turns were needed.'
-      updateSolverState('solved', `${fallbackResult.message}.${suffix}`)
-      syncStatus()
-      await replaySolutionTurns(module, fallbackResult.turns)
-      syncStatus()
-
-      return
-    }
-
-    if (fallbackResult.kind === 'error') {
-      finishSolveSession()
-      terminateSolverWorkers()
-      updateSolverState('worker error', fallbackResult.message)
-      return
-    }
+    return
   }
 
   finishSolveSession()
   updateSolverState(
-    'depth limit reached',
-    `No solution was found up to depth ${maxDepth}. Explored ${totalExplored.toLocaleString()} nodes across ${faceGroups.length} lane(s).`
+    'unsolved',
+    `Solver could not find a solution for this ${order}x${order} state.`
   )
 }
 

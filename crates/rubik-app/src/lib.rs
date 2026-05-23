@@ -113,7 +113,7 @@ struct VisualSyncState {
 
 #[derive(Resource, Default)]
 struct CubeVisualPool {
-    order: Option<u8>,
+    order: Option<u32>,
     root_entity: Option<Entity>,
     pivot_entity: Option<Entity>,
     static_body_entity: Option<Entity>,
@@ -150,7 +150,7 @@ struct RuntimeTimer {
 
 #[derive(Debug, Serialize)]
 struct RuntimeStatus {
-    order: u8,
+    order: u32,
     move_count: usize,
     redo_depth: usize,
     is_solved: bool,
@@ -479,7 +479,7 @@ extern "C" {
 
 fn build_touch_candidate(
     camera_context: Option<(&Camera, &GlobalTransform)>,
-    order: u8,
+    order: u32,
     id: u64,
     raw_position: Vec2,
     position: Vec2,
@@ -770,7 +770,7 @@ impl RuntimeBridge {
         self.animation_active = false;
     }
 
-    fn turn_layer_range(order: u8, turn: TurnCommand) -> (u8, u8) {
+    fn turn_layer_range(order: u32, turn: TurnCommand) -> (u32, u32) {
         match turn.face {
             Face::Up | Face::Right | Face::Front => {
                 let max_world = order.saturating_sub(1);
@@ -804,7 +804,7 @@ impl RuntimeBridge {
         )
     }
 
-    fn turns_compatible(_order: u8, a: TurnCommand, b: TurnCommand) -> bool {
+    fn turns_compatible(_order: u32, a: TurnCommand, b: TurnCommand) -> bool {
         Self::turns_share_axis(a.face, b.face)
     }
 
@@ -828,7 +828,7 @@ impl RuntimeBridge {
         batch
     }
 
-    fn merge_batch_turns(order: u8, turns: &[TurnCommand]) -> Vec<TurnCommand> {
+    fn merge_batch_turns(order: u32, turns: &[TurnCommand]) -> Vec<TurnCommand> {
         if turns.len() <= 1 {
             return turns.to_vec();
         }
@@ -853,7 +853,7 @@ impl RuntimeBridge {
         }
 
         let mut merged: Vec<TurnCommand> = Vec::new();
-        let mut i: u8 = 0;
+        let mut i: u32 = 0;
         while i < order {
             let net = ((layer_net[i as usize] % 4) + 4) % 4;
             if net != 0 {
@@ -864,7 +864,7 @@ impl RuntimeBridge {
                     _ => unreachable!(),
                 };
                 let start_abs = i;
-                let mut width: u8 = 1;
+                let mut width: u32 = 1;
                 // Coalesce consecutive layers with the same net rotation
                 let mut j = i + 1;
                 while j < order {
@@ -1158,12 +1158,13 @@ pub fn import_cube_state(json: &str) -> bool {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
-pub fn set_cube_order(order: u8) -> bool {
+pub fn set_cube_order(order: u32) -> bool {
     let Ok(order) = CubeOrder::new(order) else {
         with_runtime_mut(|runtime| {
             runtime.set_message(format!(
-                "Order {} is outside the supported 2..=17 range.",
-                order
+                "Order {} is outside the supported {:?} range.",
+                order,
+                rubik_core::MIN_CUBE_ORDER..=rubik_core::MAX_CUBE_ORDER
             ));
         });
         return false;
@@ -1198,7 +1199,7 @@ pub fn scramble_cube(length: u32, seed: u64) -> bool {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
-pub fn apply_turn(face_code: u8, rotation_code: u8, start_layer: u8, width: u8) -> bool {
+pub fn apply_turn(face_code: u8, rotation_code: u8, start_layer: u32, width: u32) -> bool {
     let Some(face) = decode_face(face_code) else {
         with_runtime_mut(|runtime| {
             runtime.set_message(format!("Unknown face code {}.", face_code));
@@ -1603,7 +1604,7 @@ fn merged_cubie_body_mesh(
 
 fn partition_body_cubies(
     cubie_slots: &[UVec3],
-    order: u8,
+    order: u32,
     animation_turn: Option<TurnCommand>,
 ) -> (Vec<UVec3>, Vec<UVec3>) {
     let Some(turn) = animation_turn else {
@@ -1629,7 +1630,7 @@ fn apply_body_mesh_partition(
     animated_cubies: &[UVec3],
     visibilities: &mut Query<'_, '_, &mut Visibility>,
 ) {
-    let Some(order) = pool.order.map(usize::from) else {
+    let Some(order) = pool.order.map(|o| o as usize) else {
         return;
     };
     let Some((static_body_mesh, animated_body_mesh)) = pool.body_mesh_handles.as_ref() else {
@@ -1725,7 +1726,7 @@ fn merged_sticker_mesh(
 fn partition_sticker_visuals(
     sticker_visual_states: &[StickerVisual],
     sticker_colors: &[StickerColor],
-    order: u8,
+    order: u32,
     animation_turn: Option<TurnCommand>,
 ) -> (
     Vec<(StickerVisual, StickerColor)>,
@@ -1760,7 +1761,7 @@ fn apply_sticker_mesh_partition(
     animated_stickers: &[(StickerVisual, StickerColor)],
     visibilities: &mut Query<'_, '_, &mut Visibility>,
 ) {
-    let Some(order) = pool.order.map(usize::from) else {
+    let Some(order) = pool.order.map(|o| o as usize) else {
         return;
     };
     let Some((static_sticker_mesh, animated_sticker_mesh)) = pool.sticker_mesh_handles.as_ref()
@@ -1770,7 +1771,7 @@ fn apply_sticker_mesh_partition(
     let Some(template) = pool.sticker_mesh_template.as_ref() else {
         return;
     };
-    let face_offset = cube_face_offset(order as u8);
+    let face_offset = cube_face_offset(order as u32);
 
     if let Some(mesh) = meshes.get_mut(static_sticker_mesh) {
         *mesh = merged_sticker_mesh(
@@ -1829,11 +1830,11 @@ fn restore_resting_sticker_meshes(
 
 fn cube_visual_pool_needs_rebuild(
     pool: &CubeVisualPool,
-    order: u8,
+    order: u32,
     existing_visual_roots: &Query<'_, '_, Entity, With<CubeVisualRoot>>,
 ) -> bool {
-    let expected_stickers = Face::ALL.len() * usize::from(order) * usize::from(order);
-    let expected_cubies = surface_cubie_count(usize::from(order));
+    let expected_stickers = Face::ALL.len() * order as usize * order as usize;
+    let expected_cubies = surface_cubie_count(order as usize);
     pool.order != Some(order)
         || pool.root_entity.is_none()
         || pool.pivot_entity.is_none()
@@ -1863,7 +1864,7 @@ fn spawn_cube_visual_pool(
     scene_revision: u64,
 ) -> (CubeVisualPool, Vec<ActiveTurnAnimation>) {
     let first_animation_turn = animation_turns.as_ref().and_then(|v| v.first().copied());
-    let order = usize::from(state.order.get());
+            let order = state.order.get() as usize;
     let face_span = CUBE_FACE_SPAN;
     let step = face_span / order as f32;
     let sticker_size = step * 0.84;
@@ -2104,7 +2105,7 @@ fn begin_turn_batch_animation(
     meshes: &mut ResMut<'_, Assets<Mesh>>,
     materials: &mut ResMut<'_, Assets<StandardMaterial>>,
     pool: &CubeVisualPool,
-    order: u8,
+    order: u32,
     turns: &[TurnCommand],
     scene_revision: u64,
     pivots: &mut Query<
@@ -2126,7 +2127,6 @@ fn begin_turn_batch_animation(
     }
 
     let turns = RuntimeBridge::merge_batch_turns(order, turns);
-    let turns = turns.as_slice();
 
     if turns.is_empty() {
         sync_state.active_animations.clear();
@@ -2199,7 +2199,7 @@ fn begin_turn_batch_animation(
     }
 
     let mut animated_cubies_set: Vec<UVec3> = Vec::new();
-    for &turn in turns {
+    for &turn in &turns {
         for cubie in &pool.cubie_slots {
             if cubie_matches_turn(order, turn, *cubie) {
                 if !animated_cubies_set.contains(cubie) {
@@ -2273,7 +2273,7 @@ fn begin_turn_batch_animation(
     let mut animations: Vec<ActiveTurnAnimation> = Vec::new();
     let mut temp_entities: Vec<Entity> = Vec::new();
 
-    for &turn in turns {
+    for &turn in &turns {
         let (_, animated_body_cubies) =
             partition_body_cubies(&pool.cubie_slots, order, Some(turn));
         let animated_body_mesh_data = if animated_body_cubies.is_empty() {
@@ -2840,7 +2840,7 @@ fn apply_camera_transform(
 fn projected_sticker_hit(
     camera: &Camera,
     camera_transform: &GlobalTransform,
-    order: u8,
+    order: u32,
     pointer_position: Vec2,
 ) -> Option<ScreenStickerCandidate> {
     let surface_hit = cube_surface_hit(camera, camera_transform, order, pointer_position)?;
@@ -2850,7 +2850,7 @@ fn projected_sticker_hit(
 fn slice_turn_from_sticker_drag(
     camera: &Camera,
     camera_transform: &GlobalTransform,
-    order: u8,
+    order: u32,
     candidate: ScreenStickerCandidate,
     start_position: Vec2,
     end_position: Vec2,
@@ -2912,7 +2912,7 @@ fn slice_face_from_sticker_drag(candidate: ScreenStickerCandidate, drag: Vec2) -
 fn cube_surface_hit(
     camera: &Camera,
     camera_transform: &GlobalTransform,
-    order: u8,
+    order: u32,
     pointer_position: Vec2,
 ) -> Option<CubeSurfaceHit> {
     let ray = camera
@@ -2979,10 +2979,10 @@ fn cube_surface_hit_from_ray(
 fn surface_hit_candidate(
     camera: &Camera,
     camera_transform: &GlobalTransform,
-    order: u8,
+    order: u32,
     surface_hit: CubeSurfaceHit,
 ) -> Option<ScreenStickerCandidate> {
-    let order_usize = usize::from(order);
+    let order_usize = order as usize;
     let half_extent = virtual_cube_half_extent(order);
     let surface_span = half_extent * 2.0;
     let row = surface_axis_index(
@@ -3081,7 +3081,7 @@ fn surface_hit_candidate(
     })
 }
 
-fn virtual_cube_half_extent(order: u8) -> f32 {
+fn virtual_cube_half_extent(order: u32) -> f32 {
     cube_face_offset(order) - VIRTUAL_SURFACE_INSET
 }
 
@@ -3143,15 +3143,15 @@ fn axis_face(axis: Vec3) -> Option<Face> {
     }
 }
 
-fn slice_start_layer(face: Face, cubie: UVec3, order: u8) -> u8 {
+fn slice_start_layer(face: Face, cubie: UVec3, order: u32) -> u32 {
     let max = order.saturating_sub(1);
     match face {
-        Face::Up => max.saturating_sub(cubie.y as u8),
-        Face::Right => max.saturating_sub(cubie.x as u8),
-        Face::Front => max.saturating_sub(cubie.z as u8),
-        Face::Down => cubie.y as u8,
-        Face::Left => cubie.x as u8,
-        Face::Back => cubie.z as u8,
+        Face::Up => max.saturating_sub(cubie.y),
+        Face::Right => max.saturating_sub(cubie.x),
+        Face::Front => max.saturating_sub(cubie.z),
+        Face::Down => cubie.y,
+        Face::Left => cubie.x,
+        Face::Back => cubie.z,
     }
 }
 
@@ -3179,7 +3179,7 @@ fn projected_turn_motion(
     (delta.length_squared() > f32::EPSILON).then_some(delta.normalize())
 }
 
-fn cube_face_offset(order: u8) -> f32 {
+fn cube_face_offset(order: u32) -> f32 {
     let step = CUBE_FACE_SPAN / order.max(1) as f32;
     let cube_size = CUBE_FACE_SPAN + (step * 0.12);
     cube_size / 2.0 + 0.03
@@ -3293,8 +3293,8 @@ fn rotation_direction_value(rotation: RotationAmount) -> i8 {
     }
 }
 
-fn cubie_to_centered(cubie: UVec3, order: u8) -> IVec3 {
-    let max = i32::from(order.saturating_sub(1));
+fn cubie_to_centered(cubie: UVec3, order: u32) -> IVec3 {
+    let max = order.saturating_sub(1) as i32;
     IVec3::new(
         (cubie.x as i32 * 2) - max,
         (cubie.y as i32 * 2) - max,
@@ -3302,8 +3302,8 @@ fn cubie_to_centered(cubie: UVec3, order: u8) -> IVec3 {
     )
 }
 
-fn centered_to_cubie(point: IVec3, order: u8) -> UVec3 {
-    let max = i32::from(order.saturating_sub(1));
+fn centered_to_cubie(point: IVec3, order: u32) -> UVec3 {
+    let max = order.saturating_sub(1) as i32;
     UVec3::new(
         ((point.x + max) / 2) as u32,
         ((point.y + max) / 2) as u32,
@@ -3311,7 +3311,7 @@ fn centered_to_cubie(point: IVec3, order: u8) -> UVec3 {
     )
 }
 
-fn rotate_cubie_for_turn(order: u8, turn: TurnCommand, cubie: UVec3) -> UVec3 {
+fn rotate_cubie_for_turn(order: u32, turn: TurnCommand, cubie: UVec3) -> UVec3 {
     let mut centered = cubie_to_centered(cubie, order);
     for _ in 0..positive_turn_steps(turn.rotation) {
         centered = rotate_positive_face_step(turn.face, centered);
@@ -3328,13 +3328,13 @@ fn rotate_face_for_turn(turn: TurnCommand, face: Face) -> Face {
 }
 
 fn rotate_sticker_visual_for_turn(
-    order: u8,
+    order: u32,
     turn: TurnCommand,
     visual: StickerVisual,
 ) -> StickerVisual {
     let cubie = rotate_cubie_for_turn(order, turn, visual.cubie);
     let face = rotate_face_for_turn(turn, visual.face);
-    let (row, col) = sticker_row_col(face, cubie, usize::from(order));
+    let (row, col) = sticker_row_col(face, cubie, order as usize);
     StickerVisual {
         face,
         row: row as u8,
@@ -3429,7 +3429,7 @@ fn turn_rotation_angle(turn: TurnCommand) -> f32 {
     -quarter_turns * std::f32::consts::FRAC_PI_2
 }
 
-fn cubie_matches_turn(order: u8, turn: TurnCommand, cubie: UVec3) -> bool {
+fn cubie_matches_turn(order: u32, turn: TurnCommand, cubie: UVec3) -> bool {
     let (axis_value, min_layer, max_layer) = match turn.face {
         Face::Up => {
             let max = u32::from(order.saturating_sub(1));
@@ -3656,15 +3656,15 @@ fn keyboard_selected_layer(keys: &ButtonInput<KeyCode>) -> u8 {
 fn keyboard_shortcut_turn(
     face: Face,
     rotation: RotationAmount,
-    order: u8,
+    order: u32,
     wide_turn: bool,
     selected_layer: u8,
 ) -> Option<TurnCommand> {
-    if selected_layer == 0 || selected_layer > order {
+    if selected_layer == 0 || u32::from(selected_layer) > order {
         return None;
     }
 
-    let start_layer = selected_layer - 1;
+    let start_layer = u32::from(selected_layer - 1);
     let width = if wide_turn { 2 } else { 1 };
     let turn = TurnCommand {
         face,
