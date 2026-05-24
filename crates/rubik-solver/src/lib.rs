@@ -8,8 +8,11 @@
 pub mod ida2x2;
 pub mod kociemba;
 mod min2phase;
+mod simplify;
 
 use rubik_core::{CubeState, TurnCommand};
+#[cfg(debug_assertions)]
+use rubik_core::apply_turn_to_state;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -33,13 +36,35 @@ pub fn request_cancel() {
 pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
     let token = Arc::new(AtomicBool::new(false));
     *cancel_mutex().lock().expect("lock") = Some(Arc::clone(&token));
-    
-    let result = rcube_rs::solve(state, Some(&token))
-        .map_err(|msg| SolveError::InvalidState(msg));
-    
+
+    let turns = rcube_rs::solve(state, Some(&token))
+        .map_err(|msg| SolveError::InvalidState(msg))?;
+
     // Clear the cancel token (drop the Arc)
     *cancel_mutex().lock().expect("lock") = None;
-    result
+
+    let simplified = simplify::simplify_turns(&turns, state.order.get());
+
+    // Verify simplification preserves the solution in debug builds.
+    // Skip verification for large cubes (>10) because apply_turn_to_state
+    // is O(turns × stickers) and becomes prohibitively slow.
+    #[cfg(debug_assertions)]
+    if state.order.get() <= 10 {
+        let mut verify = state.clone();
+        for &turn in &simplified {
+            apply_turn_to_state(&mut verify, turn).map_err(|e| {
+                SolveError::InvalidState(format!("simplification produced invalid turn: {e}"))
+            })?;
+        }
+        let expected = verify.solved_with_centers_from();
+        if verify != expected {
+            return Err(SolveError::InvalidState(
+                "simplification broke the solution".into(),
+            ));
+        }
+    }
+
+    Ok(simplified)
 }
 
 #[derive(Debug, Clone)]
