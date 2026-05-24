@@ -56,8 +56,7 @@ pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
                 SolveError::InvalidState(format!("simplification produced invalid turn: {e}"))
             })?;
         }
-        let expected = verify.solved_with_centers_from();
-        if verify != expected {
+        if !verify.is_solved() {
             return Err(SolveError::InvalidState(
                 "simplification broke the solution".into(),
             ));
@@ -254,8 +253,7 @@ pub fn solve_request_json(request_json: &str) -> String {
                     break;
                 }
             }
-            let solved =
-                valid && &verify == &verify.solved_with_centers_from();
+            let solved = valid && verify.is_solved();
             let json_turns: Vec<TurnCommandJson> =
                 turns.iter().map(|t| turn_to_json(t)).collect();
             serde_json::to_string(&SolveResponse {

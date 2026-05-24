@@ -50,7 +50,7 @@ impl CubeEngine {
     }
 
     pub fn is_solved(&self) -> bool {
-        self.current_state == self.current_state.solved_with_centers_from()
+        self.current_state.is_solved()
     }
 
     pub fn apply_turn(&mut self, turn: TurnCommand) -> Result<(), CubeEngineError> {

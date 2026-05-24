@@ -57,7 +57,7 @@ fn apply_turns(state: &mut CubeState, turns: &[TurnCommand]) -> Result<(), Strin
 }
 
 fn is_solved(state: &CubeState) -> bool {
-    state == &CubeState::solved(state.order)
+    state.is_solved()
 }
 
 fn verify_solution(initial: &CubeState, solution: &[TurnCommand]) -> bool {

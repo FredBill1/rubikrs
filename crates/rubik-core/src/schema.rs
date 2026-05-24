@@ -37,6 +37,39 @@ impl Face {
             Self::Back => StickerColor::Blue,
         }
     }
+
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Up => Self::Down,
+            Self::Right => Self::Left,
+            Self::Front => Self::Back,
+            Self::Down => Self::Up,
+            Self::Left => Self::Right,
+            Self::Back => Self::Front,
+        }
+    }
+
+    pub const fn direction(self) -> (i32, i32, i32) {
+        match self {
+            Self::Up => (0, 1, 0),
+            Self::Right => (1, 0, 0),
+            Self::Front => (0, 0, 1),
+            Self::Down => (0, -1, 0),
+            Self::Left => (-1, 0, 0),
+            Self::Back => (0, 0, -1),
+        }
+    }
+
+    pub fn from_solved_color(color: StickerColor) -> Self {
+        match color {
+            StickerColor::White => Self::Up,
+            StickerColor::Red => Self::Right,
+            StickerColor::Green => Self::Front,
+            StickerColor::Yellow => Self::Down,
+            StickerColor::Orange => Self::Left,
+            StickerColor::Blue => Self::Back,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -167,41 +200,68 @@ impl CubeState {
         }
     }
 
-    /// Returns a solved-state target where each face's uniform color is
-    /// determined by the true center sticker of `self`.
+    /// Checks whether the cube is solved, regardless of its overall
+    /// orientation.
     ///
-    /// For odd-order cubes: reads the center sticker of each face and fills
-    /// the entire face with that color. This supports non-standard color
-    /// schemes where centers may not be in their canonical positions.
-    ///
-    /// For even-order cubes: delegates to [`Self::solved`] because there is
-    /// no unique true center sticker.
-    pub fn solved_with_centers_from(&self) -> Self {
+    /// A cube is solved if every face is uniformly colored, the six face
+    /// colors are distinct, opposite face pairs are preserved, and the
+    /// orientation is right-handed (R × B == U).
+    pub fn is_solved(&self) -> bool {
         let order = self.order.get() as usize;
         let face_size = order * order;
 
-        if order % 2 == 0 {
-            return Self::solved(self.order);
+        // Determine each face's color from its first sticker.
+        let face_colors: [StickerColor; 6] = {
+            let mut colors = [StickerColor::White; 6];
+            for (i, color) in colors.iter_mut().enumerate() {
+                *color = self.stickers[i * face_size];
+            }
+            colors
+        };
+
+        // Check each face is uniformly colored.
+        for face_idx in 0..6usize {
+            let face_start = face_idx * face_size;
+            let expected = self.stickers[face_start];
+            for i in 1..face_size {
+                if self.stickers[face_start + i] != expected {
+                    return false;
+                }
+            }
         }
 
-        let mid = order / 2;
-        let center_offset = mid * order + mid;
-
-        let stickers: Vec<StickerColor> = Face::ALL
-            .into_iter()
-            .enumerate()
-            .flat_map(|(face_idx, _face)| {
-                let face_start = face_idx * face_size;
-                let center_color = self.stickers[face_start + center_offset];
-                core::iter::repeat_n(center_color, face_size)
-            })
-            .collect();
-
-        Self {
-            version: CUBE_STATE_SCHEMA_VERSION,
-            order: self.order,
-            stickers,
+        // Check all six face colors are distinct.
+        {
+            let mut seen = [false; 6];
+            for &color in face_colors.iter() {
+                let idx = color.index();
+                if seen[idx] {
+                    return false;
+                }
+                seen[idx] = true;
+            }
         }
+
+        // Map each physical face to the canonical face whose solved color it
+        // currently displays.
+        let cf: [Face; 6] = face_colors.map(Face::from_solved_color);
+
+        // Opposite pairs must be preserved.
+        if cf[0].opposite() != cf[3] {
+            return false;
+        } // U ↔ D
+        if cf[1].opposite() != cf[4] {
+            return false;
+        } // R ↔ L
+        if cf[2].opposite() != cf[5] {
+            return false;
+        } // F ↔ B
+
+        // Right-handed orientation: R × B == U
+        let (rx, ry, rz) = cf[1].direction();
+        let (bx, by, bz) = cf[5].direction();
+        let cross = (ry * bz - rz * by, rz * bx - rx * bz, rx * by - ry * bx);
+        cross == cf[0].direction()
     }
 
     pub fn validate(&self) -> Result<(), CubeStateValidationError> {
@@ -360,7 +420,7 @@ mod tests {
         CUBE_STATE_SCHEMA_VERSION, CubeState, CubeStateParseError, CubeStateValidationError, Face,
         RotationAmount, StickerColor, TurnCommand, TurnCommandValidationError,
     };
-    use crate::CubeOrder;
+    use crate::{apply_turn_to_state, CubeOrder};
 
     #[test]
     fn solved_state_uses_canonical_face_order_and_counts() {
@@ -487,5 +547,135 @@ mod tests {
             error,
             TurnCommandValidationError::WholeCubeRotationUnsupported { order: 3 }
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_solved tests
+    // -----------------------------------------------------------------------
+
+    /// X-axis rotation (around R-L): U→F, F→D, D→B, B→U, R/L stay.
+    fn rotate_x(perm: [usize; 6]) -> [usize; 6] {
+        [perm[5], perm[1], perm[0], perm[2], perm[4], perm[3]]
+    }
+
+    /// Y-axis rotation (around U-D): F→R, R→B, B→L, L→F, U/D stay.
+    fn rotate_y(perm: [usize; 6]) -> [usize; 6] {
+        [perm[0], perm[2], perm[4], perm[3], perm[5], perm[1]]
+    }
+
+    /// Z-axis rotation (around F-B): U→R, R→D, D→L, L→U, F/B stay.
+    fn rotate_z(perm: [usize; 6]) -> [usize; 6] {
+        [perm[4], perm[0], perm[2], perm[1], perm[3], perm[5]]
+    }
+
+    /// Generate all 24 valid face permutations reachable from identity via X,
+    /// Y, Z rotations.
+    fn all_24_face_perms() -> Vec<[usize; 6]> {
+        let identity = [0usize, 1, 2, 3, 4, 5];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = vec![identity];
+        seen.insert(identity);
+
+        let mut i = 0;
+        while i < queue.len() {
+            let perm = queue[i];
+            i += 1;
+            for next in [rotate_x(perm), rotate_y(perm), rotate_z(perm)] {
+                if seen.insert(next) {
+                    queue.push(next);
+                }
+            }
+        }
+        queue
+    }
+
+    /// Canonical solved colors in face-index order: U=White, R=Red, F=Green,
+    /// D=Yellow, L=Orange, B=Blue.
+    const CANONICAL_COLORS: [StickerColor; 6] = [
+        StickerColor::White,  // U
+        StickerColor::Red,    // R
+        StickerColor::Green,  // F
+        StickerColor::Yellow, // D
+        StickerColor::Orange, // L
+        StickerColor::Blue,   // B
+    ];
+
+    fn make_rotated_solved(order: u32, face_perm: &[usize; 6]) -> CubeState {
+        let order_usize = order as usize;
+        let face_size = order_usize * order_usize;
+        let mut stickers = Vec::with_capacity(6 * face_size);
+        for i in 0..6 {
+            let color = CANONICAL_COLORS[face_perm[i]];
+            stickers.extend(core::iter::repeat_n(color, face_size));
+        }
+        CubeState {
+            version: CUBE_STATE_SCHEMA_VERSION,
+            order: CubeOrder::new(order).expect("valid order"),
+            stickers,
+        }
+    }
+
+    #[test]
+    fn all_24_orientations_produce_24_perms() {
+        let perms = all_24_face_perms();
+        assert_eq!(perms.len(), 24, "there are exactly 24 cube orientations");
+    }
+
+    #[test]
+    fn is_solved_accepts_all_24_orientations_3x3() {
+        for perm in all_24_face_perms() {
+            let state = make_rotated_solved(3, &perm);
+            state.validate().expect("rotated solved state should be valid");
+            assert!(
+                state.is_solved(),
+                "3x3 should be solved for perm {perm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_solved_accepts_all_24_orientations_2x2() {
+        for perm in all_24_face_perms() {
+            let state = make_rotated_solved(2, &perm);
+            state.validate().expect("rotated solved state should be valid");
+            assert!(
+                state.is_solved(),
+                "2x2 should be solved for perm {perm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_solved_accepts_all_24_orientations_4x4() {
+        for perm in all_24_face_perms() {
+            let state = make_rotated_solved(4, &perm);
+            state.validate().expect("rotated solved state should be valid");
+            assert!(
+                state.is_solved(),
+                "4x4 should be solved for perm {perm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_solved_rejects_scrambled_3x3() {
+        let mut state = CubeState::solved(CubeOrder::standard());
+        apply_turn_to_state(
+            &mut state,
+            TurnCommand::outer(Face::Right, RotationAmount::Clockwise),
+        )
+        .expect("valid turn");
+        assert!(!state.is_solved());
+    }
+
+    #[test]
+    fn is_solved_rejects_scrambled_2x2() {
+        let mut state = CubeState::solved(CubeOrder::new(2).expect("valid"));
+        apply_turn_to_state(
+            &mut state,
+            TurnCommand::outer(Face::Up, RotationAmount::HalfTurn),
+        )
+        .expect("valid turn");
+        assert!(!state.is_solved());
     }
 }
