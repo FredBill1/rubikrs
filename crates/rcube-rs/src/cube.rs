@@ -33,6 +33,8 @@ use crate::face::Face;
 pub struct MoveRecord {
     pub face: u8,
     pub depth: u32,
+    /// Number of adjacent layers to turn (1 = single layer, >1 = wide turn)
+    pub width: u32,
     /// 1=Clockwise, 2=HalfTurn, -1(or 3)=CounterClockwise
     pub q: i32,
 }
@@ -238,19 +240,27 @@ impl Cube {
     // Public move — routes face/depth/q to the correct rotation axis
     // =========================================================================
 
-    pub fn move_face(&mut self, face: u8, depth: u32, q: i32) {
+    pub fn move_face_wide(&mut self, face: u8, depth: u32, width: u32, q: i32) {
         self.move_count += 1;
-        self.recorded_moves.push(MoveRecord { face, depth, q });
+        self.recorded_moves.push(MoveRecord { face, depth, width, q });
 
-        match face {
-            0 => self.rotate_z(depth, q),                 // F
-            1 => self.rotate_x(self.r1 - depth, q),        // R
-            2 => self.rotate_z(self.r1 - depth, -q),       // B
-            3 => self.rotate_x(depth, -q),                 // L
-            4 => self.rotate_y(self.r1 - depth, -q),       // U
-            5 => self.rotate_y(depth, q),                  // D
-            _ => {}
+        for i in 0..width {
+            let d = depth + i;
+            match face {
+                0 => self.rotate_z(d, q),                 // F
+                1 => self.rotate_x(self.r1 - d, q),        // R
+                2 => self.rotate_z(self.r1 - d, -q),       // B
+                3 => self.rotate_x(d, -q),                 // L
+                4 => self.rotate_y(self.r1 - d, -q),       // U
+                5 => self.rotate_y(d, q),                  // D
+                _ => {}
+            }
         }
+    }
+
+    /// Apply a single-layer turn (convenience wrapper).
+    pub fn move_face(&mut self, face: u8, depth: u32, q: i32) {
+        self.move_face_wide(face, depth, 1, q);
     }
 
     // =========================================================================
@@ -311,6 +321,49 @@ impl Cube {
                     self.solve_edges_odd(cancelled);
                 }
             }
+        }
+    }
+
+    // =========================================================================
+    // solve_reduction — centers + edges only (no corners), for reduction→3x3→Kociemba
+    // =========================================================================
+
+    pub fn solve_reduction(&mut self, cancelled: &AtomicBool) {
+        // 1x1: trivial
+        if self.row_size == 1 {
+            for i in 0u8..6u8 {
+                self.faces[i as usize].set_rc(0, 0, i);
+            }
+            return;
+        }
+
+        // 2x2: skip — handled by ida2x2 in dispatcher
+        if self.row_size == 2 {
+            return;
+        }
+
+        // Odd size: align true centers
+        self.align_true_centers();
+
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Solve centers (stages 0-14)
+        self.solve_centers(cancelled);
+
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Skip corners (stage 15) — Kociemba handles the 3x3 solve.
+        // Go directly to edges (stage 16).
+        self.stage = 16;
+
+        if self.is_even {
+            self.solve_edges_even(cancelled);
+        } else {
+            self.solve_edges_odd(cancelled);
         }
     }
 

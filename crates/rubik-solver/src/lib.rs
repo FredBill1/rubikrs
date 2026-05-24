@@ -33,13 +33,58 @@ pub fn request_cancel() {
 pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
     let token = Arc::new(AtomicBool::new(false));
     *cancel_mutex().lock().expect("lock") = Some(Arc::clone(&token));
-    
-    let result = rcube_rs::solve(state, Some(&token))
-        .map_err(|msg| SolveError::InvalidState(msg));
-    
-    // Clear the cancel token (drop the Arc)
+
+    let result = solve_inner(state, &token);
+
     *cancel_mutex().lock().expect("lock") = None;
     result
+}
+
+fn solve_inner(
+    state: &CubeState,
+    cancel: &AtomicBool,
+) -> Result<Vec<TurnCommand>, SolveError> {
+    let order = state.order.get();
+
+    if order == 2 {
+        return ida2x2::solve(state);
+    }
+    if order == 3 {
+        return kociemba::solve(state);
+    }
+
+    // For even-order cubes (4, 6, 8, ...), try reduction → Kociemba.
+    // Odd-order cubes (5, 7, ...) use the original solver.
+    // TODO: fix odd-order reduction path — the edge solver has subtle
+    // interactions with unsolved corners.
+    if order >= 4 && order % 2 == 0 {
+        let (reduction_turns, reduced_3x3) =
+            rcube_rs::reduce_to_3x3(state, cancel)
+                .map_err(|msg| SolveError::InvalidState(msg))?;
+
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SolveError::Cancelled);
+        }
+
+        // Try Kociemba on the reduced 3x3. Falls back to full solver on
+        // parity (unsolvable 3x3 state).
+        match kociemba::solve(&reduced_3x3) {
+            Ok(kociemba_turns) => {
+                let mut all_turns = reduction_turns;
+                all_turns.extend(kociemba_turns);
+                let optimized =
+                    rcube_rs::reduction::postprocess::postprocess(&all_turns);
+                return Ok(optimized);
+            }
+            Err(_) => {
+                // Parity or other issue — fall through to full solver
+            }
+        }
+    }
+
+    // Fallback: original full solver
+    rcube_rs::solve(state, Some(cancel))
+        .map_err(|msg| SolveError::InvalidState(msg))
 }
 
 #[derive(Debug, Clone)]
@@ -210,14 +255,12 @@ pub fn solve_request_json(request_json: &str) -> String {
         }
     };
 
-    let order = state.order.get();
-    let solve_result = if order == 3 {
-        kociemba::solve(&state)
-    } else if order == 2 {
-        ida2x2::solve(&state)
-    } else {
-        solve(&state)
-    };
+    let token = Arc::new(AtomicBool::new(false));
+    *cancel_mutex().lock().expect("lock") = Some(Arc::clone(&token));
+
+    let solve_result = solve_inner(&state, &token);
+
+    *cancel_mutex().lock().expect("lock") = None;
     match solve_result {
         Ok(turns) => {
             // Verify the solution

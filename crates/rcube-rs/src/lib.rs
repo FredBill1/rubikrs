@@ -28,6 +28,7 @@
 pub mod constants;
 mod face;
 pub mod cube;
+pub mod reduction;
 
 use cube::{Cube, MoveRecord};
 use rubik_core::{CubeState, Face as RubikFace, RotationAmount, StickerColor, TurnCommand};
@@ -146,7 +147,7 @@ fn move_record_to_turn(record: &MoveRecord) -> TurnCommand {
     TurnCommand {
         face,
         start_layer: record.depth,
-        width: 1,
+        width: record.width,
         rotation,
     }
 }
@@ -191,6 +192,39 @@ pub fn solve(state: &CubeState, cancel: Option<&AtomicBool>) -> Result<Vec<TurnC
     }
 
     Ok(turns)
+}
+
+/// Reduction solve: runs centers + edge pairing on the RCube, then extracts
+/// a 3x3 CubeState. Returns the reduction-phase moves and the reduced 3x3 state.
+/// The caller should solve the 3x3 (e.g., via Kociemba) and combine the moves.
+pub fn reduce_to_3x3(
+    state: &CubeState,
+    cancel: &AtomicBool,
+) -> Result<(Vec<TurnCommand>, CubeState), String> {
+    let order = state.order.get();
+    if order < 4 {
+        return Err("reduce_to_3x3 is only for order >= 4".to_string());
+    }
+    if order > 65536 {
+        return Err(format!("cube order {} exceeds maximum 65536", order));
+    }
+
+    let mut cube = cube_state_to_rcube(state);
+    cube.solve_reduction(cancel);
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err("solve cancelled".to_string());
+    }
+
+    let reduced_3x3 = reduction::extract::extract_3x3_state(&cube);
+
+    let turns: Vec<TurnCommand> = cube
+        .recorded_moves
+        .iter()
+        .map(move_record_to_turn)
+        .collect();
+
+    Ok((turns, reduced_3x3))
 }
 
 // ---------------------------------------------------------------------------
