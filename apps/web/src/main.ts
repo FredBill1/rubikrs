@@ -130,6 +130,8 @@ let cachedRuntimeStatus: RuntimeStatus | null = null
 let solveAnimationActive = false
 let solveAnimationAborted = false
 let replayExpectedEnqueueCount: bigint | null = null
+let appliedOrder: number | null = null
+let lastHistoryText: string | null = null
 
 app.innerHTML = `
   <div class="shell">
@@ -137,6 +139,10 @@ app.innerHTML = `
       <section class="stage-card" aria-label="Rubik preview stage">
         <div class="stage-grid" aria-hidden="true"></div>
         <canvas id="rubik-canvas" class="stage-canvas" aria-label="Rubik runtime canvas"></canvas>
+        <div class="stage-loader" data-boot-spinner>
+          <div class="stage-loader-spinner"></div>
+          <p class="stage-loader-text">Loading…</p>
+        </div>
         <button type="button" class="stage-toggle stage-toggle--landscape" aria-label="Toggle telemetry panel" title="Toggle telemetry panel">
           <span class="toggle-arrow"/>
         </button>
@@ -162,14 +168,10 @@ app.innerHTML = `
           <div class="control-cluster">
             <label class="field">
               <span>cube order</span>
-              <select data-order-select>
-                <option value="2">2x2</option>
-                <option value="3" selected>3x3</option>
-                <option value="4">4x4</option>
-                <option value="5">5x5</option>
-                <option value="7">7x7</option>
-                <option value="17">17x17</option>
-              </select>
+              <div class="field-row">
+                <input data-order-select type="number" min="2" max="30" value="3" />
+                <button type="button" data-action="apply-order">apply</button>
+              </div>
             </label>
 
             <div class="action-row">
@@ -181,11 +183,11 @@ app.innerHTML = `
             <div class="action-row action-row--stacked">
               <label class="field">
                 <span>scramble length</span>
-                <input data-scramble-length type="number" min="1" max="64" value="20" />
+                <input data-scramble-length type="number" min="1" max="1048576" value="2000" />
               </label>
               <label class="field">
                 <span>seed</span>
-                <input data-scramble-seed type="number" min="1" max="9999999" value="20260517" />
+                <input data-scramble-seed type="number" min="0" max="2147483647" value="0" />
               </label>
               <button type="button" data-action="scramble">scramble</button>
             </div>
@@ -240,7 +242,7 @@ app.innerHTML = `
         <section class="panel">
           <p class="panel-kicker">import / export</p>
           <div class="control-cluster">
-            <div class="action-row">
+            <div class="action-row action-row--stacked">
               <button type="button" data-action="export">export json</button>
               <button type="button" data-action="import-file">load file</button>
               <input data-import-file type="file" accept=".json,application/json" hidden />
@@ -292,7 +294,8 @@ app.innerHTML = `
 
 const bootPill = document.querySelector<HTMLElement>('[data-boot-pill]')
 const bootCopy = document.querySelector<HTMLElement>('[data-boot-copy]')
-const orderSelect = document.querySelector<HTMLSelectElement>('[data-order-select]')
+const bootSpinner = document.querySelector<HTMLElement>('[data-boot-spinner]')
+const orderSelect = document.querySelector<HTMLInputElement>('[data-order-select]')
 const scrambleLength = document.querySelector<HTMLInputElement>('[data-scramble-length]')
 const scrambleSeed = document.querySelector<HTMLInputElement>('[data-scramble-seed]')
 const turnLayer = document.querySelector<HTMLInputElement>('[data-turn-layer]')
@@ -355,14 +358,15 @@ function formatTimer(elapsedMillis: number): string {
 function parseScrambleSeed(raw: string | undefined): bigint {
   const trimmed = raw?.trim()
   if (!trimmed) {
-    return BigInt(Date.now())
+    return 0n
   }
 
   try {
-    return BigInt(trimmed)
+    const parsed = BigInt(trimmed)
+    return parsed
   } catch (error) {
     console.error(error)
-    return BigInt(Date.now())
+    return 0n
   }
 }
 
@@ -395,10 +399,16 @@ function renderRuntimeStatus(status: RuntimeStatus | null): void {
   statusOrder!.textContent = `${status.order}x${status.order}`
   statusMoves!.textContent = String(status.move_count)
   statusTimer!.textContent = formatTimer(status.elapsed_millis)
-  statusHistory!.textContent = status.recent_turns.length > 0 ? status.recent_turns.join('  ·  ') : '—'
 
-  if (orderSelect && orderSelect.value !== String(status.order)) {
+  const historyText = status.recent_turns.length > 0 ? status.recent_turns.join('  ·  ') : '—'
+  if (statusHistory && lastHistoryText !== historyText) {
+    statusHistory.textContent = historyText
+    lastHistoryText = historyText
+  }
+
+  if (orderSelect && appliedOrder !== status.order) {
     orderSelect.value = String(status.order)
+    appliedOrder = status.order
   }
 
   if (bootCopy) {
@@ -465,6 +475,9 @@ function updateBootState(tone: BootTone, label: string, detail: string): void {
   }
   if (bootCopy) {
     bootCopy.textContent = detail
+  }
+  if (tone !== 'booting' && bootSpinner) {
+    bootSpinner.hidden = true
   }
 }
 
@@ -1037,9 +1050,9 @@ function bindShellControls(module: RubikWasmModule): void {
           break
         case 'scramble': {
           cancelActiveSolve('Scrambling cancelled the in-flight solve request.')
-          const length = Number.parseInt(scrambleLength?.value ?? '20', 10) || 20
+          const length = Number.parseInt(scrambleLength?.value ?? '2000', 10) || 2000
           const seed = parseScrambleSeed(scrambleSeed?.value)
-          module.scramble_cube(length, seed)
+          module.scramble_cube(length, seed === 0n ? BigInt(Date.now()) : seed)
           break
         }
         case 'export': {
@@ -1071,6 +1084,17 @@ function bindShellControls(module: RubikWasmModule): void {
         case 'cancel-solve':
           cancelActiveSolve('Solve request cancelled. A fresh worker will be created next time.')
           break
+        case 'apply-order': {
+          cancelActiveSolve('Changing the cube order cancelled the in-flight solve request.')
+          const nextOrder = Math.max(2, Math.min(30, Number.parseInt(orderSelect?.value ?? '3', 10) || 3))
+          if (orderSelect) {
+            orderSelect.value = String(nextOrder)
+          }
+          appliedOrder = nextOrder
+          module.set_cube_order(nextOrder)
+          syncSolveControls()
+          break
+        }
       }
 
       syncStatus()
@@ -1093,14 +1117,6 @@ function bindShellControls(module: RubikWasmModule): void {
     })
   }
 
-  orderSelect?.addEventListener('change', () => {
-    cancelActiveSolve('Changing the cube order cancelled the in-flight solve request.')
-    const nextOrder = Number.parseInt(orderSelect.value, 10)
-    module.set_cube_order(nextOrder)
-    syncSolveControls()
-    syncStatus()
-  })
-
   importFile?.addEventListener('change', async () => {
     const file = importFile.files?.[0]
     if (!file) {
@@ -1116,6 +1132,13 @@ function bindShellControls(module: RubikWasmModule): void {
     module.import_cube_state(text)
     importFile.value = ''
     syncStatus()
+  })
+
+  orderSelect?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      document.querySelector<HTMLButtonElement>('[data-action="apply-order"]')?.click()
+    }
   })
 
   syncSolveControls()

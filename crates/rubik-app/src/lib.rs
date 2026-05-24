@@ -1868,7 +1868,7 @@ fn spawn_cube_visual_pool(
     let face_span = CUBE_FACE_SPAN;
     let step = face_span / order as f32;
     let sticker_size = step * 0.84;
-    let sticker_depth = 0.06_f32;
+    let sticker_depth = sticker_size * 0.113_f32;
     let cubie_body_size = step * 0.92;
     let face_offset = cube_face_offset(state.order.get());
     let sticker_material = materials.add(StandardMaterial {
@@ -3182,7 +3182,7 @@ fn projected_turn_motion(
 fn cube_face_offset(order: u32) -> f32 {
     let step = CUBE_FACE_SPAN / order.max(1) as f32;
     let cube_size = CUBE_FACE_SPAN + (step * 0.12);
-    cube_size / 2.0 + 0.03
+    cube_size / 2.0 + 0.001
 }
 
 fn surface_cubie_count(order: usize) -> usize {
