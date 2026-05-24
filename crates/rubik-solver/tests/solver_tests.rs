@@ -1068,4 +1068,27 @@ mod ida2x2_2x2 {
         }
         assert!(is_solved(&verify), "applying solution should restore solved state");
     }
+
+    #[test]
+    fn test_2x2_rotated_solved_all_24() {
+        for fp in rubik_core::all_face_permutations() {
+            let mut stickers = Vec::with_capacity(24);
+            for face_idx in 0..6 {
+                let color = rubik_core::CANONICAL_COLORS[fp[face_idx]];
+                stickers.extend(std::iter::repeat_n(color, 4));
+            }
+            let state = CubeState {
+                version: rubik_core::CUBE_STATE_SCHEMA_VERSION,
+                order: CubeOrder::new(2).expect("valid"),
+                stickers,
+            };
+            assert!(is_solved(&state),
+                "rotated state for perm {fp:?} should be is_solved");
+            let solution = solve_ida2x2_with_timeout(&state, Duration::from_secs(5))
+                .expect("solve should succeed");
+            assert!(solution.is_empty(),
+                "rotated solved 2x2 should have empty solution, got {} moves for perm {fp:?}",
+                solution.len());
+        }
+    }
 }

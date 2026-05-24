@@ -451,6 +451,133 @@ fn heuristic(perm: u16, orient: u16) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Whole-cube rotation precomputation
+// ---------------------------------------------------------------------------
+
+/// 3D coordinates (x, y, z) in {0, 1}^3 for each corner position.
+/// Positions 0-7: URF, UFL, ULB, UBR, DFR, DFL, DLB, DRB.
+const CORNER_COORDS: [(usize, usize, usize); 8] = [
+    (1, 1, 1), // 0: URF
+    (0, 1, 1), // 1: UFL
+    (0, 1, 0), // 2: ULB
+    (1, 1, 0), // 3: UBR
+    (1, 0, 1), // 4: DFR
+    (0, 0, 1), // 5: DFL
+    (0, 0, 0), // 6: DLB
+    (1, 0, 0), // 7: DRB
+];
+
+/// Direction vector for each face: U=(0,1,0), R=(1,0,0), F=(0,0,1),
+/// D=(0,-1,0), L=(-1,0,0), B=(0,0,-1).
+fn face_dir(f: usize) -> (i32, i32, i32) {
+    match f {
+        0 => (0, 1, 0),
+        1 => (1, 0, 0),
+        2 => (0, 0, 1),
+        3 => (0, -1, 0),
+        4 => (-1, 0, 0),
+        5 => (0, 0, -1),
+        _ => unreachable!(),
+    }
+}
+
+fn face_index(face: Face) -> usize {
+    match face {
+        Face::Up => 0,
+        Face::Right => 1,
+        Face::Front => 2,
+        Face::Down => 3,
+        Face::Left => 4,
+        Face::Back => 5,
+    }
+}
+
+struct RotationInfo {
+    /// Maps new_sticker_index -> old_sticker_index for building rotated states.
+    inv_perm: [usize; 24],
+    /// Maps rotated-frame face -> original-frame face (= fp^{-1}).
+    face_map: [usize; 6],
+}
+
+static ROTATIONS: OnceLock<Vec<RotationInfo>> = OnceLock::new();
+
+fn rotations() -> &'static Vec<RotationInfo> {
+    ROTATIONS.get_or_init(|| precompute_rotations())
+}
+
+fn precompute_rotations() -> Vec<RotationInfo> {
+    rubik_core::all_face_permutations()
+        .into_iter()
+        .map(|fp| {
+            let inv_perm = compute_inv_perm(&fp);
+            let face_map = compute_face_map(&fp);
+            RotationInfo { inv_perm, face_map }
+        })
+        .collect()
+}
+
+/// Compute fp^{-1}: for each canonical face f, which physical face displays it.
+fn compute_face_map(fp: &[usize; 6]) -> [usize; 6] {
+    let mut inv = [0usize; 6];
+    for physical in 0..6 {
+        inv[fp[physical]] = physical;
+    }
+    inv
+}
+
+/// Compute the sticker permutation for building a rotated CubeState.
+///
+/// For each sticker in the rotated state (new_idx), determine which original
+/// sticker (old_idx) should be placed there. Uses 3D rotation geometry.
+fn compute_inv_perm(fp: &[usize; 6]) -> [usize; 24] {
+    let mut inv_perm = [0usize; 24];
+
+    for old_pos in 0..8 {
+        let (x, y, z) = CORNER_COORDS[old_pos];
+
+        // Map from {0,1} to {-1,1} space
+        let cx = 2 * x as i32 - 1;
+        let cy = 2 * y as i32 - 1;
+        let cz = 2 * z as i32 - 1;
+
+        // Apply Phi^{-1}: (cx,cy,cz) -> cx*dir(fp[1]) + cy*dir(fp[0]) + cz*dir(fp[2])
+        let d1 = face_dir(fp[1]); // image of canonical +X (R)
+        let d0 = face_dir(fp[0]); // image of canonical +Y (U)
+        let d2 = face_dir(fp[2]); // image of canonical +Z (F)
+        let new_cx = cx * d1.0 + cy * d0.0 + cz * d2.0;
+        let new_cy = cx * d1.1 + cy * d0.1 + cz * d2.1;
+        let new_cz = cx * d1.2 + cy * d0.2 + cz * d2.2;
+
+        // Convert back to {0,1}
+        let new_x = ((new_cx + 1) / 2) as usize;
+        let new_y = ((new_cy + 1) / 2) as usize;
+        let new_z = ((new_cz + 1) / 2) as usize;
+
+        // Find new corner position
+        let new_pos = CORNER_COORDS
+            .iter()
+            .position(|&(nx, ny, nz)| nx == new_x && ny == new_y && nz == new_z)
+            .expect("rotated coords must map to a valid corner");
+
+        for old_ori in 0..3 {
+            let old_face = sticker_face(CORNER_STICKERS[old_pos][old_ori]);
+            let old_idx = CORNER_STICKERS[old_pos][old_ori];
+
+            let new_face = fp[old_face];
+
+            let new_ori = (0..3)
+                .find(|&o| sticker_face(CORNER_STICKERS[new_pos][o]) == new_face)
+                .expect("new corner must have a facelet on the target face");
+
+            let new_idx = CORNER_STICKERS[new_pos][new_ori];
+            inv_perm[new_idx] = old_idx;
+        }
+    }
+
+    inv_perm
+}
+
+// ---------------------------------------------------------------------------
 // IDA* search
 // ---------------------------------------------------------------------------
 
@@ -542,6 +669,8 @@ fn dls(
 /// Solve a 2x2 cube state using IDA* with pattern databases.
 ///
 /// Only supports order == 2. Cancel via `super::request_cancel()`.
+///
+/// Tries all 24 whole-cube orientations and returns the shortest solution.
 pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
     if state.order.get() != 2 {
         return Err(SolveError::InvalidOrder(format!(
@@ -550,28 +679,80 @@ pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
         )));
     }
 
-    let piece_lut = build_piece_lut();
-    let (pieces, orients) = extract_corners(state, &piece_lut);
-
-    let perm = perm_to_coord(&pieces);
-    let orient = orient_to_coord(&orients);
-
-    // Set up cancel token — same pattern as kociemba::solve
-    let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    *cancel_mutex().lock().expect("lock") = Some(std::sync::Arc::clone(&token));
-
-    let result = ida_star(perm, orient, &token);
-
-    // Clean up
-    *cancel_mutex().lock().expect("lock") = None;
-
-    // Check if we were cancelled
-    if token.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(SolveError::Cancelled);
+    // Early exit: already solved in any orientation
+    if state.is_solved() {
+        return Ok(vec![]);
     }
 
-    let move_indices = result?;
-    Ok(move_indices.into_iter().map(move_index_to_turn).collect())
+    let piece_lut = build_piece_lut();
+    let rotations = rotations(); // ensure precomputed
+
+    let mut best_solution: Option<Vec<TurnCommand>> = None;
+
+    for rot in rotations.iter() {
+        // Build rotated state via sticker permutation
+        let rotated_stickers: Vec<StickerColor> = (0..24)
+            .map(|new_idx| state.stickers[rot.inv_perm[new_idx]])
+            .collect();
+        let rotated_state = CubeState {
+            version: state.version,
+            order: state.order,
+            stickers: rotated_stickers,
+        };
+
+        let (pieces, orients) = extract_corners(&rotated_state, &piece_lut);
+        let perm = perm_to_coord(&pieces);
+        let orient = orient_to_coord(&orients);
+
+        // Pruning: skip if heuristic lower bound already >= current best
+        if let Some(ref best) = best_solution {
+            if heuristic(perm, orient) as usize >= best.len() {
+                continue;
+            }
+        }
+
+        // Set up cancel token
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *cancel_mutex().lock().expect("lock") = Some(std::sync::Arc::clone(&token));
+
+        let result = ida_star(perm, orient, &token);
+
+        *cancel_mutex().lock().expect("lock") = None;
+
+        if token.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(SolveError::Cancelled);
+        }
+
+        if let Ok(move_indices) = result {
+            let solution: Vec<TurnCommand> = move_indices
+                .into_iter()
+                .map(|m| {
+                    let turn = move_index_to_turn(m);
+                    let original_face_idx = rot.face_map[face_index(turn.face)];
+                    TurnCommand {
+                        face: Face::ALL[original_face_idx],
+                        ..turn
+                    }
+                })
+                .collect();
+
+            if solution.is_empty() {
+                return Ok(solution);
+            }
+
+            match &best_solution {
+                None => best_solution = Some(solution),
+                Some(best) if solution.len() < best.len() => {
+                    best_solution = Some(solution);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    best_solution.ok_or_else(|| {
+        SolveError::InvalidState("no solution found in any orientation".into())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +961,7 @@ mod tests {
         for &turn in &solution {
             apply_turn_to_state(&mut verify, turn).expect("solution turn valid");
         }
-        assert_eq!(verify, CubeState::solved(CubeOrder::new(2).expect("valid")),
+        assert!(verify.is_solved(),
             "solution should restore solved state");
     }
 
@@ -806,7 +987,89 @@ mod tests {
         for &turn in &solution {
             apply_turn_to_state(&mut verify, turn).expect("solution turn valid");
         }
-        assert_eq!(verify, CubeState::solved(CubeOrder::new(2).expect("valid")),
+        assert!(verify.is_solved(),
+            "solution should restore solved state. Solution: {:?}", solution);
+    }
+
+    // -------------------------------------------------------------------
+    // Multi-orientation tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_solve_rotated_solved_all_24() {
+        for fp in rubik_core::all_face_permutations() {
+            let mut stickers = Vec::with_capacity(24);
+            for face_idx in 0..6 {
+                let color = rubik_core::CANONICAL_COLORS[fp[face_idx]];
+                stickers.extend(std::iter::repeat_n(color, 4));
+            }
+            let state = CubeState {
+                version: rubik_core::CUBE_STATE_SCHEMA_VERSION,
+                order: CubeOrder::new(2).expect("valid"),
+                stickers,
+            };
+            assert!(state.is_solved(),
+                "rotated solved state for perm {fp:?} should be is_solved");
+            let solution = solve(&state).expect("solve should succeed");
+            assert!(solution.is_empty(),
+                "rotated solved state should give empty solution, got {} moves for perm {fp:?}",
+                solution.len());
+        }
+    }
+
+    #[test]
+    fn test_rotation_identity_inv_perm() {
+        let rots = rotations();
+        let identity = rots.first().expect("identity should be first");
+        for i in 0..24 {
+            assert_eq!(identity.inv_perm[i], i,
+                "identity rotation must have identity sticker permutation");
+        }
+        assert_eq!(identity.face_map, [0, 1, 2, 3, 4, 5],
+            "identity rotation must have identity face map");
+    }
+
+    #[test]
+    fn test_all_24_face_perms_count() {
+        assert_eq!(rubik_core::all_face_permutations().len(), 24);
+    }
+
+    #[test]
+    fn test_rotation_inv_perm_is_bijection() {
+        for (ri, rot) in rotations().iter().enumerate() {
+            let mut seen = [false; 24];
+            for &old_idx in rot.inv_perm.iter() {
+                seen[old_idx] = true;
+            }
+            assert!(seen.iter().all(|&x| x),
+                "rotation {} inv_perm must cover all 24 indices", ri);
+        }
+    }
+
+    #[test]
+    fn test_solve_rotated_scramble() {
+        use rubik_core::apply_turn_to_state;
+
+        // Create a scrambled 2x2 state
+        let mut state = CubeState::solved(CubeOrder::new(2).expect("valid"));
+        let scramble = [
+            TurnCommand::outer(Face::Right, RotationAmount::Clockwise),
+            TurnCommand::outer(Face::Up, RotationAmount::HalfTurn),
+            TurnCommand::outer(Face::Front, RotationAmount::CounterClockwise),
+        ];
+        for &turn in &scramble {
+            apply_turn_to_state(&mut state, turn).expect("valid");
+        }
+
+        let solution = solve(&state).expect("solve should succeed");
+        assert!(!solution.is_empty());
+
+        // Verify solution
+        let mut verify = state.clone();
+        for &turn in &solution {
+            apply_turn_to_state(&mut verify, turn).expect("solution turn valid");
+        }
+        assert!(verify.is_solved(),
             "solution should restore solved state. Solution: {:?}", solution);
     }
 }

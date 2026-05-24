@@ -414,6 +414,57 @@ impl fmt::Display for TurnCommandValidationError {
 
 impl std::error::Error for TurnCommandValidationError {}
 
+// ---------------------------------------------------------------------------
+// Whole-cube rotation helpers (face-permutation space)
+// ---------------------------------------------------------------------------
+
+/// X-axis rotation (around R-L): U→B, B→D, D→F, F→U, R/L stay.
+pub fn rotate_x(perm: [usize; 6]) -> [usize; 6] {
+    [perm[5], perm[1], perm[0], perm[2], perm[4], perm[3]]
+}
+
+/// Y-axis rotation (around U-D): F→R, R→B, B→L, L→F, U/D stay.
+pub fn rotate_y(perm: [usize; 6]) -> [usize; 6] {
+    [perm[0], perm[2], perm[4], perm[3], perm[5], perm[1]]
+}
+
+/// Z-axis rotation (around F-B): U→R, R→D, D→L, L→U, F/B stay.
+pub fn rotate_z(perm: [usize; 6]) -> [usize; 6] {
+    [perm[4], perm[0], perm[2], perm[1], perm[3], perm[5]]
+}
+
+/// Generate all 24 valid face permutations reachable from identity via X, Y, Z
+/// rotations.
+pub fn all_face_permutations() -> Vec<[usize; 6]> {
+    let identity = [0usize, 1, 2, 3, 4, 5];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut queue = vec![identity];
+    seen.insert(identity);
+
+    let mut i = 0;
+    while i < queue.len() {
+        let perm = queue[i];
+        i += 1;
+        for next in [rotate_x(perm), rotate_y(perm), rotate_z(perm)] {
+            if seen.insert(next) {
+                queue.push(next);
+            }
+        }
+    }
+    queue
+}
+
+/// Canonical solved colors in face-index order: U=White, R=Red, F=Green,
+/// D=Yellow, L=Orange, B=Blue.
+pub const CANONICAL_COLORS: [StickerColor; 6] = [
+    StickerColor::White,
+    StickerColor::Red,
+    StickerColor::Green,
+    StickerColor::Yellow,
+    StickerColor::Orange,
+    StickerColor::Blue,
+];
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -553,59 +604,12 @@ mod tests {
     // is_solved tests
     // -----------------------------------------------------------------------
 
-    /// X-axis rotation (around R-L): U→F, F→D, D→B, B→U, R/L stay.
-    fn rotate_x(perm: [usize; 6]) -> [usize; 6] {
-        [perm[5], perm[1], perm[0], perm[2], perm[4], perm[3]]
-    }
-
-    /// Y-axis rotation (around U-D): F→R, R→B, B→L, L→F, U/D stay.
-    fn rotate_y(perm: [usize; 6]) -> [usize; 6] {
-        [perm[0], perm[2], perm[4], perm[3], perm[5], perm[1]]
-    }
-
-    /// Z-axis rotation (around F-B): U→R, R→D, D→L, L→U, F/B stay.
-    fn rotate_z(perm: [usize; 6]) -> [usize; 6] {
-        [perm[4], perm[0], perm[2], perm[1], perm[3], perm[5]]
-    }
-
-    /// Generate all 24 valid face permutations reachable from identity via X,
-    /// Y, Z rotations.
-    fn all_24_face_perms() -> Vec<[usize; 6]> {
-        let identity = [0usize, 1, 2, 3, 4, 5];
-        let mut seen = std::collections::BTreeSet::new();
-        let mut queue = vec![identity];
-        seen.insert(identity);
-
-        let mut i = 0;
-        while i < queue.len() {
-            let perm = queue[i];
-            i += 1;
-            for next in [rotate_x(perm), rotate_y(perm), rotate_z(perm)] {
-                if seen.insert(next) {
-                    queue.push(next);
-                }
-            }
-        }
-        queue
-    }
-
-    /// Canonical solved colors in face-index order: U=White, R=Red, F=Green,
-    /// D=Yellow, L=Orange, B=Blue.
-    const CANONICAL_COLORS: [StickerColor; 6] = [
-        StickerColor::White,  // U
-        StickerColor::Red,    // R
-        StickerColor::Green,  // F
-        StickerColor::Yellow, // D
-        StickerColor::Orange, // L
-        StickerColor::Blue,   // B
-    ];
-
     fn make_rotated_solved(order: u32, face_perm: &[usize; 6]) -> CubeState {
         let order_usize = order as usize;
         let face_size = order_usize * order_usize;
         let mut stickers = Vec::with_capacity(6 * face_size);
         for i in 0..6 {
-            let color = CANONICAL_COLORS[face_perm[i]];
+            let color = super::CANONICAL_COLORS[face_perm[i]];
             stickers.extend(core::iter::repeat_n(color, face_size));
         }
         CubeState {
@@ -617,13 +621,13 @@ mod tests {
 
     #[test]
     fn all_24_orientations_produce_24_perms() {
-        let perms = all_24_face_perms();
+        let perms = super::all_face_permutations();
         assert_eq!(perms.len(), 24, "there are exactly 24 cube orientations");
     }
 
     #[test]
     fn is_solved_accepts_all_24_orientations_3x3() {
-        for perm in all_24_face_perms() {
+        for perm in super::all_face_permutations() {
             let state = make_rotated_solved(3, &perm);
             state.validate().expect("rotated solved state should be valid");
             assert!(
@@ -635,7 +639,7 @@ mod tests {
 
     #[test]
     fn is_solved_accepts_all_24_orientations_2x2() {
-        for perm in all_24_face_perms() {
+        for perm in super::all_face_permutations() {
             let state = make_rotated_solved(2, &perm);
             state.validate().expect("rotated solved state should be valid");
             assert!(
@@ -647,7 +651,7 @@ mod tests {
 
     #[test]
     fn is_solved_accepts_all_24_orientations_4x4() {
-        for perm in all_24_face_perms() {
+        for perm in super::all_face_permutations() {
             let state = make_rotated_solved(4, &perm);
             state.validate().expect("rotated solved state should be valid");
             assert!(
