@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rubik-app", "crates/rubik-core", "crates/rubik-solver", "crates/rcube-rs"]
+members = ["crates/rubik-app", "crates/rubik-core", "crates/rubik-reduction", "crates/rubik-solver", "crates/rcube-rs"]
 resolver = "2"
 
 [workspace.package]

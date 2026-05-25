@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rubik-core = { path = "../rubik-core" }
+rubik-reduction = { path = "../rubik-reduction" }
 rcube-rs = { path = "../rcube-rs" }
 serde.workspace = true
 serde_json.workspace = true

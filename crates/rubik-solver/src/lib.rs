@@ -12,7 +12,7 @@ mod simplify;
 
 #[cfg(debug_assertions)]
 use rubik_core::apply_turn_to_state;
-use rubik_core::{CubeState, TurnCommand};
+use rubik_core::{CubeState, StickerColor, TurnCommand};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -34,6 +34,13 @@ pub fn request_cancel() {
 }
 
 pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
+    let order = state.order.get();
+
+    // Route orders 4–8 to the reduction solver
+    if (4..=8).contains(&order) {
+        return solve_with_reduction(state);
+    }
+
     let token = Arc::new(AtomicBool::new(false));
     *cancel_mutex().lock().expect("lock") = Some(Arc::clone(&token));
 
@@ -64,6 +71,97 @@ pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
     }
 
     Ok(simplified)
+}
+
+/// Solve a 4×4–8×8 cube using the reduction method.
+///
+/// Pipeline:
+/// 1. Reduce the cube (centers → edges → parity) via rubik-reduction
+/// 2. Extract a 3×3 facelet from the reduced state
+/// 3. Build a virtual 3×3 CubeState and solve with Kociemba
+/// 4. Map 3×3 outer-layer turns back to big-cube turns
+/// 5. Combine and simplify
+fn solve_with_reduction(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
+    // Phase 1–3: Reduce via rubik-reduction
+    let reduction_result = rubik_reduction::reduce(state).map_err(|e| {
+        SolveError::InvalidState(format!("reduction failed: {e}"))
+    })?;
+
+    // Extract 3×3 facelet from reduced state
+    let facelet = rubik_reduction::extract_facelet(&reduction_result.reduced_state).map_err(|e| {
+        SolveError::InvalidState(format!("facelet extraction failed: {e}"))
+    })?;
+
+    // Build a virtual 3×3 CubeState from the facelet
+    let virtual_3x3 = facelet_to_cube_state(&facelet).map_err(|e| {
+        SolveError::InvalidState(format!("facelet conversion failed: {e}"))
+    })?;
+
+    // Solve the virtual 3×3 with Kociemba
+    let kociemba_turns = kociemba::solve(&virtual_3x3)?;
+
+    // Map 3×3 outer-layer turns to big-cube turns
+    let big_cube_turns: Vec<TurnCommand> = kociemba_turns
+        .iter()
+        .map(|t| rubik_reduction::reduction::map_3x3_turn_to_big_cube(t))
+        .collect();
+
+    // Combine reduction turns + 3×3 turns
+    let mut all_turns = reduction_result.reduction_turns;
+    all_turns.extend(big_cube_turns);
+
+    // Simplify
+    let simplified = simplify::simplify_turns(&all_turns, state.order.get());
+
+    // Verify in debug builds
+    #[cfg(debug_assertions)]
+    {
+        let mut verify = state.clone();
+        for &turn in &simplified {
+            apply_turn_to_state(&mut verify, turn).map_err(|e| {
+                SolveError::InvalidState(format!("reduction simplification produced invalid turn: {e}"))
+            })?;
+        }
+        if !verify.is_solved() {
+            return Err(SolveError::InvalidState(
+                "reduction solver produced incomplete solution".into(),
+            ));
+        }
+    }
+
+    Ok(simplified)
+}
+
+/// Build a 3×3 CubeState from a 54-character facelet string.
+///
+/// Facelet format: 6 faces × 9 stickers, in U-R-F-D-L-B order.
+/// Characters: 'U'=White, 'R'=Red, 'F'=Green, 'D'=Yellow, 'L'=Orange, 'B'=Blue
+fn facelet_to_cube_state(facelet: &str) -> Result<CubeState, String> {
+    use rubik_core::CubeOrder;
+
+    if facelet.len() != 54 {
+        return Err(format!("facelet must be 54 chars, got {}", facelet.len()));
+    }
+
+    let mut stickers = Vec::with_capacity(54);
+    for ch in facelet.chars() {
+        let color = match ch {
+            'U' => StickerColor::White,
+            'R' => StickerColor::Red,
+            'F' => StickerColor::Green,
+            'D' => StickerColor::Yellow,
+            'L' => StickerColor::Orange,
+            'B' => StickerColor::Blue,
+            other => return Err(format!("invalid facelet character: '{}'", other)),
+        };
+        stickers.push(color);
+    }
+
+    Ok(CubeState {
+        version: 1,
+        order: CubeOrder::new(3).map_err(|e| format!("{e}"))?,
+        stickers,
+    })
 }
 
 #[derive(Debug, Clone)]

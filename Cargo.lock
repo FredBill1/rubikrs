@@ -3533,6 +3533,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rubik-reduction"
+version = "0.1.0"
+dependencies = [
+ "rubik-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rubik-solver"
 version = "0.1.0"
 dependencies = [
@@ -3540,6 +3549,7 @@ dependencies = [
  "lazy_static",
  "rcube-rs",
  "rubik-core",
+ "rubik-reduction",
  "serde",
  "serde_json",
  "wasm-bindgen",

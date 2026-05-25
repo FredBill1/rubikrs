@@ -110,7 +110,10 @@ fn find_improving_commutator(
     correct_before: usize,
     solved_faces: &[Face],
 ) -> Option<Vec<TurnCommand>> {
-    let max_depth = if order % 2 == 0 { order / 2 } else { 1 };
+    // For even N: N/2 layers (e.g. 4→2, 6→3).
+    // For odd N: (N-1)/2 layers on each side of the fixed middle (e.g. 5→2, 7→3).
+    // Integer division `order / 2` gives the correct value for both cases.
+    let max_depth = order / 2;
     for depth in 1..=max_depth {
         for &slice_face in &Face::ALL {
             let slice_cw = TurnCommand {
