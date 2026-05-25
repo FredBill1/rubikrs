@@ -9,6 +9,6 @@ pub use engine::{
 };
 pub use order::{CubeOrder, CubeOrderError, MAX_CUBE_ORDER, MIN_CUBE_ORDER};
 pub use schema::{
-    CubeState, CubeStateParseError, CubeStateValidationError, Face, RotationAmount, StickerColor,
-    TurnCommand, TurnCommandValidationError, CUBE_STATE_SCHEMA_VERSION,
+    CUBE_STATE_SCHEMA_VERSION, CubeState, CubeStateParseError, CubeStateValidationError, Face,
+    RotationAmount, StickerColor, TurnCommand, TurnCommandValidationError,
 };

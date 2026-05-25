@@ -71,8 +71,8 @@ const N_MOVES_P2: usize = 10;
 const MAX_DEPTH2: usize = 13;
 
 static MOVE2STR: [&str; 18] = [
-    "U ", "U2", "U'", "R ", "R2", "R'", "F ", "F2", "F'",
-    "D ", "D2", "D'", "L ", "L2", "L'", "B ", "B2", "B'",
+    "U ", "U2", "U'", "R ", "R2", "R'", "F ", "F2", "F'", "D ", "D2", "D'", "L ", "L2", "L'", "B ",
+    "B2", "B'",
 ];
 
 static URF_MOVE: [[u8; 18]; 6] = [
@@ -117,9 +117,7 @@ static EDGE_FACELET: [[u8; 2]; 12] = [
     [B + 3, R + 5],
 ];
 
-static P2MOVES: [u8; 18] = [
-    0, 1, 2, 4, 7, 9, 10, 11, 13, 16, 3, 5, 6, 8, 12, 14, 15, 17,
-];
+static P2MOVES: [u8; 18] = [0, 1, 2, 4, 7, 9, 10, 11, 13, 16, 3, 5, 6, 8, 12, 14, 15, 17];
 
 impl Solution {
     fn append_move(&mut self, cur_move: u8) {
@@ -284,9 +282,7 @@ impl Cubie {
         }
         let fstr: &[u8] = facelet.as_bytes();
         let mut f: [u8; 54] = [0; 54];
-        let colors: [u8; 6] = [
-            fstr[4], fstr[13], fstr[22], fstr[31], fstr[40], fstr[49],
-        ];
+        let colors: [u8; 6] = [fstr[4], fstr[13], fstr[22], fstr[31], fstr[40], fstr[49]];
         let mut count: i32 = 0;
         for i in 0..54 {
             if let Some(fidx) = colors.iter().position(|&s| s == fstr[i]) {
@@ -720,17 +716,9 @@ impl StaticContext {
         for i in 0..18 {
             for j in 0..16 {
                 Cubie::corn_mult(&self.symcube[j], &self.movecube[i], &mut cc);
-                Cubie::corn_mult(
-                    &cc,
-                    &self.symcube[self.symmuli[0][j] as usize],
-                    &mut cd,
-                );
+                Cubie::corn_mult(&cc, &self.symcube[self.symmuli[0][j] as usize], &mut cd);
                 Cubie::edge_mult(&self.symcube[j], &self.movecube[i], &mut cc);
-                Cubie::edge_mult(
-                    &cc,
-                    &self.symcube[self.symmuli[0][j] as usize],
-                    &mut cd,
-                );
+                Cubie::edge_mult(&cc, &self.symcube[self.symmuli[0][j] as usize], &mut cd);
                 for k in 0..18 {
                     if Cubie::cmp(&self.movecube[k], &cd) == 0 {
                         self.symmove2[p2moves_imap[i] as usize][j] = p2moves_imap[k] as u8;
@@ -895,8 +883,7 @@ fn init_move_tables(sctx: &StaticContext, stbl: &mut StaticTables) {
             Cubie::edge_mult(&c, &sctx.movecube[P2MOVES[j] as usize], &mut d);
             stbl.cperm_move[i * N_MOVES_P2 + j] =
                 esym2csym(stbl.eperm_raw2sym[d.get_cperm() as usize]);
-            stbl.eperm_move[i * N_MOVES_P2 + j] =
-                stbl.eperm_raw2sym[d.get_eperm() as usize];
+            stbl.eperm_move[i * N_MOVES_P2 + j] = stbl.eperm_raw2sym[d.get_eperm() as usize];
         }
         let mut d = Cubie::new();
         Cubie::inv(&c, &mut d);
@@ -1009,9 +996,9 @@ fn init_raw_sym_prun(
 
             for m in 0..n_moves {
                 let symx = sym_move[sym * n_moves + m] as usize;
-                let rawx = raw_conj[(raw_move[raw * n_moves + m] as usize)
-                    << sym_shift
-                    | (symx & sym_mask)] as usize;
+                let rawx = raw_conj
+                    [(raw_move[raw * n_moves + m] as usize) << sym_shift | (symx & sym_mask)]
+                    as usize;
                 let symx = symx >> sym_shift;
                 let idx = symx * n_raw + rawx;
                 let prun = get_pruning(prun_table, idx);
@@ -1035,9 +1022,8 @@ fn init_raw_sym_prun(
                         continue;
                     }
                     let idxx = idx
-                        + raw_conj[((rawx << sym_shift)
-                            | (j ^ (sym_e2c_magic >> (j << 1) & 3)))
-                            as usize]
+                        + raw_conj
+                            [((rawx << sym_shift) | (j ^ (sym_e2c_magic >> (j << 1) & 3))) as usize]
                             as usize;
                     if get_pruning(prun_table, idxx) == check {
                         set_pruning(prun_table, idxx, xor_val);
@@ -1266,18 +1252,16 @@ impl Coord2 {
             get_pruning(
                 &stbl.ccomb_eperm_prun,
                 (edgei >> 4) as usize * N_CCOMB
-                    + stbl.ccomb_conj
-                        [stbl.cperm2comb[corni as usize >> 4] as usize * 16
-                            + sctx.symmuli[edgei as usize & 0xf][corni as usize & 0xf] as usize]
+                    + stbl.ccomb_conj[stbl.cperm2comb[corni as usize >> 4] as usize * 16
+                        + sctx.symmuli[edgei as usize & 0xf][corni as usize & 0xf] as usize]
                         as usize,
             ),
             std::cmp::max(
                 get_pruning(
                     &stbl.ccomb_eperm_prun,
                     self.edge as usize * N_CCOMB
-                        + stbl.ccomb_conj
-                            [stbl.cperm2comb[self.corn as usize] as usize * 16
-                                + sctx.symmuli[self.esym as usize][self.csym as usize] as usize]
+                        + stbl.ccomb_conj[stbl.cperm2comb[self.corn as usize] as usize * 16
+                            + sctx.symmuli[self.esym as usize][self.csym as usize] as usize]
                             as usize,
                 ),
                 get_pruning(
@@ -1358,8 +1342,7 @@ impl IdaContext {
             for urf_idx in 0..6 {
                 self.urf_idx = urf_idx;
                 let cc = self.urf_cubies[self.urf_idx as usize];
-                let ret =
-                    self.phase1_pre_moves(sctx, stbl, MAX_PREMV_LEN as i8, -30, &cc, 0);
+                let ret = self.phase1_pre_moves(sctx, stbl, MAX_PREMV_LEN as i8, -30, &cc, 0);
                 if ret == 0 {
                     let solbuf = self.solution.to_string();
                     #[cfg(debug_assertions)]
@@ -1595,17 +1578,13 @@ impl IdaContext {
                 [node.edge as usize * N_MOVES_P2 + sctx.symmove2[m][node.esym as usize] as usize];
             nodex.esym = sctx.symmult[nodex.edge as usize & 0xf][node.esym as usize] as u16;
             nodex.edge = nodex.edge >> 4;
-            let edgei =
-                get_perm_sym_inv(sctx, stbl, nodex.edge, nodex.esym, 0) as usize;
-            let corni =
-                get_perm_sym_inv(sctx, stbl, nodex.corn, nodex.csym, 1) as usize;
+            let edgei = get_perm_sym_inv(sctx, stbl, nodex.edge, nodex.esym, 0) as usize;
+            let corni = get_perm_sym_inv(sctx, stbl, nodex.corn, nodex.csym, 1) as usize;
             let prun = get_pruning(
                 &stbl.ccomb_eperm_prun,
                 (edgei >> 4) as usize * N_CCOMB
-                    + stbl.ccomb_conj
-                        [stbl.cperm2comb[corni as usize >> 4] as usize * 16
-                            + sctx.symmuli[edgei as usize & 0xf][corni as usize & 0xf]
-                                as usize]
+                    + stbl.ccomb_conj[stbl.cperm2comb[corni as usize >> 4] as usize * 16
+                        + sctx.symmuli[edgei as usize & 0xf][corni as usize & 0xf] as usize]
                         as usize,
             ) as i8;
             if prun > maxl + 1 {
@@ -1617,17 +1596,13 @@ impl IdaContext {
                 get_pruning(
                     &stbl.mperm_cperm_prun,
                     nodex.corn as usize * N_MPERM
-                        + stbl.mperm_conj
-                            [nodex.mid as usize * 16 + nodex.csym as usize] as usize,
+                        + stbl.mperm_conj[nodex.mid as usize * 16 + nodex.csym as usize] as usize,
                 ),
                 get_pruning(
                     &stbl.ccomb_eperm_prun,
                     nodex.edge as usize * N_CCOMB
-                        + stbl.ccomb_conj
-                            [stbl.cperm2comb[nodex.corn as usize] as usize * 16
-                                + sctx.symmuli[nodex.esym as usize]
-                                    [nodex.csym as usize]
-                                    as usize]
+                        + stbl.ccomb_conj[stbl.cperm2comb[nodex.corn as usize] as usize * 16
+                            + sctx.symmuli[nodex.esym as usize][nodex.csym as usize] as usize]
                             as usize,
                 ),
             ) as i8;

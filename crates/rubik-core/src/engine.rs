@@ -592,7 +592,11 @@ mod tests {
     fn three_by_three_scramble_includes_middle_slices() {
         let scramble = generate_scramble(CubeOrder::standard(), 24, 21);
         // All turns should have width=1 and start_layer in {0, 1}
-        assert!(scramble.iter().all(|turn| turn.width == 1 && turn.start_layer <= 2));
+        assert!(
+            scramble
+                .iter()
+                .all(|turn| turn.width == 1 && turn.start_layer <= 2)
+        );
         // Should include at least some middle-slice turns (probabilistic, but very likely
         // with length 24 and 25% chance per move; seed 21 is deterministic)
         assert!(

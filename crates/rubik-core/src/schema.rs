@@ -420,7 +420,7 @@ mod tests {
         CUBE_STATE_SCHEMA_VERSION, CubeState, CubeStateParseError, CubeStateValidationError, Face,
         RotationAmount, StickerColor, TurnCommand, TurnCommandValidationError,
     };
-    use crate::{apply_turn_to_state, CubeOrder};
+    use crate::{CubeOrder, apply_turn_to_state};
 
     #[test]
     fn solved_state_uses_canonical_face_order_and_counts() {
@@ -625,11 +625,10 @@ mod tests {
     fn is_solved_accepts_all_24_orientations_3x3() {
         for perm in all_24_face_perms() {
             let state = make_rotated_solved(3, &perm);
-            state.validate().expect("rotated solved state should be valid");
-            assert!(
-                state.is_solved(),
-                "3x3 should be solved for perm {perm:?}"
-            );
+            state
+                .validate()
+                .expect("rotated solved state should be valid");
+            assert!(state.is_solved(), "3x3 should be solved for perm {perm:?}");
         }
     }
 
@@ -637,11 +636,10 @@ mod tests {
     fn is_solved_accepts_all_24_orientations_2x2() {
         for perm in all_24_face_perms() {
             let state = make_rotated_solved(2, &perm);
-            state.validate().expect("rotated solved state should be valid");
-            assert!(
-                state.is_solved(),
-                "2x2 should be solved for perm {perm:?}"
-            );
+            state
+                .validate()
+                .expect("rotated solved state should be valid");
+            assert!(state.is_solved(), "2x2 should be solved for perm {perm:?}");
         }
     }
 
@@ -649,11 +647,10 @@ mod tests {
     fn is_solved_accepts_all_24_orientations_4x4() {
         for perm in all_24_face_perms() {
             let state = make_rotated_solved(4, &perm);
-            state.validate().expect("rotated solved state should be valid");
-            assert!(
-                state.is_solved(),
-                "4x4 should be solved for perm {perm:?}"
-            );
+            state
+                .validate()
+                .expect("rotated solved state should be valid");
+            assert!(state.is_solved(), "4x4 should be solved for perm {perm:?}");
         }
     }
 

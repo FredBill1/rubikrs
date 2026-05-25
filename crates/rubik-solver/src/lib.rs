@@ -10,9 +10,9 @@ pub mod kociemba;
 mod min2phase;
 mod simplify;
 
-use rubik_core::{CubeState, TurnCommand};
 #[cfg(debug_assertions)]
 use rubik_core::apply_turn_to_state;
+use rubik_core::{CubeState, TurnCommand};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -37,8 +37,8 @@ pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
     let token = Arc::new(AtomicBool::new(false));
     *cancel_mutex().lock().expect("lock") = Some(Arc::clone(&token));
 
-    let turns = rcube_rs::solve(state, Some(&token))
-        .map_err(|msg| SolveError::InvalidState(msg))?;
+    let turns =
+        rcube_rs::solve(state, Some(&token)).map_err(|msg| SolveError::InvalidState(msg))?;
 
     // Clear the cancel token (drop the Arc)
     *cancel_mutex().lock().expect("lock") = None;
@@ -129,7 +129,7 @@ pub struct TurnCommandJson {
 }
 
 #[cfg(target_arch = "wasm32")]
-use rubik_core::{Face};
+use rubik_core::Face;
 
 #[cfg(target_arch = "wasm32")]
 fn face_to_face_code(face: Face) -> u8 {
@@ -183,7 +183,11 @@ fn turn_to_json(turn: &TurnCommand) -> TurnCommandJson {
         rotation_code: rotation_to_code(turn.rotation),
         start_layer: turn.start_layer,
         width: turn.width,
-        notation: format!("{} {}", face_to_notation(turn.face, turn.start_layer), rot_str),
+        notation: format!(
+            "{} {}",
+            face_to_notation(turn.face, turn.start_layer),
+            rot_str
+        ),
     }
 }
 
@@ -254,8 +258,7 @@ pub fn solve_request_json(request_json: &str) -> String {
                 }
             }
             let solved = valid && verify.is_solved();
-            let json_turns: Vec<TurnCommandJson> =
-                turns.iter().map(|t| turn_to_json(t)).collect();
+            let json_turns: Vec<TurnCommandJson> = turns.iter().map(|t| turn_to_json(t)).collect();
             serde_json::to_string(&SolveResponse {
                 kind: if solved {
                     "solved".to_string()

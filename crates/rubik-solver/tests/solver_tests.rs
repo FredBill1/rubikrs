@@ -1,10 +1,13 @@
-use rubik_core::{apply_turn_to_state, CubeOrder, CubeState, Face, RotationAmount, TurnCommand};
-use rubik_solver::solve;
+use rubik_core::{
+    CUBE_STATE_SCHEMA_VERSION, CubeOrder, CubeState, Face, RotationAmount, StickerColor,
+    TurnCommand, apply_turn_to_state,
+};
 use rubik_solver::kociemba;
+use rubik_solver::solve;
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -65,6 +68,59 @@ fn verify_solution(initial: &CubeState, solution: &[TurnCommand]) -> bool {
     apply_turns(&mut state, solution).is_ok() && is_solved(&state)
 }
 
+const CANONICAL_COLORS: [StickerColor; 6] = [
+    StickerColor::White,
+    StickerColor::Red,
+    StickerColor::Green,
+    StickerColor::Yellow,
+    StickerColor::Orange,
+    StickerColor::Blue,
+];
+
+fn rotate_x(perm: [usize; 6]) -> [usize; 6] {
+    [perm[5], perm[1], perm[0], perm[2], perm[4], perm[3]]
+}
+
+fn rotate_y(perm: [usize; 6]) -> [usize; 6] {
+    [perm[0], perm[2], perm[4], perm[3], perm[5], perm[1]]
+}
+
+fn rotate_z(perm: [usize; 6]) -> [usize; 6] {
+    [perm[4], perm[0], perm[2], perm[1], perm[3], perm[5]]
+}
+
+fn all_24_face_perms() -> Vec<[usize; 6]> {
+    let identity = [0usize, 1, 2, 3, 4, 5];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut queue = vec![identity];
+    seen.insert(identity);
+
+    let mut i = 0;
+    while i < queue.len() {
+        let perm = queue[i];
+        i += 1;
+        for next in [rotate_x(perm), rotate_y(perm), rotate_z(perm)] {
+            if seen.insert(next) {
+                queue.push(next);
+            }
+        }
+    }
+    queue
+}
+
+fn make_rotated_solved_2x2(face_perm: &[usize; 6]) -> CubeState {
+    let mut stickers = Vec::with_capacity(24);
+    for face in 0..6 {
+        let color = CANONICAL_COLORS[face_perm[face]];
+        stickers.extend(core::iter::repeat_n(color, 4));
+    }
+    CubeState {
+        version: CUBE_STATE_SCHEMA_VERSION,
+        order: CubeOrder::new(2).expect("valid"),
+        stickers,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Time-limited solve helper
 // ---------------------------------------------------------------------------
@@ -72,7 +128,9 @@ fn verify_solution(initial: &CubeState, solution: &[TurnCommand]) -> bool {
 fn solve_with_timeout(state: &CubeState, timeout: Duration) -> Result<Vec<TurnCommand>, String> {
     let state = state.clone();
     let done = Arc::new(AtomicBool::new(false));
-    let result = Arc::new(std::sync::Mutex::new(None::<Result<Vec<TurnCommand>, String>>));
+    let result = Arc::new(std::sync::Mutex::new(
+        None::<Result<Vec<TurnCommand>, String>>,
+    ));
 
     let result_clone = Arc::clone(&result);
     let done_clone = Arc::clone(&done);
@@ -114,10 +172,7 @@ fn solve_with_timeout(state: &CubeState, timeout: Duration) -> Result<Vec<TurnCo
             }
         }
         Some(Err(e)) => Err(e.clone()),
-        None => Err(format!(
-            "solve timed out after {:?}",
-            start.elapsed()
-        )),
+        None => Err(format!("solve timed out after {:?}", start.elapsed())),
     }
 }
 
@@ -125,10 +180,15 @@ fn solve_with_timeout(state: &CubeState, timeout: Duration) -> Result<Vec<TurnCo
 // Kociemba solve helper (thread-based timeout, same pattern as solve_with_timeout)
 // ---------------------------------------------------------------------------
 
-fn solve_kociemba_with_timeout(state: &CubeState, timeout: Duration) -> Result<Vec<TurnCommand>, String> {
+fn solve_kociemba_with_timeout(
+    state: &CubeState,
+    timeout: Duration,
+) -> Result<Vec<TurnCommand>, String> {
     let state = state.clone();
     let done = Arc::new(AtomicBool::new(false));
-    let result = Arc::new(std::sync::Mutex::new(None::<Result<Vec<TurnCommand>, String>>));
+    let result = Arc::new(std::sync::Mutex::new(
+        None::<Result<Vec<TurnCommand>, String>>,
+    ));
 
     let result_clone = Arc::clone(&result);
     let done_clone = Arc::clone(&done);
@@ -214,16 +274,66 @@ fn make_complex_4x4_state() -> CubeState {
     use RotationAmount::*;
     let mut state = CubeState::solved(CubeOrder::new(4).expect("valid order"));
     let scramble = [
-        TurnCommand { face: Right, start_layer: 1, width: 1, rotation: Clockwise },
-        TurnCommand { face: Up, start_layer: 0, width: 1, rotation: HalfTurn },
-        TurnCommand { face: Front, start_layer: 1, width: 1, rotation: CounterClockwise },
-        TurnCommand { face: Right, start_layer: 0, width: 1, rotation: Clockwise },
-        TurnCommand { face: Up, start_layer: 1, width: 1, rotation: Clockwise },
-        TurnCommand { face: Left, start_layer: 0, width: 1, rotation: CounterClockwise },
-        TurnCommand { face: Down, start_layer: 1, width: 1, rotation: HalfTurn },
-        TurnCommand { face: Back, start_layer: 0, width: 1, rotation: Clockwise },
-        TurnCommand { face: Up, start_layer: 0, width: 1, rotation: CounterClockwise },
-        TurnCommand { face: Front, start_layer: 0, width: 1, rotation: HalfTurn },
+        TurnCommand {
+            face: Right,
+            start_layer: 1,
+            width: 1,
+            rotation: Clockwise,
+        },
+        TurnCommand {
+            face: Up,
+            start_layer: 0,
+            width: 1,
+            rotation: HalfTurn,
+        },
+        TurnCommand {
+            face: Front,
+            start_layer: 1,
+            width: 1,
+            rotation: CounterClockwise,
+        },
+        TurnCommand {
+            face: Right,
+            start_layer: 0,
+            width: 1,
+            rotation: Clockwise,
+        },
+        TurnCommand {
+            face: Up,
+            start_layer: 1,
+            width: 1,
+            rotation: Clockwise,
+        },
+        TurnCommand {
+            face: Left,
+            start_layer: 0,
+            width: 1,
+            rotation: CounterClockwise,
+        },
+        TurnCommand {
+            face: Down,
+            start_layer: 1,
+            width: 1,
+            rotation: HalfTurn,
+        },
+        TurnCommand {
+            face: Back,
+            start_layer: 0,
+            width: 1,
+            rotation: Clockwise,
+        },
+        TurnCommand {
+            face: Up,
+            start_layer: 0,
+            width: 1,
+            rotation: CounterClockwise,
+        },
+        TurnCommand {
+            face: Front,
+            start_layer: 0,
+            width: 1,
+            rotation: HalfTurn,
+        },
     ];
     apply_algorithm(&mut state, &scramble);
     state
@@ -304,7 +414,10 @@ mod simple_short_moves {
     fn test_simple_moves_for_order(order: u32, turns: &[TurnCommand]) {
         let mut state = CubeState::solved(CubeOrder::new(order).expect("valid order"));
         apply_turns(&mut state, turns).expect("turns should apply");
-        assert!(!is_solved(&state), "state should not be solved after applying turns");
+        assert!(
+            !is_solved(&state),
+            "state should not be solved after applying turns"
+        );
 
         let solution =
             solve_with_timeout(&state, Duration::from_secs(1)).expect("solve should succeed");
@@ -316,7 +429,10 @@ mod simple_short_moves {
 
     #[test]
     fn test_2x2_single_outer_turn() {
-        test_simple_moves_for_order(2, &[TurnCommand::outer(Face::Right, RotationAmount::Clockwise)]);
+        test_simple_moves_for_order(
+            2,
+            &[TurnCommand::outer(Face::Right, RotationAmount::Clockwise)],
+        );
     }
 
     #[test]
@@ -337,7 +453,10 @@ mod simple_short_moves {
 
     #[test]
     fn test_4x4_single_outer_turn() {
-        test_simple_moves_for_order(4, &[TurnCommand::outer(Face::Front, RotationAmount::HalfTurn)]);
+        test_simple_moves_for_order(
+            4,
+            &[TurnCommand::outer(Face::Front, RotationAmount::HalfTurn)],
+        );
     }
 
     #[test]
@@ -554,11 +673,13 @@ mod large_cube_scrambles {
     fn test_64x64_scramble_200_moves() {
         let order: u32 = 64;
         let scramble = generate_scramble(order, 200, 12345);
-        let mut state =
-            CubeState::solved(CubeOrder::new(order).expect("64 should be valid"));
+        let mut state = CubeState::solved(CubeOrder::new(order).expect("64 should be valid"));
 
         apply_turns(&mut state, &scramble).expect("scramble should apply");
-        assert!(!is_solved(&state), "scrambled 64x64 state should not be solved");
+        assert!(
+            !is_solved(&state),
+            "scrambled 64x64 state should not be solved"
+        );
 
         let solution =
             solve_with_timeout(&state, Duration::from_secs(3)).expect("solve should succeed");
@@ -574,8 +695,7 @@ mod large_cube_scrambles {
     fn test_64x64_scramble_200_moves_seed2() {
         let order: u32 = 64;
         let scramble = generate_scramble(order, 200, 99999);
-        let mut state =
-            CubeState::solved(CubeOrder::new(order).expect("64 should be valid"));
+        let mut state = CubeState::solved(CubeOrder::new(order).expect("64 should be valid"));
         apply_turns(&mut state, &scramble).expect("scramble should apply");
 
         let solution =
@@ -634,7 +754,10 @@ mod edge_cases {
         for &turn in &solution {
             apply_turn_to_state(&mut verify, turn).expect("solution turn should be valid");
         }
-        assert!(is_solved(&verify), "applying solution should restore solved state");
+        assert!(
+            is_solved(&verify),
+            "applying solution should restore solved state"
+        );
     }
 
     #[test]
@@ -677,7 +800,10 @@ mod kociemba_3x3 {
 
     #[test]
     fn test_3x3_single_turn() {
-        test_kociemba_simple(3, &[TurnCommand::outer(Face::Right, RotationAmount::Clockwise)]);
+        test_kociemba_simple(
+            3,
+            &[TurnCommand::outer(Face::Right, RotationAmount::Clockwise)],
+        );
     }
 
     #[test]
@@ -800,7 +926,10 @@ mod kociemba_3x3 {
         for &turn in &solution {
             apply_turn_to_state(&mut verify, turn).expect("solution turn should be valid");
         }
-        assert!(is_solved(&verify), "applying solution should restore solved state");
+        assert!(
+            is_solved(&verify),
+            "applying solution should restore solved state"
+        );
     }
 }
 
@@ -817,7 +946,9 @@ mod ida2x2_2x2 {
     ) -> Result<Vec<TurnCommand>, String> {
         let state = state.clone();
         let done = Arc::new(AtomicBool::new(false));
-        let result = Arc::new(std::sync::Mutex::new(None::<Result<Vec<TurnCommand>, String>>));
+        let result = Arc::new(std::sync::Mutex::new(
+            None::<Result<Vec<TurnCommand>, String>>,
+        ));
 
         let result_clone = Arc::clone(&result);
         let done_clone = Arc::clone(&done);
@@ -857,7 +988,10 @@ mod ida2x2_2x2 {
                 }
             }
             Some(Err(e)) => Err(e.clone()),
-            None => Err(format!("ida2x2 solve timed out after {:?}", start.elapsed())),
+            None => Err(format!(
+                "ida2x2 solve timed out after {:?}",
+                start.elapsed()
+            )),
         }
     }
 
@@ -880,7 +1014,11 @@ mod ida2x2_2x2 {
             "ida2x2 should solve R turn. Solution length: {}",
             solution.len()
         );
-        assert!(solution.len() <= 11, "2x2 solution should be <= 11 HTM, got {}", solution.len());
+        assert!(
+            solution.len() <= 11,
+            "2x2 solution should be <= 11 HTM, got {}",
+            solution.len()
+        );
     }
 
     #[test]
@@ -904,7 +1042,10 @@ mod ida2x2_2x2 {
         let mut state = CubeState::solved(CubeOrder::new(2).expect("valid"));
         apply_turns(
             &mut state,
-            &[TurnCommand::outer(Face::Front, RotationAmount::CounterClockwise)],
+            &[TurnCommand::outer(
+                Face::Front,
+                RotationAmount::CounterClockwise,
+            )],
         )
         .expect("turn");
         let solution = solve_ida2x2_with_timeout(&state, Duration::from_secs(5))
@@ -1038,6 +1179,45 @@ mod ida2x2_2x2 {
     }
 
     #[test]
+    fn test_2x2_all_rotated_solved_states_are_empty() {
+        for perm in all_24_face_perms() {
+            let state = make_rotated_solved_2x2(&perm);
+            let solution = solve_ida2x2_with_timeout(&state, Duration::from_secs(5))
+                .expect("solve should succeed");
+            assert!(
+                solution.is_empty(),
+                "rotated solved state should return an empty solution for {perm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_2x2_rotated_solved_plus_one_turn_stays_one_turn() {
+        let rotated = all_24_face_perms()
+            .into_iter()
+            .find(|perm| *perm != [0, 1, 2, 3, 4, 5])
+            .expect("there should be a non-canonical solved orientation");
+        let mut state = make_rotated_solved_2x2(&rotated);
+        apply_turn_to_state(
+            &mut state,
+            TurnCommand::outer(Face::Right, RotationAmount::Clockwise),
+        )
+        .expect("turn should apply");
+
+        let solution = solve_ida2x2_with_timeout(&state, Duration::from_secs(5))
+            .expect("solve should succeed");
+        assert!(
+            verify_solution(&state, &solution),
+            "solution should restore a solved orientation"
+        );
+        assert_eq!(
+            solution.len(),
+            1,
+            "one move away from a rotated solved state should stay one move away"
+        );
+    }
+
+    #[test]
     fn test_2x2_quarter_turn_cycle() {
         let mut state = CubeState::solved(CubeOrder::new(2).expect("valid"));
         let turn = TurnCommand::outer(Face::Right, RotationAmount::Clockwise);
@@ -1066,6 +1246,9 @@ mod ida2x2_2x2 {
         for &turn in &solution {
             apply_turn_to_state(&mut verify, turn).expect("solution turn should be valid");
         }
-        assert!(is_solved(&verify), "applying solution should restore solved state");
+        assert!(
+            is_solved(&verify),
+            "applying solution should restore solved state"
+        );
     }
 }

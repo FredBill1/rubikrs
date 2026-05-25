@@ -355,10 +355,22 @@ mod tests {
         let state = CubeState::solved(CubeOrder::new(order).expect("valid"));
         let mut scrambled = state.clone();
         let scramble_turns = vec![
-            rubik_core::TurnCommand::outer(rubik_core::Face::Right, rubik_core::RotationAmount::Clockwise),
-            rubik_core::TurnCommand::outer(rubik_core::Face::Up, rubik_core::RotationAmount::Clockwise),
-            rubik_core::TurnCommand::outer(rubik_core::Face::Front, rubik_core::RotationAmount::Clockwise),
-            rubik_core::TurnCommand::outer(rubik_core::Face::Right, rubik_core::RotationAmount::CounterClockwise),
+            rubik_core::TurnCommand::outer(
+                rubik_core::Face::Right,
+                rubik_core::RotationAmount::Clockwise,
+            ),
+            rubik_core::TurnCommand::outer(
+                rubik_core::Face::Up,
+                rubik_core::RotationAmount::Clockwise,
+            ),
+            rubik_core::TurnCommand::outer(
+                rubik_core::Face::Front,
+                rubik_core::RotationAmount::Clockwise,
+            ),
+            rubik_core::TurnCommand::outer(
+                rubik_core::Face::Right,
+                rubik_core::RotationAmount::CounterClockwise,
+            ),
         ];
         for &t in &scramble_turns {
             apply_turn_to_state(&mut scrambled, t).expect("valid");

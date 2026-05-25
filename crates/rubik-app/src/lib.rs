@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::{cell::RefCell, collections::{BTreeSet, VecDeque}};
+use std::{
+    cell::RefCell,
+    collections::{BTreeSet, VecDeque},
+};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -878,12 +881,8 @@ impl RuntimeBridge {
                 }
                 let abs_end = start_abs + width - 1;
                 let canonical_start = match canonical {
-                    Face::Up | Face::Right | Face::Front => {
-                        (order - 1).saturating_sub(abs_end)
-                    }
-                    Face::Down | Face::Left | Face::Back => {
-                        start_abs
-                    }
+                    Face::Up | Face::Right | Face::Front => (order - 1).saturating_sub(abs_end),
+                    Face::Down | Face::Left | Face::Back => start_abs,
                 };
                 merged.push(TurnCommand {
                     face: canonical,
@@ -907,7 +906,10 @@ impl RuntimeBridge {
         let from_state = self.engine.state().clone();
         for turn in &batch {
             if self.engine.apply_turn(*turn).is_err() {
-                self.set_message(format!("Failed to apply queued turn {}.", format_turn(*turn)));
+                self.set_message(format!(
+                    "Failed to apply queued turn {}.",
+                    format_turn(*turn)
+                ));
                 continue;
             }
         }
@@ -1318,9 +1320,8 @@ fn sync_cube_visuals(
     }
 
     if scene_meta.scene_revision == sync_state.rendered_revision {
-        let should_drain = with_runtime(|runtime| {
-            !runtime.turn_queue.is_empty() && !runtime.animation_active
-        });
+        let should_drain =
+            with_runtime(|runtime| !runtime.turn_queue.is_empty() && !runtime.animation_active);
         if should_drain {
             with_runtime_mut(|runtime| runtime.process_queue_head());
         } else {
@@ -1462,10 +1463,8 @@ fn animate_turn_visuals(
                 Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
 
             if progress < 1.0 {
-                pivot_transform.rotation = Quat::from_axis_angle(
-                    animation.axis,
-                    animation.angle_radians * eased,
-                );
+                pivot_transform.rotation =
+                    Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
                 still_active.push(animation);
             } else {
                 completed_animations.push(animation);
@@ -1864,7 +1863,7 @@ fn spawn_cube_visual_pool(
     scene_revision: u64,
 ) -> (CubeVisualPool, Vec<ActiveTurnAnimation>) {
     let first_animation_turn = animation_turns.as_ref().and_then(|v| v.first().copied());
-            let order = state.order.get() as usize;
+    let order = state.order.get() as usize;
     let face_span = CUBE_FACE_SPAN;
     let step = face_span / order as f32;
     let sticker_size = step * 0.84;
@@ -2183,8 +2182,14 @@ fn begin_turn_batch_animation(
 
     let root_entity = pool.root_entity.expect("pool has root");
     let face_span = CUBE_FACE_SPAN;
-    let body_template = pool.body_mesh_template.as_ref().expect("pool has body template");
-    let sticker_template = pool.sticker_mesh_template.as_ref().expect("pool has sticker template");
+    let body_template = pool
+        .body_mesh_template
+        .as_ref()
+        .expect("pool has body template");
+    let sticker_template = pool
+        .sticker_mesh_template
+        .as_ref()
+        .expect("pool has sticker template");
     let face_offset = cube_face_offset(order);
 
     if let Some(animated_body) = pool.animated_body_entity {
@@ -2274,12 +2279,16 @@ fn begin_turn_batch_animation(
     let mut temp_entities: Vec<Entity> = Vec::new();
 
     for &turn in &turns {
-        let (_, animated_body_cubies) =
-            partition_body_cubies(&pool.cubie_slots, order, Some(turn));
+        let (_, animated_body_cubies) = partition_body_cubies(&pool.cubie_slots, order, Some(turn));
         let animated_body_mesh_data = if animated_body_cubies.is_empty() {
             merged_cubie_body_mesh(body_template, &pool.cubie_slots, order as usize, face_span)
         } else {
-            merged_cubie_body_mesh(body_template, &animated_body_cubies, order as usize, face_span)
+            merged_cubie_body_mesh(
+                body_template,
+                &animated_body_cubies,
+                order as usize,
+                face_span,
+            )
         };
         let animated_body_handle = meshes.add(animated_body_mesh_data);
 

@@ -76,9 +76,7 @@ impl Face {
         match self.orientation {
             0 => self.data[((r as usize) << self.bitshift) + c as usize],
             1 => self.data[((c as usize) << self.bitshift) + (self.r1 - r) as usize],
-            2 => {
-                self.data[(((self.r1 - r) as usize) << self.bitshift) + (self.r1 - c) as usize]
-            }
+            2 => self.data[(((self.r1 - r) as usize) << self.bitshift) + (self.r1 - c) as usize],
             3 => self.data[(((self.r1 - c) as usize) << self.bitshift) + r as usize],
             _ => 0,
         }
@@ -93,9 +91,7 @@ impl Face {
         match q {
             0 => self.data[((r as usize) << self.bitshift) + c as usize],
             1 => self.data[((c as usize) << self.bitshift) + (self.r1 - r) as usize],
-            2 => {
-                self.data[(((self.r1 - r) as usize) << self.bitshift) + (self.r1 - c) as usize]
-            }
+            2 => self.data[(((self.r1 - r) as usize) << self.bitshift) + (self.r1 - c) as usize],
             3 => self.data[(((self.r1 - c) as usize) << self.bitshift) + r as usize],
             _ => 0,
         }
@@ -162,12 +158,8 @@ impl Face {
         match self.orientation {
             0 => ((r as usize) << self.bitshift) as i32 + c as i32,
             1 => ((c as usize) << self.bitshift) as i32 + (self.r1 - r) as i32,
-            2 => {
-                (((self.r1 - r) as usize) << self.bitshift) as i32 + (self.r1 - c) as i32
-            }
-            3 => {
-                (((self.r1 - c) as usize) << self.bitshift) as i32 + r as i32
-            }
+            2 => (((self.r1 - r) as usize) << self.bitshift) as i32 + (self.r1 - c) as i32,
+            3 => (((self.r1 - c) as usize) << self.bitshift) as i32 + r as i32,
             _ => 0,
         }
     }

@@ -23,13 +23,16 @@ fn main() {
     }
 
     let tables = ida2x2::move_tables();
+    let goals = ida2x2::goal_states();
 
     // Generate permutation PDB
     eprintln!("Generating permutation PDB ({} entries)...", NUM_PERM);
     let mut perm_pdb = vec![255u8; NUM_PERM];
     let mut queue = VecDeque::new();
-    perm_pdb[0] = 0;
-    queue.push_back(0u16);
+    for &coord in goals.perm_coords() {
+        perm_pdb[coord as usize] = 0;
+        queue.push_back(coord);
+    }
 
     while let Some(coord) = queue.pop_front() {
         let dist = perm_pdb[coord as usize] + 1;
@@ -45,14 +48,19 @@ fn main() {
 
     let perm_reachable = perm_pdb.iter().filter(|&&d| d != 255).count();
     let perm_max = perm_pdb.iter().max().unwrap_or(&0);
-    eprintln!("  reachable: {}/{}, max depth: {}", perm_reachable, NUM_PERM, perm_max);
+    eprintln!(
+        "  reachable: {}/{}, max depth: {}",
+        perm_reachable, NUM_PERM, perm_max
+    );
 
     // Generate orientation PDB
     eprintln!("Generating orientation PDB ({} entries)...", NUM_ORIENT);
     let mut orient_pdb = vec![255u8; NUM_ORIENT];
     let mut queue = VecDeque::new();
-    orient_pdb[0] = 0;
-    queue.push_back(0u16);
+    for &coord in goals.orient_coords() {
+        orient_pdb[coord as usize] = 0;
+        queue.push_back(coord);
+    }
 
     while let Some(coord) = queue.pop_front() {
         let dist = orient_pdb[coord as usize] + 1;
@@ -68,7 +76,10 @@ fn main() {
 
     let orient_reachable = orient_pdb.iter().filter(|&&d| d != 255).count();
     let orient_max = orient_pdb.iter().max().unwrap_or(&0);
-    eprintln!("  reachable: {}/{}, max depth: {}", orient_reachable, NUM_ORIENT, orient_max);
+    eprintln!(
+        "  reachable: {}/{}, max depth: {}",
+        orient_reachable, NUM_ORIENT, orient_max
+    );
 
     // Write output files
     eprintln!("Writing {}...", args[1]);
@@ -77,7 +88,8 @@ fn main() {
 
     eprintln!("Writing {}...", args[2]);
     let mut f = std::fs::File::create(&args[2]).expect("failed to create orient PDB file");
-    f.write_all(&orient_pdb).expect("failed to write orient PDB");
+    f.write_all(&orient_pdb)
+        .expect("failed to write orient PDB");
 
     eprintln!("Done.");
 }

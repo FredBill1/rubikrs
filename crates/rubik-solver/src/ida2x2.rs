@@ -7,9 +7,10 @@
 // Heuristic: max(perm_pdb[perm], orient_pdb[orient]), admissible.
 
 use rubik_core::{CubeState, Face, RotationAmount, StickerColor, TurnCommand};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::OnceLock;
 
-use super::{cancel_mutex, SolveError};
+use super::{SolveError, cancel_mutex};
 
 // ---------------------------------------------------------------------------
 // Corner definitions
@@ -36,20 +37,42 @@ const CORNER_STICKERS: [[usize; 3]; 8] = [
 /// Solved-state colors for each corner piece (piece_id -> [color0, color1, color2]).
 /// Piece 0=URF, 1=UFL, 2=ULB, 3=UBR, 4=DFR, 5=DFL, 6=DLB, 7=DRB.
 const PIECE_COLORS: [[StickerColor; 3]; 8] = [
-    [StickerColor::White, StickerColor::Red, StickerColor::Green],    // URF
-    [StickerColor::White, StickerColor::Green, StickerColor::Orange], // UFL
-    [StickerColor::White, StickerColor::Orange, StickerColor::Blue],  // ULB
-    [StickerColor::White, StickerColor::Blue, StickerColor::Red],     // UBR
-    [StickerColor::Yellow, StickerColor::Red, StickerColor::Green],   // DFR
-    [StickerColor::Yellow, StickerColor::Green, StickerColor::Orange],// DFL
-    [StickerColor::Yellow, StickerColor::Orange, StickerColor::Blue], // DLB
-    [StickerColor::Yellow, StickerColor::Blue, StickerColor::Red],    // DRB
+    [StickerColor::White, StickerColor::Red, StickerColor::Green], // URF
+    [
+        StickerColor::White,
+        StickerColor::Green,
+        StickerColor::Orange,
+    ], // UFL
+    [
+        StickerColor::White,
+        StickerColor::Orange,
+        StickerColor::Blue,
+    ], // ULB
+    [StickerColor::White, StickerColor::Blue, StickerColor::Red],  // UBR
+    [StickerColor::Yellow, StickerColor::Red, StickerColor::Green], // DFR
+    [
+        StickerColor::Yellow,
+        StickerColor::Green,
+        StickerColor::Orange,
+    ], // DFL
+    [
+        StickerColor::Yellow,
+        StickerColor::Orange,
+        StickerColor::Blue,
+    ], // DLB
+    [StickerColor::Yellow, StickerColor::Blue, StickerColor::Red], // DRB
 ];
 
 /// Primary (U/D) color for each piece: pieces 0-3 have White, pieces 4-7 have Yellow.
 const PIECE_UD_COLOR: [StickerColor; 8] = [
-    StickerColor::White, StickerColor::White, StickerColor::White, StickerColor::White,
-    StickerColor::Yellow, StickerColor::Yellow, StickerColor::Yellow, StickerColor::Yellow,
+    StickerColor::White,
+    StickerColor::White,
+    StickerColor::White,
+    StickerColor::White,
+    StickerColor::Yellow,
+    StickerColor::Yellow,
+    StickerColor::Yellow,
+    StickerColor::Yellow,
 ];
 
 /// Which face (U=0,R=1,F=2,D=3,L=4,B=5) each sticker index belongs to.
@@ -60,6 +83,21 @@ fn sticker_face(idx: usize) -> usize {
 const NUM_MOVES: usize = 18;
 const NUM_PERM: usize = 40320;
 const NUM_ORIENT: usize = 2187; // 3^7
+const MAX_HTM_DEPTH: usize = 11;
+const ORIENT_COORD_BITS: u32 = 12;
+
+const MOVE_U_CW: usize = 0;
+const MOVE_R_CW: usize = 3;
+const MOVE_F_CW: usize = 6;
+const MOVE_D_CCW: usize = 11;
+const MOVE_L_CCW: usize = 14;
+const MOVE_B_CCW: usize = 17;
+
+const WHOLE_CUBE_ROTATION_GENERATORS: [[usize; 2]; 3] = [
+    [MOVE_R_CW, MOVE_L_CCW], // x: U->F->D->B
+    [MOVE_U_CW, MOVE_D_CCW], // y: F->R->B->L
+    [MOVE_F_CW, MOVE_B_CCW], // z: U->R->D->L
+];
 
 // ---------------------------------------------------------------------------
 // Color utility
@@ -307,13 +345,20 @@ fn build_ori_transform() -> (PosMap, OriTransform) {
 
                 let order = rubik_core::CubeOrder::new(2).expect("2 is valid");
                 let mut state = CubeState::solved(order);
-                let turn = TurnCommand { face, start_layer: 0, width: 1, rotation };
+                let turn = TurnCommand {
+                    face,
+                    start_layer: 0,
+                    width: 1,
+                    rotation,
+                };
                 apply_turn_to_state(&mut state, turn).expect("valid turn");
 
                 let (pieces, _orients) = extract_corners(&state, &piece_lut);
 
                 for p in 0..8 {
-                    let new_pos = pieces.iter().position(|&pid| pid == p as u8)
+                    let new_pos = pieces
+                        .iter()
+                        .position(|&pid| pid == p as u8)
                         .expect("piece must exist");
                     pos_map[m][p] = new_pos;
                 }
@@ -402,7 +447,10 @@ fn build_move_tables() -> MoveTables {
         }
     }
 
-    MoveTables { perm_move, orient_move }
+    MoveTables {
+        perm_move,
+        orient_move,
+    }
 }
 
 /// Look up the new permutation coordinate after applying move `m` to `coord`.
@@ -434,7 +482,117 @@ fn move_index_to_turn(m: usize) -> TurnCommand {
         2 => RotationAmount::CounterClockwise,
         _ => unreachable!(),
     };
-    TurnCommand { face, start_layer: 0, width: 1, rotation }
+    TurnCommand {
+        face,
+        start_layer: 0,
+        width: 1,
+        rotation,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Solved-state goal set
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct GoalStates {
+    goal_pairs: Vec<u32>,
+    perm_coords: Vec<u16>,
+    orient_coords: Vec<u16>,
+}
+
+impl GoalStates {
+    pub fn perm_coords(&self) -> &[u16] {
+        &self.perm_coords
+    }
+
+    pub fn orient_coords(&self) -> &[u16] {
+        &self.orient_coords
+    }
+
+    fn contains(&self, perm: u16, orient: u16) -> bool {
+        self.goal_pairs
+            .binary_search(&encode_goal_pair(perm, orient))
+            .is_ok()
+    }
+}
+
+static GOAL_STATES: OnceLock<GoalStates> = OnceLock::new();
+
+pub fn goal_states() -> &'static GoalStates {
+    GOAL_STATES.get_or_init(build_goal_states)
+}
+
+fn encode_goal_pair(perm: u16, orient: u16) -> u32 {
+    ((perm as u32) << ORIENT_COORD_BITS) | orient as u32
+}
+
+fn decode_goal_pair(code: u32) -> (u16, u16) {
+    let orient_mask = (1u32 << ORIENT_COORD_BITS) - 1;
+    (
+        (code >> ORIENT_COORD_BITS) as u16,
+        (code & orient_mask) as u16,
+    )
+}
+
+fn apply_move_sequence(mut perm: u16, mut orient: u16, moves: &[usize]) -> (u16, u16) {
+    for &m in moves {
+        perm = perm_after_move(perm, m);
+        orient = orient_after_move(orient, m);
+    }
+    (perm, orient)
+}
+
+fn build_goal_states() -> GoalStates {
+    let _ = move_tables();
+
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([(0u16, 0u16)]);
+    seen.insert(encode_goal_pair(0, 0));
+
+    while let Some((perm, orient)) = queue.pop_front() {
+        for rotation in WHOLE_CUBE_ROTATION_GENERATORS {
+            let (next_perm, next_orient) = apply_move_sequence(perm, orient, &rotation);
+            let orient_sum = coord_to_orient(next_orient).iter().sum::<u8>() % 3;
+            assert_eq!(orient_sum, 0, "goal orientation parity must stay valid");
+
+            let code = encode_goal_pair(next_perm, next_orient);
+            if seen.insert(code) {
+                queue.push_back((next_perm, next_orient));
+            }
+        }
+    }
+
+    assert_eq!(
+        seen.len(),
+        24,
+        "2x2 solved state should have 24 global orientations"
+    );
+
+    let goal_pairs: Vec<u32> = seen.into_iter().collect();
+    let mut perm_coords: Vec<u16> = goal_pairs
+        .iter()
+        .map(|&code| decode_goal_pair(code).0)
+        .collect();
+    perm_coords.sort_unstable();
+    perm_coords.dedup();
+
+    let mut orient_coords: Vec<u16> = goal_pairs
+        .iter()
+        .map(|&code| decode_goal_pair(code).1)
+        .collect();
+    orient_coords.sort_unstable();
+    orient_coords.dedup();
+
+    GoalStates {
+        goal_pairs,
+        perm_coords,
+        orient_coords,
+    }
+}
+
+fn is_goal_state(perm: u16, orient: u16) -> bool {
+    goal_states().contains(perm, orient)
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +605,12 @@ const ORIENT_PDB: &[u8] = include_bytes!("pdbs/orient_pdb.bin");
 fn heuristic(perm: u16, orient: u16) -> u8 {
     let p = PERM_PDB[perm as usize];
     let o = ORIENT_PDB[orient as usize];
-    p.max(o)
+    let h = p.max(o);
+    if h == 0 && !is_goal_state(perm, orient) {
+        1
+    } else {
+        h
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,19 +622,16 @@ fn ida_star(
     start_orient: u16,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<usize>, SolveError> {
-    let h = heuristic(start_perm, start_orient) as usize;
-    if h == 0 {
+    if is_goal_state(start_perm, start_orient) {
         return Ok(vec![]);
     }
 
     use std::sync::atomic::Ordering;
+    let h = heuristic(start_perm, start_orient) as usize;
     let mut bound = h;
     let mut path: Vec<usize> = Vec::new();
 
-    // God's number for 2x2 is 14 QTM, 11 HTM
-    let max_depth = 20;
-
-    while bound <= max_depth {
+    while bound <= MAX_HTM_DEPTH {
         if cancel.load(Ordering::Relaxed) {
             return Err(SolveError::Cancelled);
         }
@@ -483,9 +643,10 @@ fn ida_star(
         bound += 1;
     }
 
-    Err(SolveError::InvalidState(
-        format!("IDA* exceeded max search depth ({})", max_depth)
-    ))
+    Err(SolveError::InvalidState(format!(
+        "IDA* exceeded proven 2x2 search depth ({})",
+        MAX_HTM_DEPTH
+    )))
 }
 
 fn dls(
@@ -503,7 +664,7 @@ fn dls(
     if depth + h > bound {
         return (false, vec![]);
     }
-    if h == 0 {
+    if is_goal_state(perm, orient) {
         return (true, path.clone());
     }
 
@@ -583,6 +744,59 @@ mod tests {
     use super::*;
     use rubik_core::CubeOrder;
 
+    const CANONICAL_COLORS: [StickerColor; 6] = [
+        StickerColor::White,
+        StickerColor::Red,
+        StickerColor::Green,
+        StickerColor::Yellow,
+        StickerColor::Orange,
+        StickerColor::Blue,
+    ];
+
+    fn rotate_x(perm: [usize; 6]) -> [usize; 6] {
+        [perm[5], perm[1], perm[0], perm[2], perm[4], perm[3]]
+    }
+
+    fn rotate_y(perm: [usize; 6]) -> [usize; 6] {
+        [perm[0], perm[2], perm[4], perm[3], perm[5], perm[1]]
+    }
+
+    fn rotate_z(perm: [usize; 6]) -> [usize; 6] {
+        [perm[4], perm[0], perm[2], perm[1], perm[3], perm[5]]
+    }
+
+    fn all_24_face_perms() -> Vec<[usize; 6]> {
+        let identity = [0usize, 1, 2, 3, 4, 5];
+        let mut seen = BTreeSet::new();
+        let mut queue = vec![identity];
+        seen.insert(identity);
+
+        let mut i = 0;
+        while i < queue.len() {
+            let perm = queue[i];
+            i += 1;
+            for next in [rotate_x(perm), rotate_y(perm), rotate_z(perm)] {
+                if seen.insert(next) {
+                    queue.push(next);
+                }
+            }
+        }
+        queue
+    }
+
+    fn make_rotated_solved(face_perm: &[usize; 6]) -> CubeState {
+        let mut stickers = Vec::with_capacity(24);
+        for face in 0..6 {
+            let color = CANONICAL_COLORS[face_perm[face]];
+            stickers.extend(core::iter::repeat_n(color, 4));
+        }
+        CubeState {
+            version: rubik_core::CUBE_STATE_SCHEMA_VERSION,
+            order: CubeOrder::new(2).expect("valid"),
+            stickers,
+        }
+    }
+
     #[test]
     fn test_perm_coord_roundtrip() {
         let perm = [0u8, 1, 2, 3, 4, 5, 6, 7];
@@ -596,7 +810,11 @@ mod tests {
 
         for c in [0, 1, 42, 1000, 10000, 20000, 30000, 40319] {
             let p = coord_to_perm(c as u16);
-            assert_eq!(perm_to_coord(&p), c as u16, "roundtrip failed for coord {c}");
+            assert_eq!(
+                perm_to_coord(&p),
+                c as u16,
+                "roundtrip failed for coord {c}"
+            );
         }
     }
 
@@ -609,7 +827,11 @@ mod tests {
         for c in [0u16, 1, 42, 500, 1000, 2000, 2186] {
             let o = coord_to_orient(c);
             assert_eq!(orient_to_coord(&o), c, "roundtrip failed for coord {c}");
-            assert_eq!(o.iter().sum::<u8>() % 3, 0, "total twist not 0 for coord {c}");
+            assert_eq!(
+                o.iter().sum::<u8>() % 3,
+                0,
+                "total twist not 0 for coord {c}"
+            );
         }
     }
 
@@ -686,10 +908,19 @@ mod tests {
         let piece_lut = build_piece_lut();
 
         // Apply random move sequences and compare
-        let faces = [Face::Up, Face::Right, Face::Front,
-                     Face::Down, Face::Left, Face::Back];
-        let rots = [RotationAmount::Clockwise, RotationAmount::HalfTurn,
-                    RotationAmount::CounterClockwise];
+        let faces = [
+            Face::Up,
+            Face::Right,
+            Face::Front,
+            Face::Down,
+            Face::Left,
+            Face::Back,
+        ];
+        let rots = [
+            RotationAmount::Clockwise,
+            RotationAmount::HalfTurn,
+            RotationAmount::CounterClockwise,
+        ];
 
         // Test: apply R U R' U' on solved state and verify
         let seq: [(usize, usize); 6] = [
@@ -728,15 +959,41 @@ mod tests {
         let result_perm = coord_to_perm(p);
         let result_orient = coord_to_orient(o);
 
-        assert_eq!(result_perm, expected_pieces,
-            "perm mismatch via coordinate vs CubeState");
-        assert_eq!(result_orient, expected_orients,
-            "orient mismatch via coordinate vs CubeState");
+        assert_eq!(
+            result_perm, expected_pieces,
+            "perm mismatch via coordinate vs CubeState"
+        );
+        assert_eq!(
+            result_orient, expected_orients,
+            "orient mismatch via coordinate vs CubeState"
+        );
     }
 
     #[test]
     fn test_heuristic_solved() {
         assert_eq!(heuristic(0, 0), 0);
+    }
+
+    #[test]
+    fn test_goal_states_match_all_rotated_solved_states() {
+        let goals = goal_states();
+        let piece_lut = build_piece_lut();
+        let mut actual = BTreeSet::new();
+
+        for perm in all_24_face_perms() {
+            let state = make_rotated_solved(&perm);
+            let (pieces, orients) = extract_corners(&state, &piece_lut);
+            let perm_coord = perm_to_coord(&pieces);
+            let orient_coord = orient_to_coord(&orients);
+
+            assert!(is_goal_state(perm_coord, orient_coord));
+            assert_eq!(heuristic(perm_coord, orient_coord), 0);
+            actual.insert(encode_goal_pair(perm_coord, orient_coord));
+        }
+
+        assert_eq!(actual.len(), 24);
+        assert_eq!(goals.goal_pairs.len(), 24);
+        assert_eq!(actual, goals.goal_pairs.iter().copied().collect());
     }
 
     #[test]
@@ -760,7 +1017,22 @@ mod tests {
     fn test_solve_solved_state() {
         let state = CubeState::solved(CubeOrder::new(2).expect("valid"));
         let solution = solve(&state).expect("solve should succeed");
-        assert!(solution.is_empty(), "solved state should give empty solution");
+        assert!(
+            solution.is_empty(),
+            "solved state should give empty solution"
+        );
+    }
+
+    #[test]
+    fn test_solve_rotated_solved_state() {
+        for perm in all_24_face_perms() {
+            let state = make_rotated_solved(&perm);
+            let solution = solve(&state).expect("solve should succeed");
+            assert!(
+                solution.is_empty(),
+                "rotated solved state should give empty solution for perm {perm:?}"
+            );
+        }
     }
 
     #[test]
@@ -770,7 +1042,8 @@ mod tests {
         apply_turn_to_state(
             &mut state,
             TurnCommand::outer(Face::Up, RotationAmount::Clockwise),
-        ).expect("U turn");
+        )
+        .expect("U turn");
 
         let solution = solve(&state).expect("solve should succeed");
         assert!(!solution.is_empty(), "should find solution");
@@ -780,8 +1053,10 @@ mod tests {
         for &turn in &solution {
             apply_turn_to_state(&mut verify, turn).expect("solution turn valid");
         }
-        assert_eq!(verify, CubeState::solved(CubeOrder::new(2).expect("valid")),
-            "solution should restore solved state");
+        assert!(
+            verify.is_solved(),
+            "solution should restore a solved orientation"
+        );
     }
 
     #[test]
@@ -806,7 +1081,10 @@ mod tests {
         for &turn in &solution {
             apply_turn_to_state(&mut verify, turn).expect("solution turn valid");
         }
-        assert_eq!(verify, CubeState::solved(CubeOrder::new(2).expect("valid")),
-            "solution should restore solved state. Solution: {:?}", solution);
+        assert!(
+            verify.is_solved(),
+            "solution should restore a solved orientation. Solution: {:?}",
+            solution
+        );
     }
 }

@@ -8,7 +8,7 @@ Replaced the buggy `solver-worker` crate with a new `rubik-solver` crate impleme
 
 ### Pipeline
 
-- **N=2**: Beginner's method: D layer → OLL → PLL (corner-only algorithms)
+- **N=2**: IDA* over corner permutation/orientation coordinates with pattern databases
 - **N=3**: Systematic beginner's method: cross → D corners → middle edges → OLL → PLL
 - **N≥4**: Reduction method:
   1. Center solving via commutator-based batch reduction
@@ -35,8 +35,9 @@ To support arbitrary-order cubes (N≥2 up to N=2048):
 
 1. **No third-party solving libraries**: The solver implements all algorithms from scratch (beginner's method for 2×2/3×3, commutator-based reduction for N≥4). The `min2phase` dependency has been removed.
 2. **No fallback logic**: All algorithms are deterministic and guaranteed to complete without max iteration/depth limits.
-3. **Systematic beginner's method**: For 2×2 and 3×3, each step detects the specific case and applies the correct algorithm, rather than trying turns greedily.
+3. **Systematic beginner's method**: The 3×3 solver detects each case and applies the correct algorithm, rather than trying turns greedily.
 4. **Commutator-based centers**: N≥4 center solving uses the commutator `r U' l' U r' U' l U` pattern adapted from RCube's approach, with batch row operations for large N.
+5. **2×2 solved-state symmetry**: The 2×2 IDA* solver treats all 24 whole-cube orientations of a solved cube as equivalent goals. Its exact goal check and regenerated multi-source PDBs are built from the same 24-orientation cubie-coordinate model, so the solver avoids redundant moves spent rotating back to one canonical sticker layout.
 
 ## Files Changed
 

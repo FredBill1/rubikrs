@@ -243,12 +243,12 @@ impl Cube {
         self.recorded_moves.push(MoveRecord { face, depth, q });
 
         match face {
-            0 => self.rotate_z(depth, q),                 // F
-            1 => self.rotate_x(self.r1 - depth, q),        // R
-            2 => self.rotate_z(self.r1 - depth, -q),       // B
-            3 => self.rotate_x(depth, -q),                 // L
-            4 => self.rotate_y(self.r1 - depth, -q),       // U
-            5 => self.rotate_y(depth, q),                  // D
+            0 => self.rotate_z(depth, q),            // F
+            1 => self.rotate_x(self.r1 - depth, q),  // R
+            2 => self.rotate_z(self.r1 - depth, -q), // B
+            3 => self.rotate_x(depth, -q),           // L
+            4 => self.rotate_y(self.r1 - depth, -q), // U
+            5 => self.rotate_y(depth, q),            // D
             _ => {}
         }
     }
@@ -327,166 +327,91 @@ impl Cube {
 
         // Stage 0: Push R color pieces from F to R
         if self.stage == 0 {
-            self.push_center_pieces(
-                constants::F,
-                constants::R,
-                constants::R,
-                cancelled,
-            );
+            self.push_center_pieces(constants::F, constants::R, constants::R, cancelled);
             self.stage += 1;
         }
 
         // Stage 1: Push R color pieces from U to R
         if self.stage == 1 {
-            self.push_center_pieces(
-                constants::U,
-                constants::R,
-                constants::R,
-                cancelled,
-            );
+            self.push_center_pieces(constants::U, constants::R, constants::R, cancelled);
             self.stage += 1;
         }
 
         // Stage 2: Push R color pieces from B to R
         if self.stage == 2 {
-            self.push_center_pieces(
-                constants::B,
-                constants::R,
-                constants::R,
-                cancelled,
-            );
+            self.push_center_pieces(constants::B, constants::R, constants::R, cancelled);
             self.stage += 1;
         }
 
         // Stage 3: Push R color pieces from L to R
         if self.stage == 3 {
-            self.push_center_pieces(
-                constants::L,
-                constants::R,
-                constants::R,
-                cancelled,
-            );
+            self.push_center_pieces(constants::L, constants::R, constants::R, cancelled);
             self.stage += 1;
         }
 
         // Stage 4: Push R color pieces from D to R
         if self.stage == 4 {
-            self.push_center_pieces(
-                constants::D,
-                constants::R,
-                constants::R,
-                cancelled,
-            );
+            self.push_center_pieces(constants::D, constants::R, constants::R, cancelled);
             self.stage += 1;
         }
 
         // Stage 5: Push L color pieces from U to L
         if self.stage == 5 {
-            self.push_center_pieces(
-                constants::U,
-                constants::L,
-                constants::L,
-                cancelled,
-            );
+            self.push_center_pieces(constants::U, constants::L, constants::L, cancelled);
             self.stage += 1;
         }
 
         // Stage 6: Push L color pieces from D to L
         if self.stage == 6 {
-            self.push_center_pieces(
-                constants::D,
-                constants::L,
-                constants::L,
-                cancelled,
-            );
+            self.push_center_pieces(constants::D, constants::L, constants::L, cancelled);
             self.stage += 1;
         }
 
         // Stage 7: Push L color pieces from B to L
         if self.stage == 7 {
-            self.push_center_pieces(
-                constants::B,
-                constants::L,
-                constants::L,
-                cancelled,
-            );
+            self.push_center_pieces(constants::B, constants::L, constants::L, cancelled);
             self.stage += 1;
         }
 
         // Stage 8: Push L color pieces from F to L
         if self.stage == 8 {
-            self.push_center_pieces(
-                constants::F,
-                constants::L,
-                constants::L,
-                cancelled,
-            );
+            self.push_center_pieces(constants::F, constants::L, constants::L, cancelled);
             self.stage += 1;
         }
 
         // Stage 9: Push F color pieces from B to F
         if self.stage == 9 {
-            self.push_center_pieces(
-                constants::B,
-                constants::F,
-                constants::F,
-                cancelled,
-            );
+            self.push_center_pieces(constants::B, constants::F, constants::F, cancelled);
             self.stage += 1;
         }
 
         // Stage 10: Push F color pieces from U to F
         if self.stage == 10 {
-            self.push_center_pieces(
-                constants::U,
-                constants::F,
-                constants::F,
-                cancelled,
-            );
+            self.push_center_pieces(constants::U, constants::F, constants::F, cancelled);
             self.stage += 1;
         }
 
         // Stage 11: Push F color pieces from D to F
         if self.stage == 11 {
-            self.push_center_pieces(
-                constants::D,
-                constants::F,
-                constants::F,
-                cancelled,
-            );
+            self.push_center_pieces(constants::D, constants::F, constants::F, cancelled);
             self.stage += 1;
         }
 
         // Stage 12: Push D color pieces from U to D
         if self.stage == 12 {
-            self.push_center_pieces(
-                constants::U,
-                constants::D,
-                constants::D,
-                cancelled,
-            );
+            self.push_center_pieces(constants::U, constants::D, constants::D, cancelled);
             self.stage += 1;
         }
 
         // Stage 13: Push D color pieces from B to D
         if self.stage == 13 {
-            self.push_center_pieces(
-                constants::B,
-                constants::D,
-                constants::D,
-                cancelled,
-            );
+            self.push_center_pieces(constants::B, constants::D, constants::D, cancelled);
             self.stage += 1;
         }
 
         // Stage 14: Push U color pieces from B to U
         if self.stage == 14 {
-            self.push_center_pieces(
-                constants::U,
-                constants::B,
-                constants::B,
-                cancelled,
-            );
+            self.push_center_pieces(constants::U, constants::B, constants::B, cancelled);
             self.stage += 1;
         }
     }
@@ -578,13 +503,7 @@ impl Cube {
     // PushCenterPieces — push center pieces of a color from one face to another
     // =========================================================================
 
-    fn push_center_pieces(
-        &mut self,
-        src: u8,
-        dst: u8,
-        color: u8,
-        cancelled: &AtomicBool,
-    ) {
+    fn push_center_pieces(&mut self, src: u8, dst: u8, color: u8, cancelled: &AtomicBool) {
         let map = self.find_commutator_map(src, dst);
 
         let srcl = constants::CMAP[map][2]; // face 'left' of src (in direction of dst)
@@ -673,9 +592,13 @@ impl Cube {
 
     pub fn scramble(&mut self, seed: u32) {
         // MSVC-compatible rand()
-        struct Rng { state: u32 }
+        struct Rng {
+            state: u32,
+        }
         impl Rng {
-            fn srand(&mut self, s: u32) { self.state = s; }
+            fn srand(&mut self, s: u32) {
+                self.state = s;
+            }
             fn rand(&mut self) -> u32 {
                 self.state = self.state.wrapping_mul(214013).wrapping_add(2531011);
                 (self.state >> 16) & 0x7FFF
@@ -690,9 +613,15 @@ impl Cube {
 
             for _ in 0..(3 * row_size) {
                 let rnd = rng.rand() % 3;
-                if rnd == 0 { self.rotate_x(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1); }
-                if rnd == 1 { self.rotate_y(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1); }
-                if rnd == 2 { self.rotate_z(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1); }
+                if rnd == 0 {
+                    self.rotate_x(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1);
+                }
+                if rnd == 1 {
+                    self.rotate_y(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1);
+                }
+                if rnd == 2 {
+                    self.rotate_z(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1);
+                }
             }
 
             for i in 0..row_size {
@@ -703,9 +632,15 @@ impl Cube {
 
             for _ in 0..(3 * row_size) {
                 let rnd = rng.rand() % 3;
-                if rnd == 0 { self.rotate_x(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1); }
-                if rnd == 1 { self.rotate_y(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1); }
-                if rnd == 2 { self.rotate_z(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1); }
+                if rnd == 0 {
+                    self.rotate_x(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1);
+                }
+                if rnd == 1 {
+                    self.rotate_y(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1);
+                }
+                if rnd == 2 {
+                    self.rotate_z(rng.rand() % row_size, (rng.rand() as i32 & 3) + 1);
+                }
             }
 
             let seed = (seed + 1) % 0x0FFFFFF;
@@ -887,44 +822,44 @@ impl Cube {
     fn get_corner(&self, cr: usize) -> (u8, u8, u8) {
         match cr {
             0 => (
-                self.faces[4].get_rc(0, 0),          // U(0,0)
-                self.faces[0].get_rc(self.r1, 0),     // F(R1,0)
+                self.faces[4].get_rc(0, 0),             // U(0,0)
+                self.faces[0].get_rc(self.r1, 0),       // F(R1,0)
                 self.faces[3].get_rc(self.r1, self.r1), // L(R1,R1)
             ),
             1 => (
-                self.faces[4].get_rc(self.r1, 0),     // U(R1,0)
-                self.faces[3].get_rc(self.r1, 0),     // L(R1,0)
+                self.faces[4].get_rc(self.r1, 0),       // U(R1,0)
+                self.faces[3].get_rc(self.r1, 0),       // L(R1,0)
                 self.faces[2].get_rc(self.r1, self.r1), // B(R1,R1)
             ),
             2 => (
                 self.faces[4].get_rc(self.r1, self.r1), // U(R1,R1)
                 self.faces[1].get_rc(self.r1, self.r1), // R(R1,R1)
-                self.faces[2].get_rc(self.r1, 0),     // B(R1,0)
+                self.faces[2].get_rc(self.r1, 0),       // B(R1,0)
             ),
             3 => (
-                self.faces[4].get_rc(0, self.r1),     // U(0,R1)
+                self.faces[4].get_rc(0, self.r1),       // U(0,R1)
                 self.faces[0].get_rc(self.r1, self.r1), // F(R1,R1)
-                self.faces[1].get_rc(self.r1, 0),     // R(R1,0)
+                self.faces[1].get_rc(self.r1, 0),       // R(R1,0)
             ),
             4 => (
-                self.faces[5].get_rc(0, 0),          // D(0,0)
-                self.faces[3].get_rc(0, 0),           // L(0,0)
-                self.faces[2].get_rc(0, self.r1),     // B(0,R1)
+                self.faces[5].get_rc(0, 0),       // D(0,0)
+                self.faces[3].get_rc(0, 0),       // L(0,0)
+                self.faces[2].get_rc(0, self.r1), // B(0,R1)
             ),
             5 => (
-                self.faces[5].get_rc(self.r1, 0),     // D(R1,0)
-                self.faces[0].get_rc(0, 0),           // F(0,0)
-                self.faces[3].get_rc(0, self.r1),     // L(0,R1)
+                self.faces[5].get_rc(self.r1, 0), // D(R1,0)
+                self.faces[0].get_rc(0, 0),       // F(0,0)
+                self.faces[3].get_rc(0, self.r1), // L(0,R1)
             ),
             6 => (
                 self.faces[5].get_rc(self.r1, self.r1), // D(R1,R1)
-                self.faces[0].get_rc(0, self.r1),     // F(0,R1)
-                self.faces[1].get_rc(0, 0),           // R(0,0)
+                self.faces[0].get_rc(0, self.r1),       // F(0,R1)
+                self.faces[1].get_rc(0, 0),             // R(0,0)
             ),
             7 => (
-                self.faces[5].get_rc(0, self.r1),     // D(0,R1)
-                self.faces[1].get_rc(0, self.r1),     // R(0,R1)
-                self.faces[2].get_rc(0, 0),           // B(0,0)
+                self.faces[5].get_rc(0, self.r1), // D(0,R1)
+                self.faces[1].get_rc(0, self.r1), // R(0,R1)
+                self.faces[2].get_rc(0, 0),       // B(0,0)
             ),
             _ => (0, 0, 0),
         }
@@ -1105,9 +1040,7 @@ impl Cube {
                         // Piece exists on the left?
                         if (l0 == c0 && l1 == c1) || (l0 == c1 && l1 == c0) {
                             // Also a piece exists on the right?
-                            if ((r0 == c0 && r1 == c1) || (r0 == c1 && r1 == c0))
-                                && r != self.mid
-                            {
+                            if ((r0 == c0 && r1 == c1) || (r0 == c1 && r1 == c0)) && r != self.mid {
                                 mstack[mptr] = r;
                                 mptr += 1;
                             }

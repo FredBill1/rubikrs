@@ -4,10 +4,10 @@
 
 use rubik_core::{CubeState, Face, RotationAmount, StickerColor, TurnCommand};
 
-use super::{cancel_mutex, SolveError};
+use super::{SolveError, cancel_mutex};
 use crate::min2phase;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Solve a 3x3 cube state using the Kociemba two-phase algorithm.
 ///
@@ -105,7 +105,7 @@ fn parse_solution(solution: &str) -> Result<Vec<TurnCommand>, SolveError> {
                 return Err(SolveError::InvalidState(format!(
                     "unknown move token: '{}' in solution '{}'",
                     other, solution
-                )))
+                )));
             }
         };
 

@@ -26,8 +26,8 @@
 //   4. Return the move sequence
 
 pub mod constants;
-mod face;
 pub mod cube;
+mod face;
 
 use cube::{Cube, MoveRecord};
 use rubik_core::{CubeState, Face as RubikFace, RotationAmount, StickerColor, TurnCommand};
@@ -46,13 +46,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn rcube_face_to_rubik(rcube_face: u8) -> RubikFace {
     match rcube_face {
-        0 => RubikFace::Front,   // F
-        1 => RubikFace::Right,   // R
-        2 => RubikFace::Back,    // B
-        3 => RubikFace::Left,    // L
-        4 => RubikFace::Up,      // U
-        5 => RubikFace::Down,    // D
-        _ => RubikFace::Up,      // shouldn't happen
+        0 => RubikFace::Front, // F
+        1 => RubikFace::Right, // R
+        2 => RubikFace::Back,  // B
+        3 => RubikFace::Left,  // L
+        4 => RubikFace::Up,    // U
+        5 => RubikFace::Down,  // D
+        _ => RubikFace::Up,    // shouldn't happen
     }
 }
 
@@ -123,8 +123,7 @@ fn cube_state_to_rcube(state: &CubeState) -> Cube {
                 let sc = state.stickers[rubik_sticker_idx];
                 let rc_color = sticker_color_to_rcube_color(sc);
                 // Row flip: rubik row r (top-down) → RCube row (R1-r) (bottom-up)
-                cube.faces[rcube_face_idx as usize]
-                    .set_rc((r1 - r as usize) as u32, c, rc_color);
+                cube.faces[rcube_face_idx as usize].set_rc((r1 - r as usize) as u32, c, rc_color);
             }
         }
     }
@@ -215,7 +214,11 @@ mod tests {
     fn test_solve_solved_2x2() {
         let state = CubeState::solved(CubeOrder::new(2).expect("valid"));
         let result = solve(&state, None);
-        assert!(result.is_ok(), "solved 2x2 should solve trivially: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "solved 2x2 should solve trivially: {:?}",
+            result.err()
+        );
         let turns = result.unwrap();
         // Applying solution to solved state should keep it solved
         let mut verify = state.clone();
@@ -230,6 +233,10 @@ mod tests {
     fn test_solve_solved_3x3() {
         let state = CubeState::solved(CubeOrder::new(3).expect("valid"));
         let result = solve(&state, None);
-        assert!(result.is_ok(), "solved 3x3 should solve: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "solved 3x3 should solve: {:?}",
+            result.err()
+        );
     }
 }
