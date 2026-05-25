@@ -110,7 +110,7 @@ fn pair_wing_layer(
     let seq_a: [TurnCommand; 5] = [ds, r, u, rp, dsp]; // d R U R' d'
     let seq_b: [TurnCommand; 5] = [dsp, l, up, lp, ds]; // d' L' U' L d
 
-    let max_iters = 2000;
+    let max_iters = 10000;
     let mut iter = 0;
 
     loop {
@@ -182,6 +182,22 @@ fn pair_wing_layer(
             if after2 <= current_paired && iter > 50 {
                 // Try deeper cycling
                 tracker.apply(&[ds, d_outer, ds, d_outer, dsp, dsp])?;
+            }
+
+            // If still completely stuck after many iterations, try a more
+            // aggressive shake-up sequence to escape local optima.
+            if iter > 500 && iter % 100 == 0 {
+                let after3 = edge_types::count_paired_edge_groups(tracker.state);
+                if after3 <= current_paired {
+                    // Aggressive shake: inner slices on multiple axes
+                    let shake = [
+                        TurnCommand { face: rubik_core::Face::Right, start_layer: 1, width: 1, rotation: rubik_core::RotationAmount::Clockwise },
+                        TurnCommand { face: rubik_core::Face::Up, start_layer: 1, width: 1, rotation: rubik_core::RotationAmount::Clockwise },
+                        TurnCommand { face: rubik_core::Face::Right, start_layer: 1, width: 1, rotation: rubik_core::RotationAmount::CounterClockwise },
+                        TurnCommand { face: rubik_core::Face::Up, start_layer: 1, width: 1, rotation: rubik_core::RotationAmount::CounterClockwise },
+                    ];
+                    tracker.apply(&shake)?;
+                }
             }
         }
     }
