@@ -19,9 +19,7 @@ use rubik_core::{CubeState, Face, RotationAmount, StickerColor, TurnCommand, app
 use super::ReductionError;
 use crate::center_types::{self, center_positions_on_face, CenterPiece};
 
-/// Maximum iterations per face pair before falling back.
-/// Kept low to prevent excessive edge scrambling.
-const MAX_ITERATIONS_PER_PAIR: usize = 500;
+const MAX_ITERATIONS_PER_PAIR: usize = 200;
 
 /// Hard cap on visited states during BFS to prevent runaway memory/time.
 const BFS_VISITED_CAP: usize = 200_000;
@@ -75,7 +73,11 @@ pub fn solve_centers(state: &CubeState) -> Result<Vec<TurnCommand>, ReductionErr
         ));
     }
 
-    Ok(all_turns)
+    // Simplify the turn sequence to reduce edge scrambling.
+    // This cancels adjacent inverse moves and merges same-face same-slice turns,
+    // which can significantly reduce the sequence length without changing
+    // the center-solving effect.
+    Ok(simplify_center_turns(&all_turns, order))
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,6 +1212,81 @@ pub fn find_matching_center(
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Turn simplification (reduces sequence length to help the edge solver)
+// ---------------------------------------------------------------------------
+
+/// Simplify a turn sequence by canceling adjacent inverses and merging
+/// same-slice adjacent turns. Canonicalises all moves to the positive face
+/// (R/U/F) so that cross-face cancellations work.
+fn simplify_center_turns(turns: &[TurnCommand], order: u32) -> Vec<TurnCommand> {
+    if turns.len() <= 1 {
+        return turns.to_vec();
+    }
+
+    let r1 = order - 1;
+
+    // Convert to internal representation
+    let mut moves: Vec<(u8, u32, i32)> = turns.iter().map(|t| {
+        let q: i32 = match t.rotation {
+            RotationAmount::Clockwise => 1,
+            RotationAmount::HalfTurn => 2,
+            RotationAmount::CounterClockwise => -1,
+        };
+        match t.face {
+            Face::Right => (0u8, t.start_layer, q),
+            Face::Left => (0u8, r1 - t.start_layer, -q),
+            Face::Up => (1u8, t.start_layer, q),
+            Face::Down => (1u8, r1 - t.start_layer, -q),
+            Face::Front => (2u8, t.start_layer, q),
+            Face::Back => (2u8, r1 - t.start_layer, -q),
+        }
+    }).collect();
+
+    // Run merge pass to fixed point
+    loop {
+        let len_before = moves.len();
+        let mut i = 0;
+        while i + 1 < moves.len() {
+            let (a_axis, a_depth, a_amt) = moves[i];
+            let (b_axis, b_depth, b_amt) = moves[i + 1];
+            if a_axis == b_axis && a_depth == b_depth {
+                let sum = ((a_amt + b_amt) % 4 + 4) % 4;
+                if sum == 0 {
+                    moves.remove(i);
+                    moves.remove(i); // i+1 shifts to i
+                } else {
+                    let norm = match sum { 1 => 1, 2 => 2, 3 => -1, _ => 0 };
+                    moves[i] = (a_axis, a_depth, norm);
+                    moves.remove(i + 1);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if moves.len() == len_before {
+            break;
+        }
+    }
+
+    // Convert back to TurnCommands
+    moves.into_iter().filter_map(|(axis, depth, amt)| {
+        let rotation = match amt {
+            1 => RotationAmount::Clockwise,
+            -1 => RotationAmount::CounterClockwise,
+            2 | -2 => RotationAmount::HalfTurn,
+            _ => return None,
+        };
+        let face = match axis {
+            0 => Face::Right,
+            1 => Face::Up,
+            2 => Face::Front,
+            _ => return None,
+        };
+        Some(TurnCommand { face, start_layer: depth, width: 1, rotation })
+    }).collect()
 }
 
 // ---------------------------------------------------------------------------

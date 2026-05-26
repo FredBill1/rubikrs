@@ -118,6 +118,24 @@ fn pair_wing_layer(
     let mut iter = 0;
     let mut stall_iters = 0u32;
 
+    // Scratch buffer for unchecked turn application (avoids repeated validation)
+    let mut scratch: Vec<rubik_core::StickerColor> = tracker.state.stickers.clone();
+
+    /// Apply a sequence of turns to a state WITHOUT full validation.
+    /// Much faster than apply_turn_to_state for simulation.
+    fn apply_unchecked(
+        state: &mut CubeState,
+        scratch: &mut [rubik_core::StickerColor],
+        cmds: &[TurnCommand],
+    ) -> Result<(), ()> {
+        for &t in cmds {
+            if rubik_core::apply_turn_to_state_unchecked(state, t, scratch).is_err() {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
     loop {
         iter += 1;
         if iter > max_iters {
@@ -138,21 +156,19 @@ fn pair_wing_layer(
         for setup in &setups {
             for seq in [seq_a, seq_b, seq_c, seq_d, seq_e, seq_f] {
                 let mut sim_state = tracker.state.clone();
-                let mut sim_turns = Vec::new();
-                let mut sim = StateTracker {
-                    state: &mut sim_state,
-                    turns: &mut sim_turns,
+                let candidate: Vec<TurnCommand> = if let Some(ut) = setup {
+                    let _ = apply_unchecked(&mut sim_state, &mut scratch, &[*ut]);
+                    let _ = apply_unchecked(&mut sim_state, &mut scratch, seq);
+                    let mut c = Vec::with_capacity(1 + seq.len());
+                    c.push(*ut);
+                    c.extend_from_slice(seq);
+                    c
+                } else {
+                    let _ = apply_unchecked(&mut sim_state, &mut scratch, seq);
+                    seq.to_vec()
                 };
 
-                let mut candidate = Vec::new();
-                if let Some(ut) = setup {
-                    let _ = sim.apply(&[*ut]);
-                    candidate.push(*ut);
-                }
-                let _ = sim.apply(seq);
-                candidate.extend_from_slice(seq);
-
-                let new_paired = edge_types::count_paired_edge_groups(sim.state);
+                let new_paired = edge_types::count_paired_edge_groups(&sim_state);
                 if new_paired > best_paired {
                     best_paired = new_paired;
                     best_seq = Some(candidate);
@@ -174,7 +190,6 @@ fn pair_wing_layer(
             let mut found_improvement = false;
 
             for ds_steps in 0..4u32 {
-                // Apply ds^ds_steps to cycle the d-slice
                 let ds_cycle: Vec<TurnCommand> = match ds_steps {
                     0 => vec![],
                     1 => vec![ds],
@@ -184,31 +199,30 @@ fn pair_wing_layer(
 
                 if !ds_cycle.is_empty() {
                     let mut sim_state = tracker.state.clone();
-                    let mut sim_turns = Vec::new();
-                    let mut sim = StateTracker { state: &mut sim_state, turns: &mut sim_turns };
-                    let _ = sim.apply(&ds_cycle);
-                    let after_ds = edge_types::count_paired_edge_groups(sim.state);
+                    let _ = apply_unchecked(&mut sim_state, &mut scratch, &ds_cycle);
+                    let after_ds = edge_types::count_paired_edge_groups(&sim_state);
                     if after_ds < current_paired {
-                        continue; // this ds cycle breaks pairs, skip
+                        continue;
                     }
                     tracker.apply(&ds_cycle)?;
                 }
 
-                // Now try all setups + sequences
                 let cp = edge_types::count_paired_edge_groups(tracker.state);
                 for setup in &setups {
                     for seq in [seq_a, seq_b, seq_c, seq_d, seq_e, seq_f] {
                         let mut sim_state = tracker.state.clone();
-                        let mut sim_turns = Vec::new();
-                        let mut sim = StateTracker { state: &mut sim_state, turns: &mut sim_turns };
-                        let mut candidate = Vec::new();
-                        if let Some(ut) = setup {
-                            let _ = sim.apply(&[*ut]);
-                            candidate.push(*ut);
-                        }
-                        let _ = sim.apply(seq);
-                        candidate.extend_from_slice(seq);
-                        let new_paired = edge_types::count_paired_edge_groups(sim.state);
+                        let candidate: Vec<TurnCommand> = if let Some(ut) = setup {
+                            let _ = apply_unchecked(&mut sim_state, &mut scratch, &[*ut]);
+                            let _ = apply_unchecked(&mut sim_state, &mut scratch, seq);
+                            let mut c = Vec::with_capacity(1 + seq.len());
+                            c.push(*ut);
+                            c.extend_from_slice(seq);
+                            c
+                        } else {
+                            let _ = apply_unchecked(&mut sim_state, &mut scratch, seq);
+                            seq.to_vec()
+                        };
+                        let new_paired = edge_types::count_paired_edge_groups(&sim_state);
                         if new_paired > cp {
                             tracker.apply(&candidate)?;
                             found_improvement = true;
