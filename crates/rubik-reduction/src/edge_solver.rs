@@ -1,20 +1,14 @@
 // edge_solver — pairs edges for N×N cubes (N ≥ 4) using reduction method.
 //
-// Approach: d-slice edge pairing (the standard reduction method).
+// Approach: explicit wing matching with d-slice commutators.
 //
 // Algorithm:
-// 1. Use the inner d-slice (layer between U and D, adjacent to D) as the
-//    working slice to bring matching wing pieces together.
-// 2. Store paired edges on the U and D layers.
-// 3. For the last few edges, use special algorithms to handle remaining cases.
-//
-// For N×N cubes:
-//   - Pair outer wings first, then inner wings (for N > 4)
-//   - Work slice by slice from the outside in
-//
-// Key algorithms:
-//   - Standard pair: d R U R' d'  (pairs UF edge using d slice)
-//   - Last two edges:  slice-flip-slice commutators
+// 1. Iterate over unpaired edge positions on the U layer.
+// 2. For each, find the matching wing piece (same two colors).
+// 3. Bring the matching wing to the FR position in the d-slice.
+// 4. Pair using d R U R' d' (or mirror).
+// 5. Cycle the d-slice to bring new unpaired edges to the working area.
+// 6. For the last 2-3 edges, use slice-flip-slice algorithms.
 
 use rubik_core::{apply_turn_to_state, CubeState, Face, RotationAmount, TurnCommand};
 
@@ -80,8 +74,9 @@ fn d_slice_turn(wing_layer: u32, rotation: RotationAmount) -> TurnCommand {
 
 /// Pair all edge wings at a specific layer using a greedy simulation approach.
 ///
-/// Tries all combinations of U-layer orientation × pairing sequence,
-/// picks whichever increases the paired-edge count, and applies it.
+/// Tries all U-layer setups with the standard d-slice commutator sequences.
+/// When stuck, cycles the d-slice to bring new wing pieces into the working
+/// area, and uses aggressive shake sequences to escape local optima.
 fn pair_wing_layer(
     state: &mut CubeState,
     turns: &mut Vec<TurnCommand>,
@@ -94,6 +89,8 @@ fn pair_wing_layer(
     let rp = TurnCommand::outer(Face::Right, RotationAmount::CounterClockwise);
     let l = TurnCommand::outer(Face::Left, RotationAmount::Clockwise);
     let lp = TurnCommand::outer(Face::Left, RotationAmount::CounterClockwise);
+    let f = TurnCommand::outer(Face::Front, RotationAmount::Clockwise);
+    let fp = TurnCommand::outer(Face::Front, RotationAmount::CounterClockwise);
     let u = TurnCommand::outer(Face::Up, RotationAmount::Clockwise);
     let up = TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise);
     let u2 = TurnCommand::outer(Face::Up, RotationAmount::HalfTurn);
@@ -102,16 +99,24 @@ fn pair_wing_layer(
     let ds2 = d_slice_turn(wing_layer, RotationAmount::HalfTurn);
     let d_outer = TurnCommand::outer(Face::Down, RotationAmount::Clockwise);
 
-    // Pairing attempt candidates: (setup_u, pairing_seq)
-    // setup_u = U-turn to apply before the pairing sequence
+    // Pairing sequences
+    let seq_a: &[TurnCommand] = &[ds, r, u, rp, dsp];   // d R U R' d'
+    let seq_b: &[TurnCommand] = &[dsp, rp, up, r, ds];   // d' R' U' R d
+    let seq_c: &[TurnCommand] = &[ds, rp, f, r, fp, dsp]; // d R' F R F' d' (sledge)
+    let seq_d: &[TurnCommand] = &[dsp, l, fp, lp, f, ds]; // d' L F' L' F d (mirror sledge)
+
+    // u-slice variants
+    let us = TurnCommand { face: Face::Up, start_layer: 1 + wing_layer, width: 1, rotation: RotationAmount::Clockwise };
+    let usp = TurnCommand { face: Face::Up, start_layer: 1 + wing_layer, width: 1, rotation: RotationAmount::CounterClockwise };
+    let seq_e: &[TurnCommand] = &[usp, r, u, rp, us];    // u' R U R' u
+    let seq_f: &[TurnCommand] = &[us, rp, up, r, usp];   // u R' U' R u'
+
+    // U setups
     let setups: [Option<TurnCommand>; 4] = [None, Some(u), Some(u2), Some(up)];
 
-    // Pairing sequence variants
-    let seq_a: [TurnCommand; 5] = [ds, r, u, rp, dsp]; // d R U R' d'
-    let seq_b: [TurnCommand; 5] = [dsp, l, up, lp, ds]; // d' L' U' L d
-
-    let max_iters = 10000;
+    let max_iters = 50000;
     let mut iter = 0;
+    let mut stall_iters = 0u32;
 
     loop {
         iter += 1;
@@ -126,13 +131,12 @@ fn pair_wing_layer(
             break;
         }
 
-        // Try all combinations and find the best one
+        // Try all setup + sequence combinations
         let mut best_seq: Option<Vec<TurnCommand>> = None;
         let mut best_paired = current_paired;
 
         for setup in &setups {
-            for seq in [&seq_a, &seq_b] {
-                // Clone state for simulation
+            for seq in [seq_a, seq_b, seq_c, seq_d, seq_e, seq_f] {
                 let mut sim_state = tracker.state.clone();
                 let mut sim_turns = Vec::new();
                 let mut sim = StateTracker {
@@ -158,45 +162,89 @@ fn pair_wing_layer(
 
         if let Some(seq) = best_seq {
             tracker.apply(&seq)?;
-
-            // After pairing, cycle the d-slice to bring new unpaired edges
-            // into the U layer for the next iteration.
+            stall_iters = 0;
+            // Cycle d-slice to bring fresh edges to U
             let post_paired = edge_types::count_paired_edge_groups(tracker.state);
-
-            // Move paired edge away from U layer and bring up fresh edges
             if post_paired > current_paired {
-                // Cycle: d + D + d' brings equator/D edges to U
                 tracker.apply(&[ds, d_outer, dsp])?;
             }
         } else {
-            // No sequence helped. Cycle the d-slice to shake things up.
-            tracker.apply(&[ds2])?;
+            // No sequence helped — systematically try all d-slice positions
+            // by applying ds 0-3 times, then trying all U setups
+            let mut found_improvement = false;
 
-            // If still stuck, try cycling U
-            let after = edge_types::count_paired_edge_groups(tracker.state);
-            if after <= current_paired {
-                tracker.apply(&[u])?;
+            for ds_steps in 0..4u32 {
+                // Apply ds^ds_steps to cycle the d-slice
+                let ds_cycle: Vec<TurnCommand> = match ds_steps {
+                    0 => vec![],
+                    1 => vec![ds],
+                    2 => vec![ds2],
+                    _ => vec![dsp],
+                };
+
+                if !ds_cycle.is_empty() {
+                    let mut sim_state = tracker.state.clone();
+                    let mut sim_turns = Vec::new();
+                    let mut sim = StateTracker { state: &mut sim_state, turns: &mut sim_turns };
+                    let _ = sim.apply(&ds_cycle);
+                    let after_ds = edge_types::count_paired_edge_groups(sim.state);
+                    if after_ds < current_paired {
+                        continue; // this ds cycle breaks pairs, skip
+                    }
+                    tracker.apply(&ds_cycle)?;
+                }
+
+                // Now try all setups + sequences
+                let cp = edge_types::count_paired_edge_groups(tracker.state);
+                for setup in &setups {
+                    for seq in [seq_a, seq_b, seq_c, seq_d, seq_e, seq_f] {
+                        let mut sim_state = tracker.state.clone();
+                        let mut sim_turns = Vec::new();
+                        let mut sim = StateTracker { state: &mut sim_state, turns: &mut sim_turns };
+                        let mut candidate = Vec::new();
+                        if let Some(ut) = setup {
+                            let _ = sim.apply(&[*ut]);
+                            candidate.push(*ut);
+                        }
+                        let _ = sim.apply(seq);
+                        candidate.extend_from_slice(seq);
+                        let new_paired = edge_types::count_paired_edge_groups(sim.state);
+                        if new_paired > cp {
+                            tracker.apply(&candidate)?;
+                            found_improvement = true;
+                            break;
+                        }
+                    }
+                    if found_improvement { break; }
+                }
+                if found_improvement { break; }
+
+                // Undo ds cycle if we didn't find anything
+                if !ds_cycle.is_empty() {
+                    let undo: Vec<TurnCommand> = match ds_steps {
+                        1 => vec![dsp],
+                        2 => vec![ds2],
+                        3 => vec![ds],
+                        _ => vec![],
+                    };
+                    tracker.apply(&undo)?;
+                }
             }
 
-            let after2 = edge_types::count_paired_edge_groups(tracker.state);
-            if after2 <= current_paired && iter > 50 {
-                // Try deeper cycling
-                tracker.apply(&[ds, d_outer, ds, d_outer, dsp, dsp])?;
-            }
+            if found_improvement {
+                stall_iters = 0;
+            } else {
+                stall_iters += 1;
+                // Still stuck — do a standard cycle to shake things up
+                tracker.apply(&[ds, d_outer, dsp])?;
 
-            // If still completely stuck after many iterations, try a more
-            // aggressive shake-up sequence to escape local optima.
-            if iter > 500 && iter % 100 == 0 {
-                let after3 = edge_types::count_paired_edge_groups(tracker.state);
-                if after3 <= current_paired {
-                    // Aggressive shake: inner slices on multiple axes
-                    let shake = [
-                        TurnCommand { face: rubik_core::Face::Right, start_layer: 1, width: 1, rotation: rubik_core::RotationAmount::Clockwise },
-                        TurnCommand { face: rubik_core::Face::Up, start_layer: 1, width: 1, rotation: rubik_core::RotationAmount::Clockwise },
-                        TurnCommand { face: rubik_core::Face::Right, start_layer: 1, width: 1, rotation: rubik_core::RotationAmount::CounterClockwise },
-                        TurnCommand { face: rubik_core::Face::Up, start_layer: 1, width: 1, rotation: rubik_core::RotationAmount::CounterClockwise },
-                    ];
-                    tracker.apply(&shake)?;
+                // If stalled for >500 iterations without progress, apply an
+                // aggressive random shake: cycle the d-slice then apply U
+                // to break out of stubborn local optima.
+                if stall_iters > 500 {
+                    // Aggressive shake: multiple d-slice cycles + U turns
+                    tracker.apply(&[ds2, u, dsp])?;
+                    stall_iters = 0;
                 }
             }
         }

@@ -18,7 +18,7 @@ use super::ReductionError;
 use crate::center_types::{self, center_positions_on_face, CenterPiece};
 
 /// Maximum iterations per face pair.
-const MAX_ITERATIONS_PER_PAIR: usize = 5000;
+const MAX_ITERATIONS_PER_PAIR: usize = 3000;
 
 /// Maximum depth for IDA* fallback.
 const IDA_MAX_DEPTH: usize = 6;
@@ -82,6 +82,9 @@ fn solve_face_pair_unrestricted(
     let mut current = state.clone();
     let mut turns: Vec<TurnCommand> = Vec::new();
 
+    // 2-ply is expensive — only run once per stuck sequence
+    let mut tried_2ply = false;
+
     for _iter in 0..MAX_ITERATIONS_PER_PAIR {
         let solved_a = face_centers_solved(&current, face_a, order);
         let solved_b = face_centers_solved(&current, face_b, order);
@@ -94,7 +97,6 @@ fn solve_face_pair_unrestricted(
         let correct_b = count_correct_on_face(&current, face_b);
         let total_before = correct_a + correct_b;
 
-        // Determine which solved faces to preserve
         let preserved: Vec<Face> = if solved_a && !solved_b {
             vec![face_a]
         } else if solved_b && !solved_a {
@@ -103,34 +105,55 @@ fn solve_face_pair_unrestricted(
             vec![]
         };
 
-        // Try to find an improving sequence
-        if let Some(seq) = find_best_candidate_unrestricted(
-            &current, face_a, face_b, order, total_before, &preserved,
+        let full = generate_pair_candidates(&current, face_a, face_b, order, &preserved);
+
+        // 1. Strict-improvement greedy
+        if let Some(seq) = find_best_candidate_unrestricted_with_candidates(
+            &current, face_a, face_b, order, total_before, &preserved, &full,
         ) {
             apply_turns(&mut current, &seq)?;
             turns.extend(seq);
+            tried_2ply = false;
             continue;
         }
 
-        // If stuck, try enabling move on the face with fewer correct pieces
+        // 2. Enabling move (allows ≤1 decrease in TOTAL to create room)
         {
             let target = if correct_a <= correct_b { face_a } else { face_b };
-            if let Some(seq) = find_enabling_move(
-                &current, target, order,
-                count_correct_on_face(&current, target), &preserved,
+            if let Some(seq) = find_enabling_move_with_candidates(
+                &current, target, face_a, face_b, order,
+                count_correct_on_face(&current, target), total_before, &preserved, &full,
             ) {
                 apply_turns(&mut current, &seq)?;
                 turns.extend(seq);
+                tried_2ply = false;
                 continue;
             }
         }
 
-        // IDA* fallback on each unsolved face
+        // 3. Fast 2-ply: first 300 C1 that affect target faces, full C2
+        if !tried_2ply {
+            let max_correct = center_positions_on_face(face_a, order).len()
+                + center_positions_on_face(face_b, order).len();
+            if max_correct.saturating_sub(total_before) <= 10 {
+                tried_2ply = true;
+                // Use the full candidate set for both C1 and C2.
+                // C1 limited to first 300 that affect target faces for speed.
+                if let Some(seq) = find_2ply_improvement(
+                    &current, face_a, face_b, order, total_before, &preserved,
+                    &full, &full,
+                ) {
+                    apply_turns(&mut current, &seq)?;
+                    turns.extend(seq);
+                    tried_2ply = false;
+                    continue;
+                }
+            }
+        }
         {
             let mut found = false;
             for &face in &[face_a, face_b] {
                 if !face_centers_solved(&current, face, order) {
-                    // Use all slice candidates; simulation filters by preservation
                     let candidates = generate_all_ida_candidates(order);
                     if let Some(seq) = ida_star_single_face_with_candidates(
                         &current, face, order, &preserved, &candidates,
@@ -143,6 +166,55 @@ fn solve_face_pair_unrestricted(
                 }
             }
             if found {
+                continue;
+            }
+        }
+
+        // 5. Shake: prefer non-decreasing, fall back to ≤1 decrease
+        {
+            let mut shook = false;
+            for candidate in &full {
+                if candidate.len() < 4 { continue; }
+                if let Ok(sim) = simulate_sequence(&current, candidate) {
+                    if !solved_faces_preserved(&sim, &preserved, order) { continue; }
+                    let total = count_correct_on_face(&sim, face_a)
+                        + count_correct_on_face(&sim, face_b);
+                    if total < total_before { continue; }
+                    let changed = center_positions_on_face(face_a, order)
+                        .iter().any(|p| p.color_in(&sim) != p.color_in(&current))
+                        || center_positions_on_face(face_b, order)
+                            .iter().any(|p| p.color_in(&sim) != p.color_in(&current));
+                    if changed {
+                        apply_turns(&mut current, candidate)?;
+                        turns.extend_from_slice(candidate);
+                        shook = true;
+                        break;
+                    }
+                }
+            }
+            if !shook {
+                for candidate in &full {
+                    if candidate.len() < 4 { continue; }
+                    if let Ok(sim) = simulate_sequence(&current, candidate) {
+                        if !solved_faces_preserved(&sim, &preserved, order) { continue; }
+                        let total = count_correct_on_face(&sim, face_a)
+                            + count_correct_on_face(&sim, face_b);
+                        if total < total_before.saturating_sub(1) { continue; }
+                        let changed = center_positions_on_face(face_a, order)
+                            .iter().any(|p| p.color_in(&sim) != p.color_in(&current))
+                            || center_positions_on_face(face_b, order)
+                                .iter().any(|p| p.color_in(&sim) != p.color_in(&current));
+                        if changed {
+                            apply_turns(&mut current, candidate)?;
+                            turns.extend_from_slice(candidate);
+                            shook = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if shook {
+                tried_2ply = false;
                 continue;
             }
         }
@@ -176,10 +248,25 @@ fn find_best_candidate_unrestricted(
     total_before: usize,
     preserved: &[Face],
 ) -> Option<Vec<TurnCommand>> {
+    let candidates = generate_pair_candidates(state, face_a, face_b, order, preserved);
+    find_best_candidate_unrestricted_with_candidates(
+        state, face_a, face_b, order, total_before, preserved, &candidates,
+    )
+}
+
+fn find_best_candidate_unrestricted_with_candidates(
+    state: &CubeState,
+    face_a: Face,
+    face_b: Face,
+    order: u32,
+    total_before: usize,
+    preserved: &[Face],
+    candidates: &[Vec<TurnCommand>],
+) -> Option<Vec<TurnCommand>> {
     let mut best: Option<(Vec<TurnCommand>, usize)> = None;
 
-    for candidate in generate_pair_candidates(state, face_a, face_b, order, preserved) {
-        if let Ok(sim) = simulate_sequence(state, &candidate) {
+    for candidate in candidates {
+        if let Ok(sim) = simulate_sequence(state, candidate) {
             if !solved_faces_preserved(&sim, preserved, order) {
                 continue;
             }
@@ -188,10 +275,10 @@ fn find_best_candidate_unrestricted(
             if total > total_before {
                 match &best {
                     Some((_, best_total)) if total > *best_total => {
-                        best = Some((candidate, total));
+                        best = Some((candidate.clone(), total));
                     }
                     None => {
-                        best = Some((candidate, total));
+                        best = Some((candidate.clone(), total));
                     }
                     _ => {}
                 }
@@ -200,6 +287,132 @@ fn find_best_candidate_unrestricted(
     }
 
     best.map(|(turns, _)| turns)
+}
+
+/// Generate a focused set of commutators for 2-ply search.
+/// Only uses inner slices on faces perpendicular to the target pair,
+/// and face turns on the target pair. This dramatically reduces the
+/// search space while covering all useful commutators.
+fn generate_focused_2ply_commutators(
+    face_a: Face,
+    face_b: Face,
+    order: u32,
+    preserved: &[Face],
+) -> Vec<Vec<TurnCommand>> {
+    let max_depth = order / 2;
+    let mut candidates = Vec::new();
+
+    // Perpendicular faces: those NOT on the same axis as face_a/face_b.
+    // Two faces share an axis if they are the same or opposite.
+    let perpendicular: Vec<Face> = Face::ALL
+        .iter()
+        .filter(|f| **f != face_a && **f != face_b && f.opposite() != face_a && f.opposite() != face_b)
+        .copied()
+        .collect();
+
+    // Single inner-slice turns on perpendicular faces
+    for depth in 1..=max_depth {
+        for &sf in &perpendicular {
+            for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
+                candidates.push(vec![TurnCommand {
+                    face: sf, start_layer: depth, width: 1, rotation: rot,
+                }]);
+            }
+        }
+    }
+
+    // Commutators [slice, face_turn]
+    for depth in 1..=max_depth {
+        for &sf in &perpendicular {
+            let slice_cw = TurnCommand {
+                face: sf, start_layer: depth, width: 1,
+                rotation: RotationAmount::Clockwise,
+            };
+            let slice_ccw = slice_cw.inverse();
+
+            let mut face_candidates = vec![
+                (face_a, RotationAmount::Clockwise),
+                (face_a, RotationAmount::CounterClockwise),
+                (face_a, RotationAmount::HalfTurn),
+                (face_b, RotationAmount::Clockwise),
+                (face_b, RotationAmount::CounterClockwise),
+                (face_b, RotationAmount::HalfTurn),
+            ];
+            for &p in preserved {
+                face_candidates.push((p, RotationAmount::HalfTurn));
+            }
+
+            for &(face, rot) in &face_candidates {
+                let face_turn = TurnCommand {
+                    face, start_layer: 0, width: 1, rotation: rot,
+                };
+                let face_inv = face_turn.inverse();
+                for (a, a_inv) in [(slice_cw, slice_ccw), (slice_ccw, slice_cw)] {
+                    candidates.push(vec![a, face_turn, a_inv, face_inv]);
+                    candidates.push(vec![face_turn, a, face_inv, a_inv]);
+                    candidates.push(vec![a, face_turn, a_inv]);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Search for a 2-ply improvement using focused C1 candidates and full C2 candidates.
+fn find_2ply_improvement(
+    state: &CubeState,
+    face_a: Face,
+    face_b: Face,
+    order: u32,
+    total_before: usize,
+    preserved: &[Face],
+    c1_candidates: &[Vec<TurnCommand>],
+    c2_candidates: &[Vec<TurnCommand>],
+) -> Option<Vec<TurnCommand>> {
+    // Build C1 indices: candidates that affect target faces (limit 300)
+    let c1_indices: Vec<usize> = c1_candidates.iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            if let Ok(sim) = simulate_sequence(state, c) {
+                center_positions_on_face(face_a, order)
+                    .iter().any(|p| p.color_in(&sim) != p.color_in(state))
+                || center_positions_on_face(face_b, order)
+                    .iter().any(|p| p.color_in(&sim) != p.color_in(state))
+            } else { false }
+        })
+        .take(300)
+        .map(|(i, _)| i)
+        .collect();
+
+    for &i in &c1_indices {
+        let first = &c1_candidates[i];
+        let sim1 = match simulate_sequence(state, first) {
+            Ok(s) => s, Err(_) => continue,
+        };
+        let count_after_c1 = count_correct_on_face(&sim1, face_a)
+            + count_correct_on_face(&sim1, face_b);
+        // Relaxed pruning: allow larger temporary decreases
+        if count_after_c1 < total_before.saturating_sub(6) {
+            continue;
+        }
+        for second in c2_candidates {
+            let sim2 = match simulate_sequence(&sim1, second) {
+                Ok(s) => s, Err(_) => continue,
+            };
+            if !solved_faces_preserved(&sim2, preserved, order) {
+                continue;
+            }
+            let total = count_correct_on_face(&sim2, face_a)
+                + count_correct_on_face(&sim2, face_b);
+            if total > total_before {
+                let mut combined = first.clone();
+                combined.extend_from_slice(second);
+                return Some(combined);
+            }
+        }
+    }
+    None
 }
 
 /// Generate candidates for the unrestricted pair phase.
@@ -271,6 +484,37 @@ fn generate_pair_candidates(
         }
     }
 
+    // Two-slice commutators [slice1, slice2, slice1', slice2'] — these can
+    // cycle center pieces in ways single-slice+face commutators can't.
+    // Only include perpendicular slices (different axes) for effectiveness.
+    for d1 in 1..=max_depth {
+        for d2 in 1..=max_depth {
+            for &f1 in &Face::ALL {
+                // Only use the first 3 faces (U, R, F) to avoid duplicates
+                // from opposite faces on the same axis
+                if f1 as u8 >= 3 { continue; }
+                for &f2 in &Face::ALL {
+                    if f2 as u8 >= 3 { continue; }
+                    if f1 == f2 { continue; }
+                    let slice1_cw = TurnCommand {
+                        face: f1, start_layer: d1, width: 1,
+                        rotation: RotationAmount::Clockwise,
+                    };
+                    let slice1_ccw = slice1_cw.inverse();
+                    let slice2_cw = TurnCommand {
+                        face: f2, start_layer: d2, width: 1,
+                        rotation: RotationAmount::Clockwise,
+                    };
+                    let slice2_ccw = slice2_cw.inverse();
+
+                    // [slice1, slice2, slice1', slice2']
+                    candidates.push(vec![slice1_cw, slice2_cw, slice1_ccw, slice2_ccw]);
+                    candidates.push(vec![slice1_cw, slice2_ccw, slice1_ccw, slice2_cw]);
+                }
+            }
+        }
+    }
+
     candidates
 }
 
@@ -288,52 +532,106 @@ fn solve_equator_faces(
     let mut current = state.clone();
     let mut turns: Vec<TurnCommand> = Vec::new();
 
-    let equator_faces = [Face::Front, Face::Back, Face::Right, Face::Left];
-    let locked = vec![Face::Up, Face::Down];
+    let equator_seq = [Face::Front, Face::Right, Face::Back, Face::Left];
 
-    for _iter in 0..MAX_ITERATIONS_PER_PAIR {
-        let all_solved = equator_faces
-            .iter()
-            .all(|&f| face_centers_solved(&current, f, order));
+    // Solve equator faces sequentially. Each face becomes "locked" after solving.
+    let mut locked: Vec<Face> = vec![Face::Up, Face::Down];
 
-        if all_solved {
-            break;
-        }
-
-        let total_before: usize = equator_faces
-            .iter()
-            .map(|&f| count_correct_on_face(&current, f))
-            .sum();
-
-        if let Some(seq) = find_best_equator_candidate(
-            &current, order, total_before, &locked,
-        ) {
-            apply_turns(&mut current, &seq)?;
-            turns.extend(seq);
+    for &face in &equator_seq {
+        if face_centers_solved(&current, face, order) {
+            locked.push(face);
             continue;
         }
 
-        // If stuck, try enabling moves
-        let mut found = false;
-        for &face in &equator_faces {
-            if !face_centers_solved(&current, face, order) {
-                let cb = count_correct_on_face(&current, face);
-                if let Some(seq) = find_enabling_move(
-                    &current, face, order, cb, &locked,
-                ) {
-                    apply_turns(&mut current, &seq)?;
-                    turns.extend(seq);
-                    found = true;
-                    break;
+        // Try greedy improvement for this face
+        let equator_candidates = generate_equator_candidates(order, &locked);
+
+        for _iter in 0..MAX_ITERATIONS_PER_PAIR {
+            if face_centers_solved(&current, face, order) {
+                break;
+            }
+
+            let correct_before = count_correct_on_face(&current, face);
+
+            // Find best equator candidate that improves this face while
+            // preserving all locked faces
+            let mut best: Option<(Vec<TurnCommand>, usize)> = None;
+
+            for candidate in &equator_candidates {
+                if let Ok(sim) = simulate_sequence(&current, candidate) {
+                    if !solved_faces_preserved(&sim, &locked, order) {
+                        continue;
+                    }
+                    let correct_after = count_correct_on_face(&sim, face);
+                    if correct_after > correct_before {
+                        match &best {
+                            Some((_, best_c)) if correct_after > *best_c => {
+                                best = Some((candidate.clone(), correct_after));
+                            }
+                            None => {
+                                best = Some((candidate.clone(), correct_after));
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
-        }
-        if found {
-            continue;
-        }
 
-        // IDA* fallback
-        for &face in &equator_faces {
+            if let Some((seq, _)) = best {
+                apply_turns(&mut current, &seq)?;
+                turns.extend(seq);
+                continue;
+            }
+
+            // Try enabling move for this face (allow ≤1 decrease, pick best)
+            {
+                let mut best_enable: Option<(Vec<TurnCommand>, usize)> = None;
+                let positions = center_positions_on_face(face, order);
+                for candidate in &equator_candidates {
+                    if candidate.len() < 4 { continue; }
+                    if let Ok(sim) = simulate_sequence(&current, candidate) {
+                        if !solved_faces_preserved(&sim, &locked, order) { continue; }
+                        let total = count_correct_on_face(&sim, face);
+                        if total + 1 < correct_before { continue; }
+                        let changed = positions.iter().any(|p| {
+                            p.color_in(&sim) != p.color_in(&current)
+                        });
+                        if changed {
+                            match &best_enable {
+                                None => best_enable = Some((candidate.clone(), total)),
+                                Some((_, best_total)) if total > *best_total => {
+                                    best_enable = Some((candidate.clone(), total));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if let Some((seq, _)) = best_enable {
+                    apply_turns(&mut current, &seq)?;
+                    turns.extend(seq);
+                    continue;
+                }
+            }
+
+            // 2-ply search for equator faces
+            {
+                let max_correct = center_positions_on_face(face, order).len();
+                if max_correct.saturating_sub(correct_before) <= 4 {
+                    // For equator, all candidates use u/d slices, so the full
+                    // equator set is already focused
+                    if let Some(seq) = find_2ply_improvement(
+                        &current, face, face, order, correct_before,
+                        &locked, &equator_candidates, &equator_candidates,
+                    ) {
+                        apply_turns(&mut current, &seq)?;
+                        turns.extend(seq);
+                        continue;
+                    }
+                }
+            }
+
+            // IDA* fallback
             let wrong = count_wrong_on_face(&current, face);
             if wrong > 0 {
                 if let Some(seq) = ida_star_single_face(
@@ -341,32 +639,65 @@ fn solve_equator_faces(
                 ) {
                     apply_turns(&mut current, &seq)?;
                     turns.extend(seq);
-                    found = true;
-                    break;
+                    continue;
                 }
             }
+
+            // Shake: first try non-decreasing moves, then allow small decrease
+            {
+                let mut shook = false;
+                for candidate in &equator_candidates {
+                    if candidate.len() < 4 { continue; }
+                    if let Ok(sim) = simulate_sequence(&current, candidate) {
+                        if !solved_faces_preserved(&sim, &locked, order) { continue; }
+                        let total = count_correct_on_face(&sim, face);
+                        if total < correct_before { continue; }
+                        let changed = center_positions_on_face(face, order)
+                            .iter().any(|p| p.color_in(&sim) != p.color_in(&current));
+                        if changed {
+                            apply_turns(&mut current, candidate)?;
+                            turns.extend_from_slice(candidate);
+                            shook = true;
+                            break;
+                        }
+                    }
+                }
+                if !shook {
+                    for candidate in &equator_candidates {
+                        if candidate.len() < 4 { continue; }
+                        if let Ok(sim) = simulate_sequence(&current, candidate) {
+                            if !solved_faces_preserved(&sim, &locked, order) { continue; }
+                            let total = count_correct_on_face(&sim, face);
+                            if total < correct_before.saturating_sub(1) { continue; }
+                            let changed = center_positions_on_face(face, order)
+                                .iter().any(|p| p.color_in(&sim) != p.color_in(&current));
+                            if changed {
+                                apply_turns(&mut current, candidate)?;
+                                turns.extend_from_slice(candidate);
+                                shook = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if shook {
+                    continue;
+                }
+            }
+
+            break; // stuck
         }
-        if found {
-            continue;
+
+        if !face_centers_solved(&current, face, order) {
+            let c = count_correct_on_face(&current, face);
+            let t = center_positions_on_face(face, order).len();
+            return Err(ReductionError::InvalidState(format!(
+                "failed to solve equator face {:?}: {}/{} correct",
+                face, c, t
+            )));
         }
 
-        break;
-    }
-
-    let all_solved = equator_faces
-        .iter()
-        .all(|&f| face_centers_solved(&current, f, order));
-
-    if !all_solved {
-        let details: Vec<String> = equator_faces.iter().map(|&f| {
-            let c = count_correct_on_face(&current, f);
-            let t = center_positions_on_face(f, order).len();
-            format!("{:?}: {}/{}", f, c, t)
-        }).collect();
-        return Err(ReductionError::InvalidState(format!(
-            "failed to solve equator faces ({})",
-            details.join(", ")
-        )));
+        locked.push(face);
     }
 
     Ok((turns, current))
@@ -461,6 +792,19 @@ fn generate_equator_candidates(
         }
     }
 
+    // Two-slice commutators using only u/d slices (preserve U/D)
+    for d1 in 1..=max_depth {
+        for d2 in 1..=max_depth {
+            let u_cw = TurnCommand { face: Face::Up, start_layer: d1, width: 1, rotation: RotationAmount::Clockwise };
+            let u_ccw = u_cw.inverse();
+            let d_cw = TurnCommand { face: Face::Down, start_layer: d2, width: 1, rotation: RotationAmount::Clockwise };
+            let d_ccw = d_cw.inverse();
+
+            candidates.push(vec![u_cw, d_cw, u_ccw, d_ccw]);
+            candidates.push(vec![u_cw, d_ccw, u_ccw, d_cw]);
+        }
+    }
+
     candidates
 }
 
@@ -504,7 +848,8 @@ fn ida_star_single_face_with_candidates(
         return Some(Vec::new());
     }
 
-    for max_depth in 1..=IDA_MAX_DEPTH {
+    // Start from depth 2 since greedy already tried all single candidates
+    for max_depth in 2..=IDA_MAX_DEPTH {
         if let Some(result) = ida_dfs_single(
             state, target_face, order, locked,
             candidates, max_depth, 0, wrong,
@@ -544,7 +889,17 @@ fn ida_dfs_single(
             if wrong_after == 0 {
                 return Some(candidate.clone());
             }
-            if wrong_after < wrong_before {
+            // Only recurse if we made improvement OR we're very close to solved
+            // (within 2 pieces) and still have depth remaining.
+            let can_recurse = if wrong_after < wrong_before {
+                true
+            } else if wrong_after == wrong_before && wrong_before <= 2 && depth + 1 < max_depth {
+                // Allow staying at same count when very close — enables 2-ply
+                true
+            } else {
+                false
+            };
+            if can_recurse {
                 if let Some(mut rest) = ida_dfs_single(
                     &sim, target_face, order, locked,
                     candidates, max_depth, depth + 1, wrong_after,
@@ -624,6 +979,54 @@ fn find_enabling_move(
         }
     }
     None
+}
+
+/// Same as find_enabling_move but uses precomputed candidates.
+/// Checks both faces in the pair to ensure total doesn't drop too much.
+/// Picks the BEST candidate (maximizes total) rather than the first.
+fn find_enabling_move_with_candidates(
+    state: &CubeState,
+    target_face: Face,
+    face_a: Face,
+    face_b: Face,
+    order: u32,
+    _correct_before: usize,
+    total_before: usize,
+    preserved: &[Face],
+    candidates: &[Vec<TurnCommand>],
+) -> Option<Vec<TurnCommand>> {
+    let positions = center_positions_on_face(target_face, order);
+    let mut best: Option<(Vec<TurnCommand>, usize)> = None;
+
+    for candidate in candidates {
+        if candidate.len() < 4 {
+            continue;
+        }
+        if let Ok(sim) = simulate_sequence(state, candidate) {
+            if !solved_faces_preserved(&sim, preserved, order) {
+                continue;
+            }
+            let total = count_correct_on_face(&sim, face_a)
+                + count_correct_on_face(&sim, face_b);
+            // Allow at most 1 decrease in total
+            if total + 1 < total_before {
+                continue;
+            }
+            let changed = positions.iter().any(|p| {
+                p.color_in(&sim) != p.color_in(state)
+            });
+            if changed {
+                match &best {
+                    None => best = Some((candidate.clone(), total)),
+                    Some((_, best_total)) if total > *best_total => {
+                        best = Some((candidate.clone(), total));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    best.map(|(seq, _)| seq)
 }
 
 // ---------------------------------------------------------------------------
