@@ -3612,12 +3612,12 @@ fn sticker_rotation(face: Face) -> Quat {
 
 fn color_for_sticker(color: StickerColor) -> Color {
     match color {
-        StickerColor::White => Color::srgb_u8(239, 244, 248),
-        StickerColor::Red => Color::srgb_u8(222, 75, 63),
-        StickerColor::Green => Color::srgb_u8(54, 190, 126),
-        StickerColor::Yellow => Color::srgb_u8(244, 191, 66),
-        StickerColor::Orange => Color::srgb_u8(255, 139, 39),
-        StickerColor::Blue => Color::srgb_u8(58, 118, 247),
+        StickerColor::White => Color::srgb_u8(255, 255, 255),
+        StickerColor::Red => Color::srgb_u8(185, 0, 0),
+        StickerColor::Green => Color::srgb_u8(0, 155, 72),
+        StickerColor::Yellow => Color::srgb_u8(255, 213, 0),
+        StickerColor::Orange => Color::srgb_u8(255, 89, 0),
+        StickerColor::Blue => Color::srgb_u8(0, 69, 173),
     }
 }
 
