@@ -1,0 +1,3 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.15s
+     Running unittests src\lib.rs (target\debug\deps\rubik_reduction-126525a4006156a0.exe)
+   Doc-tests rubik_reduction
