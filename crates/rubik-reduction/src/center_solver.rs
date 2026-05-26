@@ -1,27 +1,37 @@
 // center_solver — solves centers for N×N cubes (N ≥ 4).
 //
-// Pair-wise solving approach:
-//   1. Solve U + D as a pair (any moves, maximize combined correct count)
-//   2. Solve F + B as a pair (using only u/d inner slices that don't affect U/D)
-//   3. R + L auto-solve by color-counting (only 2 colors left)
+// Two-phase solver with greedy + BFS/IDA* fallback:
+//   Phase 1: Solve U+D pair — greedy first, then BFS at shallow depth,
+//            then enabling/2-ply/IDA*/shake fallbacks.
+//   Phase 2: Solve equator faces (F, B, R, L) one at a time using only
+//            u/d inner-slice moves — same layered fallback strategy.
 //
-// For each pair, we use best-improvement greedy: evaluate all candidate
-// sequences and pick the one maximizing total correct count across BOTH
-// faces in the pair. When one face is fully solved, only moves that
-// preserve it are considered.
+// The BFS uses pre-generated commutator sequences as "moves" so that
+// depth-2 BFS already covers 8 individual turns. Depths are kept shallow
+// (2-3 strict, 3-4 break-even) to produce short solution sequences that
+// don't scramble edges excessively.
 //
 // This module works for all N ≥ 4.
 
+use std::collections::{HashSet, VecDeque};
 use rubik_core::{CubeState, Face, RotationAmount, StickerColor, TurnCommand, apply_turn_to_state};
 
 use super::ReductionError;
 use crate::center_types::{self, center_positions_on_face, CenterPiece};
 
-/// Maximum iterations per face pair.
-const MAX_ITERATIONS_PER_PAIR: usize = 3000;
+/// Maximum iterations per face pair before falling back.
+/// Kept low to prevent excessive edge scrambling.
+const MAX_ITERATIONS_PER_PAIR: usize = 500;
+
+/// Hard cap on visited states during BFS to prevent runaway memory/time.
+const BFS_VISITED_CAP: usize = 200_000;
 
 /// Maximum depth for IDA* fallback.
 const IDA_MAX_DEPTH: usize = 6;
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
 
 /// Solve all centers. Returns the sequence of turns needed.
 pub fn solve_centers(state: &CubeState) -> Result<Vec<TurnCommand>, ReductionError> {
@@ -41,19 +51,18 @@ pub fn solve_centers(state: &CubeState) -> Result<Vec<TurnCommand>, ReductionErr
     let mut current = state.clone();
     let mut all_turns: Vec<TurnCommand> = Vec::new();
 
-    // Phase 1: Solve U+D pair (any moves allowed)
+    // Phase 1: Solve U+D pair — BFS with any center-affecting moves
     {
-        let (turns, new_state) = solve_face_pair_unrestricted(
+        let (turns, new_state) = solve_face_pair_bfs(
             &current, Face::Up, Face::Down, order,
         )?;
         all_turns.extend(turns);
         current = new_state;
     }
 
-    // Phase 2: Solve the 4 equator faces (F, B, R, L) together,
-    // using only u/d inner slices that don't affect U/D.
+    // Phase 2: Solve equator faces one at a time — BFS with u/d-only moves
     {
-        let (turns, new_state) = solve_equator_faces(
+        let (turns, new_state) = solve_equator_faces_bfs(
             &current, order,
         )?;
         all_turns.extend(turns);
@@ -70,10 +79,10 @@ pub fn solve_centers(state: &CubeState) -> Result<Vec<TurnCommand>, ReductionErr
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: unrestricted pair solving (any moves)
+// Phase 1: U+D pair with BFS
 // ---------------------------------------------------------------------------
 
-fn solve_face_pair_unrestricted(
+fn solve_face_pair_bfs(
     state: &CubeState,
     face_a: Face,
     face_b: Face,
@@ -82,8 +91,11 @@ fn solve_face_pair_unrestricted(
     let mut current = state.clone();
     let mut turns: Vec<TurnCommand> = Vec::new();
 
-    // 2-ply is expensive — only run once per stuck sequence
-    let mut tried_2ply = false;
+    // Pre-generate all BFS moves for this order
+    let bf_moves = generate_pair_bfs_moves(order);
+
+    // Full candidate set for fallback strategies
+    let full_candidates = generate_pair_candidates(order);
 
     for _iter in 0..MAX_ITERATIONS_PER_PAIR {
         let solved_a = face_centers_solved(&current, face_a, order);
@@ -105,58 +117,100 @@ fn solve_face_pair_unrestricted(
             vec![]
         };
 
-        let full = generate_pair_candidates(&current, face_a, face_b, order, &preserved);
-
-        // 1. Strict-improvement greedy
+        // 1. Greedy best single commutator — cheap and produces short sequences.
         if let Some(seq) = find_best_candidate_unrestricted_with_candidates(
-            &current, face_a, face_b, order, total_before, &preserved, &full,
+            &current, face_a, face_b, order, total_before, &preserved, &full_candidates,
         ) {
             apply_turns(&mut current, &seq)?;
             turns.extend(seq);
-            tried_2ply = false;
             continue;
         }
 
-        // 2. Enabling move (allows ≤1 decrease in TOTAL to create room)
+        // 2. BFS strict improvement at shallow depths (2-3).
+        //    Keeping depth low prevents excessive edge scrambling.
         {
-            let target = if correct_a <= correct_b { face_a } else { face_b };
-            if let Some(seq) = find_enabling_move_with_candidates(
-                &current, target, face_a, face_b, order,
-                count_correct_on_face(&current, target), total_before, &preserved, &full,
-            ) {
-                apply_turns(&mut current, &seq)?;
-                turns.extend(seq);
-                tried_2ply = false;
+            let target_fn = |s: &CubeState| -> usize {
+                count_correct_on_face(s, face_a) + count_correct_on_face(s, face_b)
+            };
+            let mut bfs_found = false;
+            for bfs_depth in 2..=3 {
+                if let Some(seq) = bfs_improve(
+                    &current, &target_fn, total_before,
+                    true, &bf_moves, bfs_depth,
+                    &preserved, order,
+                ) {
+                    apply_turns(&mut current, &seq)?;
+                    turns.extend(seq);
+                    bfs_found = true;
+                    break;
+                }
+            }
+            if bfs_found {
                 continue;
             }
         }
 
-        // 3. Fast 2-ply: first 300 C1 that affect target faces, full C2
-        if !tried_2ply {
-            let max_correct = center_positions_on_face(face_a, order).len()
-                + center_positions_on_face(face_b, order).len();
-            if max_correct.saturating_sub(total_before) <= 10 {
-                tried_2ply = true;
-                // Use the full candidate set for both C1 and C2.
-                // C1 limited to first 300 that affect target faces for speed.
-                if let Some(seq) = find_2ply_improvement(
-                    &current, face_a, face_b, order, total_before, &preserved,
-                    &full, &full,
+        // 3. Enabling move (allows ≤1 decrease in total to create room)
+        {
+            let target = if correct_a <= correct_b { face_a } else { face_b };
+            if let Some(seq) = find_enabling_move_with_candidates(
+                &current, target, face_a, face_b, order,
+                count_correct_on_face(&current, target), total_before, &preserved, &full_candidates,
+            ) {
+                apply_turns(&mut current, &seq)?;
+                turns.extend(seq);
+                continue;
+            }
+        }
+
+        // 4. BFS with break-even acceptance (depth 3-4, allow non-decreasing).
+        //    Only triggered when strict BFS and greedy both fail.
+        {
+            let target_fn = |s: &CubeState| -> usize {
+                count_correct_on_face(s, face_a) + count_correct_on_face(s, face_b)
+            };
+            let mut bfs_found = false;
+            for bfs_depth in 3..=4 {
+                if let Some(seq) = bfs_improve(
+                    &current, &target_fn, total_before,
+                    false, &bf_moves, bfs_depth,
+                    &preserved, order,
                 ) {
                     apply_turns(&mut current, &seq)?;
                     turns.extend(seq);
-                    tried_2ply = false;
+                    bfs_found = true;
+                    break;
+                }
+            }
+            if bfs_found {
+                continue;
+            }
+        }
+
+        // 5. 2-ply search — chain two commutators for improvement.
+        {
+            let max_correct = center_positions_on_face(face_a, order).len()
+                + center_positions_on_face(face_b, order).len();
+            if max_correct.saturating_sub(total_before) <= 10 {
+                if let Some(seq) = find_2ply_improvement(
+                    &current, face_a, face_b, order, total_before, &preserved,
+                    &full_candidates, &full_candidates,
+                ) {
+                    apply_turns(&mut current, &seq)?;
+                    turns.extend(seq);
                     continue;
                 }
             }
         }
+
+        // 6. IDA* per-face fallback — single-face inner-slice turns.
         {
             let mut found = false;
             for &face in &[face_a, face_b] {
                 if !face_centers_solved(&current, face, order) {
-                    let candidates = generate_all_ida_candidates(order);
+                    let ida_candidates = generate_all_ida_candidates(order);
                     if let Some(seq) = ida_star_single_face_with_candidates(
-                        &current, face, order, &preserved, &candidates,
+                        &current, face, order, &preserved, &ida_candidates,
                     ) {
                         apply_turns(&mut current, &seq)?;
                         turns.extend(seq);
@@ -170,51 +224,13 @@ fn solve_face_pair_unrestricted(
             }
         }
 
-        // 5. Shake: prefer non-decreasing, fall back to ≤1 decrease
+        // 7. Shake: non-decreasing then ≤1 decrease commutators.
         {
-            let mut shook = false;
-            for candidate in &full {
-                if candidate.len() < 4 { continue; }
-                if let Ok(sim) = simulate_sequence(&current, candidate) {
-                    if !solved_faces_preserved(&sim, &preserved, order) { continue; }
-                    let total = count_correct_on_face(&sim, face_a)
-                        + count_correct_on_face(&sim, face_b);
-                    if total < total_before { continue; }
-                    let changed = center_positions_on_face(face_a, order)
-                        .iter().any(|p| p.color_in(&sim) != p.color_in(&current))
-                        || center_positions_on_face(face_b, order)
-                            .iter().any(|p| p.color_in(&sim) != p.color_in(&current));
-                    if changed {
-                        apply_turns(&mut current, candidate)?;
-                        turns.extend_from_slice(candidate);
-                        shook = true;
-                        break;
-                    }
-                }
-            }
-            if !shook {
-                for candidate in &full {
-                    if candidate.len() < 4 { continue; }
-                    if let Ok(sim) = simulate_sequence(&current, candidate) {
-                        if !solved_faces_preserved(&sim, &preserved, order) { continue; }
-                        let total = count_correct_on_face(&sim, face_a)
-                            + count_correct_on_face(&sim, face_b);
-                        if total < total_before.saturating_sub(1) { continue; }
-                        let changed = center_positions_on_face(face_a, order)
-                            .iter().any(|p| p.color_in(&sim) != p.color_in(&current))
-                            || center_positions_on_face(face_b, order)
-                                .iter().any(|p| p.color_in(&sim) != p.color_in(&current));
-                        if changed {
-                            apply_turns(&mut current, candidate)?;
-                            turns.extend_from_slice(candidate);
-                            shook = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if shook {
-                tried_2ply = false;
+            if let Some(seq) = shake_pair(
+                &current, face_a, face_b, order, total_before, &preserved, &full_candidates,
+            ) {
+                apply_turns(&mut current, &seq)?;
+                turns.extend(seq);
                 continue;
             }
         }
@@ -238,294 +254,11 @@ fn solve_face_pair_unrestricted(
     Ok((turns, current))
 }
 
-/// Best-improvement search for unrestricted pair: try all inner-slice turns
-/// and commutators, pick the one maximizing total correct on face_a + face_b.
-fn find_best_candidate_unrestricted(
-    state: &CubeState,
-    face_a: Face,
-    face_b: Face,
-    order: u32,
-    total_before: usize,
-    preserved: &[Face],
-) -> Option<Vec<TurnCommand>> {
-    let candidates = generate_pair_candidates(state, face_a, face_b, order, preserved);
-    find_best_candidate_unrestricted_with_candidates(
-        state, face_a, face_b, order, total_before, preserved, &candidates,
-    )
-}
-
-fn find_best_candidate_unrestricted_with_candidates(
-    state: &CubeState,
-    face_a: Face,
-    face_b: Face,
-    order: u32,
-    total_before: usize,
-    preserved: &[Face],
-    candidates: &[Vec<TurnCommand>],
-) -> Option<Vec<TurnCommand>> {
-    let mut best: Option<(Vec<TurnCommand>, usize)> = None;
-
-    for candidate in candidates {
-        if let Ok(sim) = simulate_sequence(state, candidate) {
-            if !solved_faces_preserved(&sim, preserved, order) {
-                continue;
-            }
-            let total = count_correct_on_face(&sim, face_a)
-                + count_correct_on_face(&sim, face_b);
-            if total > total_before {
-                match &best {
-                    Some((_, best_total)) if total > *best_total => {
-                        best = Some((candidate.clone(), total));
-                    }
-                    None => {
-                        best = Some((candidate.clone(), total));
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    best.map(|(turns, _)| turns)
-}
-
-/// Generate a focused set of commutators for 2-ply search.
-/// Only uses inner slices on faces perpendicular to the target pair,
-/// and face turns on the target pair. This dramatically reduces the
-/// search space while covering all useful commutators.
-fn generate_focused_2ply_commutators(
-    face_a: Face,
-    face_b: Face,
-    order: u32,
-    preserved: &[Face],
-) -> Vec<Vec<TurnCommand>> {
-    let max_depth = order / 2;
-    let mut candidates = Vec::new();
-
-    // Perpendicular faces: those NOT on the same axis as face_a/face_b.
-    // Two faces share an axis if they are the same or opposite.
-    let perpendicular: Vec<Face> = Face::ALL
-        .iter()
-        .filter(|f| **f != face_a && **f != face_b && f.opposite() != face_a && f.opposite() != face_b)
-        .copied()
-        .collect();
-
-    // Single inner-slice turns on perpendicular faces
-    for depth in 1..=max_depth {
-        for &sf in &perpendicular {
-            for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
-                candidates.push(vec![TurnCommand {
-                    face: sf, start_layer: depth, width: 1, rotation: rot,
-                }]);
-            }
-        }
-    }
-
-    // Commutators [slice, face_turn]
-    for depth in 1..=max_depth {
-        for &sf in &perpendicular {
-            let slice_cw = TurnCommand {
-                face: sf, start_layer: depth, width: 1,
-                rotation: RotationAmount::Clockwise,
-            };
-            let slice_ccw = slice_cw.inverse();
-
-            let mut face_candidates = vec![
-                (face_a, RotationAmount::Clockwise),
-                (face_a, RotationAmount::CounterClockwise),
-                (face_a, RotationAmount::HalfTurn),
-                (face_b, RotationAmount::Clockwise),
-                (face_b, RotationAmount::CounterClockwise),
-                (face_b, RotationAmount::HalfTurn),
-            ];
-            for &p in preserved {
-                face_candidates.push((p, RotationAmount::HalfTurn));
-            }
-
-            for &(face, rot) in &face_candidates {
-                let face_turn = TurnCommand {
-                    face, start_layer: 0, width: 1, rotation: rot,
-                };
-                let face_inv = face_turn.inverse();
-                for (a, a_inv) in [(slice_cw, slice_ccw), (slice_ccw, slice_cw)] {
-                    candidates.push(vec![a, face_turn, a_inv, face_inv]);
-                    candidates.push(vec![face_turn, a, face_inv, a_inv]);
-                    candidates.push(vec![a, face_turn, a_inv]);
-                }
-            }
-        }
-    }
-
-    candidates
-}
-
-/// Search for a 2-ply improvement using focused C1 candidates and full C2 candidates.
-fn find_2ply_improvement(
-    state: &CubeState,
-    face_a: Face,
-    face_b: Face,
-    order: u32,
-    total_before: usize,
-    preserved: &[Face],
-    c1_candidates: &[Vec<TurnCommand>],
-    c2_candidates: &[Vec<TurnCommand>],
-) -> Option<Vec<TurnCommand>> {
-    // Build C1 indices: candidates that affect target faces (limit 300)
-    let c1_indices: Vec<usize> = c1_candidates.iter()
-        .enumerate()
-        .filter(|(_, c)| {
-            if let Ok(sim) = simulate_sequence(state, c) {
-                center_positions_on_face(face_a, order)
-                    .iter().any(|p| p.color_in(&sim) != p.color_in(state))
-                || center_positions_on_face(face_b, order)
-                    .iter().any(|p| p.color_in(&sim) != p.color_in(state))
-            } else { false }
-        })
-        .take(300)
-        .map(|(i, _)| i)
-        .collect();
-
-    for &i in &c1_indices {
-        let first = &c1_candidates[i];
-        let sim1 = match simulate_sequence(state, first) {
-            Ok(s) => s, Err(_) => continue,
-        };
-        let count_after_c1 = count_correct_on_face(&sim1, face_a)
-            + count_correct_on_face(&sim1, face_b);
-        // Relaxed pruning: allow larger temporary decreases
-        if count_after_c1 < total_before.saturating_sub(6) {
-            continue;
-        }
-        for second in c2_candidates {
-            let sim2 = match simulate_sequence(&sim1, second) {
-                Ok(s) => s, Err(_) => continue,
-            };
-            if !solved_faces_preserved(&sim2, preserved, order) {
-                continue;
-            }
-            let total = count_correct_on_face(&sim2, face_a)
-                + count_correct_on_face(&sim2, face_b);
-            if total > total_before {
-                let mut combined = first.clone();
-                combined.extend_from_slice(second);
-                return Some(combined);
-            }
-        }
-    }
-    None
-}
-
-/// Generate candidates for the unrestricted pair phase.
-fn generate_pair_candidates(
-    _state: &CubeState,
-    face_a: Face,
-    face_b: Face,
-    order: u32,
-    preserved: &[Face],
-) -> Vec<Vec<TurnCommand>> {
-    let mut candidates = Vec::new();
-    let max_depth = order / 2;
-
-    // Single inner-slice turns
-    for depth in 1..=max_depth {
-        for &slice_face in &Face::ALL {
-            for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
-                candidates.push(vec![TurnCommand {
-                    face: slice_face, start_layer: depth, width: 1, rotation: rot,
-                }]);
-            }
-        }
-    }
-
-    // Commutators [slice, face_turn] — include ALL slices even if they
-    // affect preserved faces; the simulation check filters correctly.
-    for depth in 1..=max_depth {
-        for &slice_face in &Face::ALL {
-            let slice_cw = TurnCommand {
-                face: slice_face, start_layer: depth, width: 1,
-                rotation: RotationAmount::Clockwise,
-            };
-            let slice_ccw = slice_cw.inverse();
-
-            // Face-turn candidates: face_a, face_b, and all other
-            // unsolved faces. For larger cubes, limit to perpendicular
-            // faces to keep performance manageable.
-            let mut face_candidates = vec![
-                (face_a, RotationAmount::Clockwise),
-                (face_a, RotationAmount::CounterClockwise),
-                (face_a, RotationAmount::HalfTurn),
-                (face_b, RotationAmount::Clockwise),
-                (face_b, RotationAmount::CounterClockwise),
-                (face_b, RotationAmount::HalfTurn),
-            ];
-            // Include all unsolved faces for full search coverage
-            for &f in &Face::ALL {
-                if f != face_a && f != face_b && !preserved.contains(&f) {
-                    face_candidates.push((f, RotationAmount::Clockwise));
-                    face_candidates.push((f, RotationAmount::CounterClockwise));
-                    face_candidates.push((f, RotationAmount::HalfTurn));
-                }
-            }
-            for &p in preserved {
-                face_candidates.push((p, RotationAmount::HalfTurn));
-            }
-
-            for &(face, rot) in &face_candidates {
-                let face_turn = TurnCommand {
-                    face, start_layer: 0, width: 1, rotation: rot,
-                };
-                let face_inv = face_turn.inverse();
-                for (a, a_inv) in [(slice_cw, slice_ccw), (slice_ccw, slice_cw)] {
-                    candidates.push(vec![a, face_turn, a_inv, face_inv]);
-                    candidates.push(vec![face_turn, a, face_inv, a_inv]);
-                    candidates.push(vec![a, face_turn, a_inv]);
-                }
-            }
-        }
-    }
-
-    // Two-slice commutators [slice1, slice2, slice1', slice2'] — these can
-    // cycle center pieces in ways single-slice+face commutators can't.
-    // Only include perpendicular slices (different axes) for effectiveness.
-    for d1 in 1..=max_depth {
-        for d2 in 1..=max_depth {
-            for &f1 in &Face::ALL {
-                // Only use the first 3 faces (U, R, F) to avoid duplicates
-                // from opposite faces on the same axis
-                if f1 as u8 >= 3 { continue; }
-                for &f2 in &Face::ALL {
-                    if f2 as u8 >= 3 { continue; }
-                    if f1 == f2 { continue; }
-                    let slice1_cw = TurnCommand {
-                        face: f1, start_layer: d1, width: 1,
-                        rotation: RotationAmount::Clockwise,
-                    };
-                    let slice1_ccw = slice1_cw.inverse();
-                    let slice2_cw = TurnCommand {
-                        face: f2, start_layer: d2, width: 1,
-                        rotation: RotationAmount::Clockwise,
-                    };
-                    let slice2_ccw = slice2_cw.inverse();
-
-                    // [slice1, slice2, slice1', slice2']
-                    candidates.push(vec![slice1_cw, slice2_cw, slice1_ccw, slice2_ccw]);
-                    candidates.push(vec![slice1_cw, slice2_ccw, slice1_ccw, slice2_cw]);
-                }
-            }
-        }
-    }
-
-    candidates
-}
-
 // ---------------------------------------------------------------------------
-// Phase 2: solve equator faces (F, B, R, L) as a group
+// Phase 2: Equator faces with BFS (u/d-only moves)
 // ---------------------------------------------------------------------------
 
-/// Solve all 4 equator faces together using only u/d inner slices
-/// (which don't affect U/D). Maximize total correct count across all
-/// 4 faces.
-fn solve_equator_faces(
+fn solve_equator_faces_bfs(
     state: &CubeState,
     order: u32,
 ) -> Result<(Vec<TurnCommand>, CubeState), ReductionError> {
@@ -533,18 +266,19 @@ fn solve_equator_faces(
     let mut turns: Vec<TurnCommand> = Vec::new();
 
     let equator_seq = [Face::Front, Face::Right, Face::Back, Face::Left];
-
-    // Solve equator faces sequentially. Each face becomes "locked" after solving.
     let mut locked: Vec<Face> = vec![Face::Up, Face::Down];
+
+    // Pre-generate BFS moves for equator phase
+    let bf_moves = generate_equator_bfs_moves(order);
+
+    // Full candidate set for fallbacks
+    let full_candidates = generate_equator_candidates(order, &locked);
 
     for &face in &equator_seq {
         if face_centers_solved(&current, face, order) {
             locked.push(face);
             continue;
         }
-
-        // Try greedy improvement for this face
-        let equator_candidates = generate_equator_candidates(order, &locked);
 
         for _iter in 0..MAX_ITERATIONS_PER_PAIR {
             if face_centers_solved(&current, face, order) {
@@ -553,41 +287,66 @@ fn solve_equator_faces(
 
             let correct_before = count_correct_on_face(&current, face);
 
-            // Find best equator candidate that improves this face while
-            // preserving all locked faces
-            let mut best: Option<(Vec<TurnCommand>, usize)> = None;
-
-            for candidate in &equator_candidates {
-                if let Ok(sim) = simulate_sequence(&current, candidate) {
-                    if !solved_faces_preserved(&sim, &locked, order) {
-                        continue;
-                    }
-                    let correct_after = count_correct_on_face(&sim, face);
-                    if correct_after > correct_before {
-                        match &best {
-                            Some((_, best_c)) if correct_after > *best_c => {
-                                best = Some((candidate.clone(), correct_after));
-                            }
-                            None => {
-                                best = Some((candidate.clone(), correct_after));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            if let Some((seq, _)) = best {
+            // 1. Greedy best single commutator (u/d-only moves).
+            if let Some(seq) = find_best_equator_candidate_from_list(
+                &current, face, order, correct_before, &locked, &full_candidates,
+            ) {
                 apply_turns(&mut current, &seq)?;
                 turns.extend(seq);
                 continue;
             }
 
-            // Try enabling move for this face (allow ≤1 decrease, pick best)
+            // 2. BFS strict improvement at shallow depths (2-4).
+            {
+                let target_fn = |s: &CubeState| -> usize {
+                    count_correct_on_face(s, face)
+                };
+                let mut bfs_found = false;
+                for bfs_depth in 2..=4 {
+                    if let Some(seq) = bfs_improve(
+                        &current, &target_fn, correct_before,
+                        true, &bf_moves, bfs_depth,
+                        &locked, order,
+                    ) {
+                        apply_turns(&mut current, &seq)?;
+                        turns.extend(seq);
+                        bfs_found = true;
+                        break;
+                    }
+                }
+                if bfs_found {
+                    continue;
+                }
+            }
+
+            // 3. BFS break-even acceptance (depth 3-5).
+            {
+                let target_fn = |s: &CubeState| -> usize {
+                    count_correct_on_face(s, face)
+                };
+                let mut bfs_found = false;
+                for bfs_depth in 3..=5 {
+                    if let Some(seq) = bfs_improve(
+                        &current, &target_fn, correct_before,
+                        false, &bf_moves, bfs_depth,
+                        &locked, order,
+                    ) {
+                        apply_turns(&mut current, &seq)?;
+                        turns.extend(seq);
+                        bfs_found = true;
+                        break;
+                    }
+                }
+                if bfs_found {
+                    continue;
+                }
+            }
+
+            // 4. Enabling move — allows ≤1 decrease.
             {
                 let mut best_enable: Option<(Vec<TurnCommand>, usize)> = None;
                 let positions = center_positions_on_face(face, order);
-                for candidate in &equator_candidates {
+                for candidate in &full_candidates {
                     if candidate.len() < 4 { continue; }
                     if let Ok(sim) = simulate_sequence(&current, candidate) {
                         if !solved_faces_preserved(&sim, &locked, order) { continue; }
@@ -614,15 +373,13 @@ fn solve_equator_faces(
                 }
             }
 
-            // 2-ply search for equator faces
+            // 5. 2-ply search.
             {
                 let max_correct = center_positions_on_face(face, order).len();
                 if max_correct.saturating_sub(correct_before) <= 4 {
-                    // For equator, all candidates use u/d slices, so the full
-                    // equator set is already focused
                     if let Some(seq) = find_2ply_improvement(
                         &current, face, face, order, correct_before,
-                        &locked, &equator_candidates, &equator_candidates,
+                        &locked, &full_candidates, &full_candidates,
                     ) {
                         apply_turns(&mut current, &seq)?;
                         turns.extend(seq);
@@ -631,11 +388,12 @@ fn solve_equator_faces(
                 }
             }
 
-            // IDA* fallback
+            // 6. IDA* fallback.
             let wrong = count_wrong_on_face(&current, face);
             if wrong > 0 {
-                if let Some(seq) = ida_star_single_face(
-                    &current, face, order, &locked,
+                let ida_candidates = generate_equator_candidates(order, &locked);
+                if let Some(seq) = ida_star_single_face_with_candidates(
+                    &current, face, order, &locked, &ida_candidates,
                 ) {
                     apply_turns(&mut current, &seq)?;
                     turns.extend(seq);
@@ -643,10 +401,10 @@ fn solve_equator_faces(
                 }
             }
 
-            // Shake: first try non-decreasing moves, then allow small decrease
+            // 7. Shake: non-decreasing then ≤1 decrease.
             {
                 let mut shook = false;
-                for candidate in &equator_candidates {
+                for candidate in &full_candidates {
                     if candidate.len() < 4 { continue; }
                     if let Ok(sim) = simulate_sequence(&current, candidate) {
                         if !solved_faces_preserved(&sim, &locked, order) { continue; }
@@ -663,7 +421,7 @@ fn solve_equator_faces(
                     }
                 }
                 if !shook {
-                    for candidate in &equator_candidates {
+                    for candidate in &full_candidates {
                         if candidate.len() < 4 { continue; }
                         if let Ok(sim) = simulate_sequence(&current, candidate) {
                             if !solved_faces_preserved(&sim, &locked, order) { continue; }
@@ -703,42 +461,299 @@ fn solve_equator_faces(
     Ok((turns, current))
 }
 
-/// Best-improvement search for equator faces: use only u/d inner slices
-/// (which don't affect U/D). Evaluate all candidates, pick the one
-/// maximizing total correct across all equator faces.
-fn find_best_equator_candidate(
-    state: &CubeState,
-    order: u32,
-    total_before: usize,
-    locked: &[Face],
-) -> Option<Vec<TurnCommand>> {
-    let mut best: Option<(Vec<TurnCommand>, usize)> = None;
-    let equator_faces = [Face::Front, Face::Back, Face::Right, Face::Left];
+// ---------------------------------------------------------------------------
+// BFS search engine
+// ---------------------------------------------------------------------------
 
-    for candidate in generate_equator_candidates(order, locked) {
-        if let Ok(sim) = simulate_sequence(state, &candidate) {
-            if !solved_faces_preserved(&sim, locked, order) {
-                continue;
+/// BFS that searches for a sequence of pre-generated move-sequences that
+/// improves the target score. Returns the FIRST sequence found (not necessarily
+/// the best) at the shallowest depth where an improvement exists.
+fn bfs_improve(
+    state: &CubeState,
+    target_fn: &dyn Fn(&CubeState) -> usize,
+    score_before: usize,
+    strict: bool,
+    moves: &[Vec<TurnCommand>],
+    max_depth: usize,
+    preserved: &[Face],
+    order: u32,
+) -> Option<Vec<TurnCommand>> {
+    if moves.is_empty() {
+        return None;
+    }
+
+    let mut visited: HashSet<u64> = HashSet::with_capacity(50_000);
+    let mut queue: VecDeque<(CubeState, Vec<Vec<TurnCommand>>)> = VecDeque::with_capacity(10_000);
+
+    let initial_hash = hash_centers(state);
+    visited.insert(initial_hash);
+    queue.push_back((state.clone(), Vec::new()));
+
+    let mut depth = 0;
+    while depth <= max_depth && !queue.is_empty() {
+        let level_size = queue.len();
+        for _ in 0..level_size {
+            let (s, path) = queue.pop_front().unwrap();
+
+            for mv in moves {
+                if mv.is_empty() {
+                    continue;
+                }
+
+                let sim = match simulate_sequence(&s, mv) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                if !solved_faces_preserved(&sim, preserved, order) {
+                    continue;
+                }
+
+                let h = hash_centers(&sim);
+                if !visited.insert(h) {
+                    continue;
+                }
+
+                if visited.len() > BFS_VISITED_CAP {
+                    return None;
+                }
+
+                let score = target_fn(&sim);
+
+                if strict && score > score_before {
+                    return Some(flatten_path(&path, mv));
+                }
+
+                if !strict && score >= score_before && h != initial_hash {
+                    return Some(flatten_path(&path, mv));
+                }
+
+                if depth < max_depth {
+                    let mut new_path = path.clone();
+                    new_path.push(mv.clone());
+                    queue.push_back((sim, new_path));
+                }
             }
-            let total: usize = equator_faces
-                .iter()
-                .map(|&f| count_correct_on_face(&sim, f))
-                .sum();
-            if total > total_before {
-                match &best {
-                    Some((_, best_total)) if total > *best_total => {
-                        best = Some((candidate, total));
+        }
+        depth += 1;
+    }
+
+    None
+}
+
+/// Flatten a path of move-sequences plus a final move-sequence into a single
+/// Vec<TurnCommand>.
+fn flatten_path(path: &[Vec<TurnCommand>], last: &[TurnCommand]) -> Vec<TurnCommand> {
+    let mut result = Vec::new();
+    for seq in path {
+        result.extend_from_slice(seq);
+    }
+    result.extend_from_slice(last);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Center state hashing (only center stickers)
+// ---------------------------------------------------------------------------
+
+/// Hash only the center positions of a cube state.
+/// This dramatically reduces the visited-set size during BFS.
+fn hash_centers(state: &CubeState) -> u64 {
+    let order = state.order.get() as usize;
+    let last = order - 1;
+    let mid = if order % 2 == 1 { Some(order / 2) } else { None };
+
+    // Use FNV-1a for speed (not crypto, just visited-set dedup)
+    let mut hash: u64 = 0xcbf29ce484222325;
+
+    for face_idx in 0..6usize {
+        let offset = face_idx * order * order;
+        for row in 1..last {
+            for col in 1..last {
+                if let Some(m) = mid {
+                    if row == m && col == m {
+                        continue; // skip true center (fixed)
                     }
-                    None => {
-                        best = Some((candidate, total));
-                    }
-                    _ => {}
+                }
+                let idx = offset + row * order + col;
+                // Hash the sticker color as a byte
+                let byte = state.stickers[idx] as u8;
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+
+    hash
+}
+
+// ---------------------------------------------------------------------------
+// BFS move generation
+// ---------------------------------------------------------------------------
+
+/// Generate BFS moves for the U/D pair phase.
+/// Focused set including CW, CCW, and HalfTurn variants.
+fn generate_pair_bfs_moves(order: u32) -> Vec<Vec<TurnCommand>> {
+    let mut moves = Vec::new();
+    let max_depth = order / 2;
+    let perp = [Face::Right, Face::Left, Face::Front, Face::Back];
+
+    // Single inner-slice turns
+    for &face in &perp {
+        for depth in 1..=max_depth {
+            for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
+                moves.push(vec![TurnCommand {
+                    face, start_layer: depth, width: 1, rotation: rot,
+                }]);
+            }
+        }
+    }
+
+    // Commutators [slice, face, slice_inv, face_inv]
+    for &sf in &perp {
+        for d in 1..=max_depth {
+            let s_cw = TurnCommand { face: sf, start_layer: d, width: 1, rotation: RotationAmount::Clockwise };
+            let s_ccw = s_cw.inverse();
+            let s_h2 = TurnCommand { face: sf, start_layer: d, width: 1, rotation: RotationAmount::HalfTurn };
+
+            for &tf in &[Face::Up, Face::Down] {
+                for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
+                    let f_turn = TurnCommand { face: tf, start_layer: 0, width: 1, rotation: rot };
+                    let f_inv = f_turn.inverse();
+
+                    moves.push(vec![s_cw, f_turn, s_ccw, f_inv]);
+                    moves.push(vec![f_turn, s_cw, f_inv, s_ccw]);
+                    moves.push(vec![s_h2, f_turn, s_h2, f_inv]);
                 }
             }
         }
     }
 
-    best.map(|(turns, _)| turns)
+    moves
+}
+
+/// Generate BFS moves for the equator phase.
+fn generate_equator_bfs_moves(order: u32) -> Vec<Vec<TurnCommand>> {
+    let mut moves = Vec::new();
+    let max_depth = order / 2;
+    let eq = [Face::Front, Face::Back, Face::Right, Face::Left];
+
+    // Single inner-slice turns on U and D
+    for &sf in &[Face::Up, Face::Down] {
+        for depth in 1..=max_depth {
+            for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
+                moves.push(vec![TurnCommand {
+                    face: sf, start_layer: depth, width: 1, rotation: rot,
+                }]);
+            }
+        }
+    }
+
+    // Commutators: u/d inner slice + equator face turn
+    for &sf in &[Face::Up, Face::Down] {
+        for d in 1..=max_depth {
+            let s_cw = TurnCommand { face: sf, start_layer: d, width: 1, rotation: RotationAmount::Clockwise };
+            let s_ccw = s_cw.inverse();
+            let s_h2 = TurnCommand { face: sf, start_layer: d, width: 1, rotation: RotationAmount::HalfTurn };
+
+            for &ef in &eq {
+                for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
+                    let f_turn = TurnCommand { face: ef, start_layer: 0, width: 1, rotation: rot };
+                    let f_inv = f_turn.inverse();
+
+                    moves.push(vec![s_cw, f_turn, s_ccw, f_inv]);
+                    moves.push(vec![f_turn, s_cw, f_inv, s_ccw]);
+                    moves.push(vec![s_h2, f_turn, s_h2, f_inv]);
+                }
+            }
+        }
+    }
+
+    // Two-slice commutators u + d (different depths)
+    for d1 in 1..=max_depth {
+        for d2 in 1..=max_depth {
+            if d1 == d2 { continue; }
+            let u_cw = TurnCommand { face: Face::Up, start_layer: d1, width: 1, rotation: RotationAmount::Clockwise };
+            let u_ccw = u_cw.inverse();
+            let d_cw = TurnCommand { face: Face::Down, start_layer: d2, width: 1, rotation: RotationAmount::Clockwise };
+            let d_ccw = d_cw.inverse();
+            moves.push(vec![u_cw, d_cw, u_ccw, d_ccw]);
+        }
+    }
+
+    moves
+}
+
+// ---------------------------------------------------------------------------
+// Candidate generation (for greedy fallback when BFS gets stuck)
+// ---------------------------------------------------------------------------
+
+/// Generate candidates for the unrestricted pair phase.
+fn generate_pair_candidates(order: u32) -> Vec<Vec<TurnCommand>> {
+    let mut candidates = Vec::new();
+    let max_depth = order / 2;
+
+    // Single inner-slice turns
+    for depth in 1..=max_depth {
+        for &slice_face in &Face::ALL {
+            for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
+                candidates.push(vec![TurnCommand {
+                    face: slice_face, start_layer: depth, width: 1, rotation: rot,
+                }]);
+            }
+        }
+    }
+
+    // Commutators [slice, face_turn]
+    for depth in 1..=max_depth {
+        for &slice_face in &Face::ALL {
+            let slice_cw = TurnCommand {
+                face: slice_face, start_layer: depth, width: 1,
+                rotation: RotationAmount::Clockwise,
+            };
+            let slice_ccw = slice_cw.inverse();
+
+            for &face in &Face::ALL {
+                for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
+                    let face_turn = TurnCommand {
+                        face, start_layer: 0, width: 1, rotation: rot,
+                    };
+                    let face_inv = face_turn.inverse();
+                    candidates.push(vec![slice_cw, face_turn, slice_ccw, face_inv]);
+                    candidates.push(vec![face_turn, slice_cw, face_inv, slice_ccw]);
+                    candidates.push(vec![slice_cw, face_turn, slice_ccw]);
+                }
+            }
+        }
+    }
+
+    // Two-slice commutators
+    for d1 in 1..=max_depth {
+        for d2 in 1..=max_depth {
+            for &f1 in &[Face::Up, Face::Right, Face::Front] {
+                for &f2 in &[Face::Up, Face::Right, Face::Front] {
+                    if f1 as u8 >= f2 as u8 {
+                        continue;
+                    }
+                    let s1_cw = TurnCommand {
+                        face: f1, start_layer: d1, width: 1,
+                        rotation: RotationAmount::Clockwise,
+                    };
+                    let s1_ccw = s1_cw.inverse();
+                    let s2_cw = TurnCommand {
+                        face: f2, start_layer: d2, width: 1,
+                        rotation: RotationAmount::Clockwise,
+                    };
+                    let s2_ccw = s2_cw.inverse();
+
+                    candidates.push(vec![s1_cw, s2_cw, s1_ccw, s2_ccw]);
+                    candidates.push(vec![s1_cw, s2_ccw, s1_ccw, s2_cw]);
+                }
+            }
+        }
+    }
+
+    candidates
 }
 
 /// Generate candidates using only u/d inner slices (U and D face inner
@@ -750,11 +765,8 @@ fn generate_equator_candidates(
     let mut candidates = Vec::new();
     let max_depth = order / 2;
 
-    // Only use inner slices from U and D faces (u and d slices).
-    // These affect equator faces without touching U/D.
     for &slice_face in &[Face::Up, Face::Down] {
         for depth in 1..=max_depth {
-            // Single slice turns
             for &rot in &[RotationAmount::Clockwise, RotationAmount::CounterClockwise, RotationAmount::HalfTurn] {
                 candidates.push(vec![TurnCommand {
                     face: slice_face, start_layer: depth, width: 1, rotation: rot,
@@ -767,7 +779,6 @@ fn generate_equator_candidates(
             };
             let slice_ccw = slice_cw.inverse();
 
-            // Face-turn candidates: all equator faces + locked faces (HalfTurn only)
             let mut face_candidates: Vec<(Face, RotationAmount)> = Vec::new();
             for &f in &[Face::Front, Face::Back, Face::Right, Face::Left] {
                 face_candidates.push((f, RotationAmount::Clockwise));
@@ -783,16 +794,14 @@ fn generate_equator_candidates(
                     face, start_layer: 0, width: 1, rotation: rot,
                 };
                 let face_inv = face_turn.inverse();
-                for (a, a_inv) in [(slice_cw, slice_ccw), (slice_ccw, slice_cw)] {
-                    candidates.push(vec![a, face_turn, a_inv, face_inv]);
-                    candidates.push(vec![face_turn, a, face_inv, a_inv]);
-                    candidates.push(vec![a, face_turn, a_inv]);
-                }
+                candidates.push(vec![slice_cw, face_turn, slice_ccw, face_inv]);
+                candidates.push(vec![face_turn, slice_cw, face_inv, slice_ccw]);
+                candidates.push(vec![slice_cw, face_turn, slice_ccw]);
             }
         }
     }
 
-    // Two-slice commutators using only u/d slices (preserve U/D)
+    // Two-slice commutators using only u/d slices
     for d1 in 1..=max_depth {
         for d2 in 1..=max_depth {
             let u_cw = TurnCommand { face: Face::Up, start_layer: d1, width: 1, rotation: RotationAmount::Clockwise };
@@ -808,18 +817,237 @@ fn generate_equator_candidates(
     candidates
 }
 
-/// IDA* for a single face using only u/d slices.
-fn ida_star_single_face(
+// ---------------------------------------------------------------------------
+// Greedy single-candidate evaluation
+// ---------------------------------------------------------------------------
+
+fn find_best_candidate_unrestricted_with_candidates(
+    state: &CubeState,
+    face_a: Face,
+    face_b: Face,
+    order: u32,
+    total_before: usize,
+    preserved: &[Face],
+    candidates: &[Vec<TurnCommand>],
+) -> Option<Vec<TurnCommand>> {
+    let mut best: Option<(Vec<TurnCommand>, usize)> = None;
+
+    for candidate in candidates {
+        if let Ok(sim) = simulate_sequence(state, candidate) {
+            if !solved_faces_preserved(&sim, preserved, order) {
+                continue;
+            }
+            let total = count_correct_on_face(&sim, face_a)
+                + count_correct_on_face(&sim, face_b);
+            if total > total_before {
+                match &best {
+                    Some((_, best_total)) if total > *best_total => {
+                        best = Some((candidate.clone(), total));
+                    }
+                    None => {
+                        best = Some((candidate.clone(), total));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    best.map(|(turns, _)| turns)
+}
+
+fn find_best_equator_candidate_from_list(
     state: &CubeState,
     target_face: Face,
     order: u32,
+    correct_before: usize,
     locked: &[Face],
+    candidates: &[Vec<TurnCommand>],
 ) -> Option<Vec<TurnCommand>> {
-    let candidates = generate_equator_candidates(order, locked);
-    ida_star_single_face_with_candidates(state, target_face, order, locked, &candidates)
+    let mut best: Option<(Vec<TurnCommand>, usize)> = None;
+
+    for candidate in candidates {
+        if let Ok(sim) = simulate_sequence(state, candidate) {
+            if !solved_faces_preserved(&sim, locked, order) {
+                continue;
+            }
+            let correct_after = count_correct_on_face(&sim, target_face);
+            if correct_after > correct_before {
+                match &best {
+                    Some((_, best_c)) if correct_after > *best_c => {
+                        best = Some((candidate.clone(), correct_after));
+                    }
+                    None => {
+                        best = Some((candidate.clone(), correct_after));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    best.map(|(turns, _)| turns)
 }
 
-/// Generate all-slice IDA candidates for unrestricted phase.
+// ---------------------------------------------------------------------------
+// 2-ply search
+// ---------------------------------------------------------------------------
+
+fn find_2ply_improvement(
+    state: &CubeState,
+    face_a: Face,
+    face_b: Face,
+    order: u32,
+    total_before: usize,
+    preserved: &[Face],
+    c1_candidates: &[Vec<TurnCommand>],
+    c2_candidates: &[Vec<TurnCommand>],
+) -> Option<Vec<TurnCommand>> {
+    let c1_indices: Vec<usize> = c1_candidates.iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            if let Ok(sim) = simulate_sequence(state, c) {
+                center_positions_on_face(face_a, order)
+                    .iter().any(|p| p.color_in(&sim) != p.color_in(state))
+                || center_positions_on_face(face_b, order)
+                    .iter().any(|p| p.color_in(&sim) != p.color_in(state))
+            } else { false }
+        })
+        .take(300)
+        .map(|(i, _)| i)
+        .collect();
+
+    for &i in &c1_indices {
+        let first = &c1_candidates[i];
+        let sim1 = match simulate_sequence(state, first) {
+            Ok(s) => s, Err(_) => continue,
+        };
+        let count_after_c1 = count_correct_on_face(&sim1, face_a)
+            + count_correct_on_face(&sim1, face_b);
+        if count_after_c1 < total_before.saturating_sub(6) {
+            continue;
+        }
+        for second in c2_candidates {
+            let sim2 = match simulate_sequence(&sim1, second) {
+                Ok(s) => s, Err(_) => continue,
+            };
+            if !solved_faces_preserved(&sim2, preserved, order) {
+                continue;
+            }
+            let total = count_correct_on_face(&sim2, face_a)
+                + count_correct_on_face(&sim2, face_b);
+            if total > total_before {
+                let mut combined = first.clone();
+                combined.extend_from_slice(second);
+                return Some(combined);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Shake (make progress when stuck)
+// ---------------------------------------------------------------------------
+
+fn shake_pair(
+    state: &CubeState,
+    face_a: Face,
+    face_b: Face,
+    order: u32,
+    total_before: usize,
+    preserved: &[Face],
+    candidates: &[Vec<TurnCommand>],
+) -> Option<Vec<TurnCommand>> {
+    // First pass: non-decreasing
+    for candidate in candidates {
+        if candidate.len() < 4 { continue; }
+        if let Ok(sim) = simulate_sequence(state, candidate) {
+            if !solved_faces_preserved(&sim, preserved, order) { continue; }
+            let total = count_correct_on_face(&sim, face_a)
+                + count_correct_on_face(&sim, face_b);
+            if total < total_before { continue; }
+            let changed = center_positions_on_face(face_a, order)
+                .iter().any(|p| p.color_in(&sim) != p.color_in(state))
+                || center_positions_on_face(face_b, order)
+                    .iter().any(|p| p.color_in(&sim) != p.color_in(state));
+            if changed {
+                return Some(candidate.clone());
+            }
+        }
+    }
+    // Second pass: allow ≤1 decrease
+    for candidate in candidates {
+        if candidate.len() < 4 { continue; }
+        if let Ok(sim) = simulate_sequence(state, candidate) {
+            if !solved_faces_preserved(&sim, preserved, order) { continue; }
+            let total = count_correct_on_face(&sim, face_a)
+                + count_correct_on_face(&sim, face_b);
+            if total < total_before.saturating_sub(1) { continue; }
+            let changed = center_positions_on_face(face_a, order)
+                .iter().any(|p| p.color_in(&sim) != p.color_in(state))
+                || center_positions_on_face(face_b, order)
+                    .iter().any(|p| p.color_in(&sim) != p.color_in(state));
+            if changed {
+                return Some(candidate.clone());
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Enabling move
+// ---------------------------------------------------------------------------
+
+fn find_enabling_move_with_candidates(
+    state: &CubeState,
+    target_face: Face,
+    face_a: Face,
+    face_b: Face,
+    order: u32,
+    _correct_before: usize,
+    total_before: usize,
+    preserved: &[Face],
+    candidates: &[Vec<TurnCommand>],
+) -> Option<Vec<TurnCommand>> {
+    let positions = center_positions_on_face(target_face, order);
+    let mut best: Option<(Vec<TurnCommand>, usize)> = None;
+
+    for candidate in candidates {
+        if candidate.len() < 4 {
+            continue;
+        }
+        if let Ok(sim) = simulate_sequence(state, candidate) {
+            if !solved_faces_preserved(&sim, preserved, order) {
+                continue;
+            }
+            let total = count_correct_on_face(&sim, face_a)
+                + count_correct_on_face(&sim, face_b);
+            if total + 1 < total_before {
+                continue;
+            }
+            let changed = positions.iter().any(|p| {
+                p.color_in(&sim) != p.color_in(state)
+            });
+            if changed {
+                match &best {
+                    None => best = Some((candidate.clone(), total)),
+                    Some((_, best_total)) if total > *best_total => {
+                        best = Some((candidate.clone(), total));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    best.map(|(seq, _)| seq)
+}
+
+// ---------------------------------------------------------------------------
+// IDA* fallback
+// ---------------------------------------------------------------------------
+
 fn generate_all_ida_candidates(order: u32) -> Vec<Vec<TurnCommand>> {
     let mut candidates = Vec::new();
     let max_depth = order / 2;
@@ -835,7 +1063,6 @@ fn generate_all_ida_candidates(order: u32) -> Vec<Vec<TurnCommand>> {
     candidates
 }
 
-/// IDA* with given candidate pool.
 fn ida_star_single_face_with_candidates(
     state: &CubeState,
     target_face: Face,
@@ -848,7 +1075,6 @@ fn ida_star_single_face_with_candidates(
         return Some(Vec::new());
     }
 
-    // Start from depth 2 since greedy already tried all single candidates
     for max_depth in 2..=IDA_MAX_DEPTH {
         if let Some(result) = ida_dfs_single(
             state, target_face, order, locked,
@@ -889,12 +1115,9 @@ fn ida_dfs_single(
             if wrong_after == 0 {
                 return Some(candidate.clone());
             }
-            // Only recurse if we made improvement OR we're very close to solved
-            // (within 2 pieces) and still have depth remaining.
             let can_recurse = if wrong_after < wrong_before {
                 true
             } else if wrong_after == wrong_before && wrong_before <= 2 && depth + 1 < max_depth {
-                // Allow staying at same count when very close — enables 2-ply
                 true
             } else {
                 false
@@ -915,122 +1138,7 @@ fn ida_dfs_single(
 }
 
 // ---------------------------------------------------------------------------
-// Enabling move (changes arrangement to allow future progress)
-// ---------------------------------------------------------------------------
-
-fn find_enabling_move(
-    state: &CubeState,
-    target_face: Face,
-    order: u32,
-    correct_before: usize,
-    preserved: &[Face],
-) -> Option<Vec<TurnCommand>> {
-    let max_depth = order / 2;
-    let positions = center_positions_on_face(target_face, order);
-
-    for depth in 1..=max_depth {
-        for &slice_face in &Face::ALL {
-            let slice_cw = TurnCommand {
-                face: slice_face, start_layer: depth, width: 1,
-                rotation: RotationAmount::Clockwise,
-            };
-            let slice_ccw = slice_cw.inverse();
-
-            let face_candidates: Vec<(Face, RotationAmount)> = Face::ALL
-                .iter()
-                .filter(|&&f| !preserved.contains(&f))
-                .flat_map(|&f| [
-                    (f, RotationAmount::Clockwise),
-                    (f, RotationAmount::CounterClockwise),
-                    (f, RotationAmount::HalfTurn),
-                ])
-                .chain(preserved.iter().map(|&f| (f, RotationAmount::HalfTurn)))
-                .collect();
-
-            for &(face, rot) in &face_candidates {
-                let face_turn = TurnCommand {
-                    face, start_layer: 0, width: 1, rotation: rot,
-                };
-                let face_inv = face_turn.inverse();
-
-                for (a, a_inv) in [(slice_cw, slice_ccw), (slice_ccw, slice_cw)] {
-                    for comm in [
-                        vec![a, face_turn, a_inv, face_inv],
-                        vec![face_turn, a, face_inv, a_inv],
-                    ] {
-                        if let Ok(sim) = simulate_sequence(state, &comm) {
-                            if !solved_faces_preserved(&sim, preserved, order) {
-                                continue;
-                            }
-                            let correct_after = count_correct_on_face(&sim, target_face);
-                            if correct_after < correct_before {
-                                continue;
-                            }
-                            let changed = positions.iter().any(|p| {
-                                p.color_in(&sim) != p.color_in(state)
-                            });
-                            if changed {
-                                return Some(comm);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Same as find_enabling_move but uses precomputed candidates.
-/// Checks both faces in the pair to ensure total doesn't drop too much.
-/// Picks the BEST candidate (maximizes total) rather than the first.
-fn find_enabling_move_with_candidates(
-    state: &CubeState,
-    target_face: Face,
-    face_a: Face,
-    face_b: Face,
-    order: u32,
-    _correct_before: usize,
-    total_before: usize,
-    preserved: &[Face],
-    candidates: &[Vec<TurnCommand>],
-) -> Option<Vec<TurnCommand>> {
-    let positions = center_positions_on_face(target_face, order);
-    let mut best: Option<(Vec<TurnCommand>, usize)> = None;
-
-    for candidate in candidates {
-        if candidate.len() < 4 {
-            continue;
-        }
-        if let Ok(sim) = simulate_sequence(state, candidate) {
-            if !solved_faces_preserved(&sim, preserved, order) {
-                continue;
-            }
-            let total = count_correct_on_face(&sim, face_a)
-                + count_correct_on_face(&sim, face_b);
-            // Allow at most 1 decrease in total
-            if total + 1 < total_before {
-                continue;
-            }
-            let changed = positions.iter().any(|p| {
-                p.color_in(&sim) != p.color_in(state)
-            });
-            if changed {
-                match &best {
-                    None => best = Some((candidate.clone(), total)),
-                    Some((_, best_total)) if total > *best_total => {
-                        best = Some((candidate.clone(), total));
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    best.map(|(seq, _)| seq)
-}
-
-// ---------------------------------------------------------------------------
-// helpers
+// Shared helpers
 // ---------------------------------------------------------------------------
 
 fn face_centers_solved(state: &CubeState, face: Face, order: u32) -> bool {
@@ -1104,6 +1212,10 @@ pub fn find_matching_center(
     None
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,22 +1232,21 @@ mod tests {
     fn test_center_solver_scrambled_4x4() {
         let mut state = CubeState::solved(CubeOrder::new(4).unwrap());
 
-        // [r, U] = r U r' U' — a commutator that cycles 3 center pieces
         let scramble = vec![
             TurnCommand {
                 face: Face::Right,
                 start_layer: 1,
                 width: 1,
                 rotation: RotationAmount::Clockwise,
-            }, // r
-            TurnCommand::outer(Face::Up, RotationAmount::Clockwise), // U
+            },
+            TurnCommand::outer(Face::Up, RotationAmount::Clockwise),
             TurnCommand {
                 face: Face::Right,
                 start_layer: 1,
                 width: 1,
                 rotation: RotationAmount::CounterClockwise,
-            }, // r'
-            TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise), // U'
+            },
+            TurnCommand::outer(Face::Up, RotationAmount::CounterClockwise),
         ];
 
         for &turn in &scramble {
@@ -1213,7 +1324,6 @@ mod tests {
     fn test_center_solver_scrambled_5x5() {
         let mut state = CubeState::solved(CubeOrder::new(5).unwrap());
 
-        // [r, U] = r U r' U' — pure commutator on 5x5 (inner slice layer 1)
         let scramble = vec![
             TurnCommand {
                 face: Face::Right,
@@ -1253,7 +1363,6 @@ mod tests {
     fn test_center_solver_scrambled_6x6() {
         let mut state = CubeState::solved(CubeOrder::new(6).unwrap());
 
-        // [r, U] = r U r' U' with inner slice layer 1
         let scramble = vec![
             TurnCommand {
                 face: Face::Right,
@@ -1317,5 +1426,26 @@ mod tests {
         let turns1 = solve_centers(&state).unwrap();
         let turns2 = solve_centers(&state).unwrap();
         assert_eq!(turns1, turns2, "solver must be deterministic");
+    }
+
+    #[test]
+    fn test_hash_different_states() {
+        let s1 = CubeState::solved(CubeOrder::new(4).unwrap());
+        let mut s2 = s1.clone();
+        apply_turn_to_state(&mut s2, TurnCommand {
+            face: Face::Right, start_layer: 1, width: 1,
+            rotation: RotationAmount::Clockwise,
+        }).unwrap();
+
+        assert_ne!(hash_centers(&s1), hash_centers(&s2),
+            "different center states should hash differently");
+    }
+
+    #[test]
+    fn test_hash_same_state() {
+        let s1 = CubeState::solved(CubeOrder::new(4).unwrap());
+        let s2 = CubeState::solved(CubeOrder::new(4).unwrap());
+        assert_eq!(hash_centers(&s1), hash_centers(&s2),
+            "identical center states should hash the same");
     }
 }
