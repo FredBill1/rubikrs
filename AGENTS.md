@@ -34,5 +34,6 @@ Run these from `apps/web`.
 
 - **Keep TypeScript thin.** The DOM shell should orchestrate the runtime, not reimplement cube logic, gesture semantics, or solver rules.
 - **Keep direct manipulation Rust-side.** Sticker drag selection, live slice angles, snap thresholds, and final `TurnCommand` commits live in `crates/rubik-app`; the web shell should only forward DOM input state.
+- **Keep rendering polish Rust-side.** Sticker material, lighting, color palette, and baked color-bleed approximations live in `crates/rubik-app`; prefer mesh-rebuild-time work over per-frame JS or per-sticker entities unless a benchmark justifies it.
 - **Implement correct rubik's cube solving algorithms.** The implemented algorithm should be able to solve any valid cube state for N>=2 in a reasonable time. DO NOT USE any "max iteration" limits or fallback logic, because the correctly implemented algorithm should work end-to-end.
 - **Documentations and Git commits.** Always keep documentation (ADR and design decisions in `./docs`. `./AGENTS.md` for short bullet-point notes) up to date and make git commits after any change. Always run `npm run build:dev` before committing to make sure the code compiles.

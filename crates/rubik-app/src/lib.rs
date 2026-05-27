@@ -73,6 +73,11 @@ struct BodyMeshTemplate {
     indices: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StickerFaceLighting {
+    colors: [Vec3; Face::ALL.len()],
+}
+
 #[derive(Resource, Clone)]
 struct ShellConfig {
     base_path: String,
@@ -349,6 +354,9 @@ struct CubeSurfaceHit {
 }
 
 const CUBE_FACE_SPAN: f32 = 1.9;
+const STICKER_COLOR_BLEED_STRENGTH: f32 = 0.1;
+const STICKER_KEY_LIGHT_DIR: Vec3 = Vec3::new(-0.42, 0.58, 0.70);
+const STICKER_FILL_LIGHT_DIR: Vec3 = Vec3::new(0.50, 0.22, -0.84);
 const POINTER_TAP_MAX_DRAG_PX: f32 = 8.0;
 const SLICE_DRAG_QUARTER_TURN_PX: f32 = 130.0;
 const SLICE_SNAP_BACK_DEGREES: f32 = 10.0;
@@ -1472,25 +1480,28 @@ fn setup_scene(
         ShadowFilteringMethod::Gaussian,
         Transform::from_xyz(-3.85, 3.15, 6.45).looking_at(Vec3::ZERO, Vec3::Y),
         AmbientLight {
-            color: Color::srgb(1.0, 1.0, 1.0),
-            brightness: 200.0,
+            color: Color::srgb(0.92, 0.95, 1.0),
+            brightness: 420.0,
             ..default()
         },
     ));
 
     commands.spawn((
         PointLight {
-            intensity: 1_100_000.0,
-            range: 42.0,
+            color: Color::srgb(1.0, 0.95, 0.86),
+            intensity: 720_000.0,
+            range: 36.0,
+            radius: 4.2,
             shadows_enabled: false,
             ..default()
         },
-        Transform::from_xyz(5.5, 8.5, 5.5),
+        Transform::from_xyz(-4.8, 5.7, 6.4),
     ));
 
     commands.spawn((
         DirectionalLight {
-            illuminance: 8_000.0,
+            color: Color::srgb(1.0, 0.97, 0.9),
+            illuminance: 6_200.0,
             shadows_enabled: true,
             ..default()
         },
@@ -1502,7 +1513,7 @@ fn setup_scene(
             overlap_proportion: 0.2,
         }
         .build(),
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.78, 0.92, 0.0)),
+        Transform::from_xyz(-3.8, 6.0, 5.2).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 }
 
@@ -1925,12 +1936,131 @@ fn restore_resting_body_meshes(
     apply_body_mesh_partition(meshes, pool, &pool.cubie_slots, &[], visibilities);
 }
 
+fn make_sticker_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::WHITE,
+        metallic: 0.0,
+        perceptual_roughness: 0.44,
+        reflectance: 0.58,
+        ..default()
+    }
+}
+
+fn make_shell_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::srgb_u8(13, 16, 23),
+        metallic: 0.0,
+        perceptual_roughness: 0.66,
+        reflectance: 0.36,
+        ..default()
+    }
+}
+
+impl StickerFaceLighting {
+    fn color(&self, face: Face) -> Vec3 {
+        self.colors[face_index(face)]
+    }
+}
+
+fn sticker_face_lighting(
+    sticker_visual_states: &[StickerVisual],
+    sticker_colors: &[StickerColor],
+) -> StickerFaceLighting {
+    let mut colors = [Vec3::ZERO; Face::ALL.len()];
+    let mut counts = [0_u32; Face::ALL.len()];
+
+    for (visual, color) in sticker_visual_states
+        .iter()
+        .copied()
+        .zip(sticker_colors.iter().copied())
+    {
+        let index = face_index(visual.face);
+        colors[index] += sticker_linear_rgb(color);
+        counts[index] += 1;
+    }
+
+    for face in Face::ALL {
+        let index = face_index(face);
+        colors[index] = if counts[index] == 0 {
+            sticker_linear_rgb(face.solved_color())
+        } else {
+            colors[index] / counts[index] as f32
+        };
+    }
+
+    StickerFaceLighting { colors }
+}
+
+fn sticker_linear_rgb(color: StickerColor) -> Vec3 {
+    color_for_sticker(color).to_linear().to_vec3()
+}
+
+fn sticker_color_for_visual(
+    color: StickerColor,
+    world_position: Vec3,
+    world_normal: Vec3,
+    face_lighting: &StickerFaceLighting,
+    face_span: f32,
+) -> [f32; 4] {
+    let baked_light = 0.91
+        + 0.07 * world_normal.dot(STICKER_KEY_LIGHT_DIR).max(0.0)
+        + 0.04 * world_normal.dot(STICKER_FILL_LIGHT_DIR).max(0.0)
+        + 0.035 * world_normal.y.max(0.0)
+        + 0.025 * (-world_normal.y).max(0.0);
+    let mut rgb = sticker_linear_rgb(color) * baked_light;
+
+    rgb += sticker_bounce_light(world_position, world_normal, face_lighting, face_span);
+
+    [
+        rgb.x.clamp(0.0, 0.98),
+        rgb.y.clamp(0.0, 0.98),
+        rgb.z.clamp(0.0, 0.98),
+        1.0,
+    ]
+}
+
+fn sticker_bounce_light(
+    world_position: Vec3,
+    world_normal: Vec3,
+    face_lighting: &StickerFaceLighting,
+    face_span: f32,
+) -> Vec3 {
+    let half_extent = (face_span * 0.5).max(f32::EPSILON);
+    let mut bounce = Vec3::ZERO;
+
+    for face in Face::ALL {
+        let face_normal = face_outward_normal(face);
+        let near_face = smoothstep(
+            half_extent * 0.68,
+            half_extent * 1.04,
+            world_position.dot(face_normal),
+        );
+        if near_face <= f32::EPSILON {
+            continue;
+        }
+
+        let perpendicular = (1.0 - world_normal.dot(face_normal).abs()).clamp(0.0, 1.0);
+        let facing_source = (-world_normal).dot(face_normal).max(0.0) * 0.45;
+        let view_factor = (perpendicular * 0.85 + facing_source).clamp(0.0, 1.0);
+        bounce +=
+            face_lighting.color(face) * (near_face * view_factor * STICKER_COLOR_BLEED_STRENGTH);
+    }
+
+    bounce
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn merged_sticker_mesh(
     template: &BodyMeshTemplate,
     stickers: &[(StickerVisual, StickerColor)],
     order: usize,
     face_span: f32,
     face_offset: f32,
+    face_lighting: &StickerFaceLighting,
 ) -> Mesh {
     let vertices_per_sticker = template.positions.len();
     let mut positions = Vec::with_capacity(vertices_per_sticker * stickers.len());
@@ -1947,6 +2077,14 @@ fn merged_sticker_mesh(
             face_span,
             face_offset,
         );
+        let sticker_face_normal = rotation * Vec3::Z;
+        let vertex_color = sticker_color_for_visual(
+            color,
+            translation,
+            sticker_face_normal,
+            face_lighting,
+            face_span,
+        );
         positions.extend(template.positions.iter().map(|position| {
             let rotated = rotation * Vec3::new(position[0], position[1], position[2]);
             [
@@ -1959,10 +2097,7 @@ fn merged_sticker_mesh(
             let rotated = rotation * Vec3::new(normal[0], normal[1], normal[2]);
             [rotated.x, rotated.y, rotated.z]
         }));
-        colors.extend(std::iter::repeat_n(
-            color_for_sticker(color).to_linear().to_f32_array(),
-            vertices_per_sticker,
-        ));
+        colors.extend(std::iter::repeat_n(vertex_color, vertices_per_sticker));
         let base_index = (sticker_index * vertices_per_sticker) as u32;
         indices.extend(template.indices.iter().map(|index| base_index + index));
     }
@@ -2026,6 +2161,7 @@ fn apply_sticker_mesh_partition(
         return;
     };
     let face_offset = cube_face_offset(order as u32);
+    let face_lighting = sticker_face_lighting(&pool.sticker_visual_states, &pool.sticker_colors);
 
     if let Some(mesh) = meshes.get_mut(static_sticker_mesh) {
         *mesh = merged_sticker_mesh(
@@ -2034,6 +2170,7 @@ fn apply_sticker_mesh_partition(
             order,
             CUBE_FACE_SPAN,
             face_offset,
+            &face_lighting,
         );
     }
     if let Some(mesh) = meshes.get_mut(animated_sticker_mesh) {
@@ -2043,6 +2180,7 @@ fn apply_sticker_mesh_partition(
             order,
             CUBE_FACE_SPAN,
             face_offset,
+            &face_lighting,
         );
     }
 
@@ -2125,12 +2263,7 @@ fn spawn_cube_visual_pool(
     let sticker_depth = sticker_size * 0.113_f32;
     let cubie_body_size = step * 0.92;
     let face_offset = cube_face_offset(state.order.get());
-    let sticker_material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        metallic: 0.06,
-        perceptual_roughness: 0.21,
-        ..default()
-    });
+    let sticker_material = materials.add(make_sticker_material());
     let cubie_slots = surface_cubies(order);
     let body_mesh_template =
         cuboid_mesh_template(cubie_body_size, cubie_body_size, cubie_body_size);
@@ -2186,13 +2319,7 @@ fn spawn_cube_visual_pool(
         ))
         .id();
 
-    let shell_material = materials.add(StandardMaterial {
-        base_color: Color::srgb_u8(17, 21, 29),
-        metallic: 0.18,
-        perceptual_roughness: 0.58,
-        reflectance: 0.3,
-        ..default()
-    });
+    let shell_material = materials.add(make_shell_material());
 
     let sticker_slots = (0..state.stickers.len())
         .map(|index| sticker_slot_from_index(index, order))
@@ -2214,12 +2341,14 @@ fn spawn_cube_visual_pool(
         state.order.get(),
         first_animation_turn,
     );
+    let face_lighting = sticker_face_lighting(&sticker_visual_states, &sticker_colors);
     let static_sticker_mesh = meshes.add(merged_sticker_mesh(
         &sticker_mesh_template,
         &static_stickers,
         order,
         face_span,
         face_offset,
+        &face_lighting,
     ));
     let animated_sticker_mesh_seed = if animated_stickers.is_empty() {
         static_stickers.as_slice()
@@ -2232,6 +2361,7 @@ fn spawn_cube_visual_pool(
         order,
         face_span,
         face_offset,
+        &face_lighting,
     ));
     let static_body_entity = commands
         .spawn((
@@ -2529,12 +2659,14 @@ fn begin_turn_batch_animation(
         order as usize,
         face_span,
     );
+    let face_lighting = sticker_face_lighting(&pool.sticker_visual_states, &pool.sticker_colors);
     let static_sticker_mesh_data = merged_sticker_mesh(
         sticker_template,
         &static_sticker_data,
         order as usize,
         face_span,
         face_offset,
+        &face_lighting,
     );
 
     if let Some((body_handle, _)) = pool.body_mesh_handles.as_ref() {
@@ -2548,19 +2680,8 @@ fn begin_turn_batch_animation(
         }
     }
 
-    let shell_material = materials.add(StandardMaterial {
-        base_color: Color::srgb_u8(17, 21, 29),
-        metallic: 0.18,
-        perceptual_roughness: 0.58,
-        reflectance: 0.3,
-        ..default()
-    });
-    let sticker_material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        metallic: 0.06,
-        perceptual_roughness: 0.21,
-        ..default()
-    });
+    let shell_material = materials.add(make_shell_material());
+    let sticker_material = materials.add(make_sticker_material());
 
     let all_sticker_pairs: Vec<(StickerVisual, StickerColor)> = pool
         .sticker_visual_states
@@ -2599,6 +2720,7 @@ fn begin_turn_batch_animation(
                 order as usize,
                 face_span,
                 face_offset,
+                &face_lighting,
             )
         } else {
             merged_sticker_mesh(
@@ -2607,6 +2729,7 @@ fn begin_turn_batch_animation(
                 order as usize,
                 face_span,
                 face_offset,
+                &face_lighting,
             )
         };
         let animated_sticker_handle = meshes.add(animated_sticker_mesh_data);
@@ -3968,7 +4091,6 @@ fn rotate_sticker_visual_for_turn(
     }
 }
 
-#[cfg(test)]
 fn face_outward_normal(face: Face) -> Vec3 {
     match face {
         Face::Up => Vec3::Y,
@@ -4226,14 +4348,25 @@ fn sticker_rotation(face: Face) -> Quat {
     }
 }
 
+fn face_index(face: Face) -> usize {
+    match face {
+        Face::Up => 0,
+        Face::Right => 1,
+        Face::Front => 2,
+        Face::Down => 3,
+        Face::Left => 4,
+        Face::Back => 5,
+    }
+}
+
 fn color_for_sticker(color: StickerColor) -> Color {
     match color {
-        StickerColor::White => Color::srgb_u8(255, 255, 255),
-        StickerColor::Red => Color::srgb_u8(185, 0, 0),
-        StickerColor::Green => Color::srgb_u8(0, 155, 72),
-        StickerColor::Yellow => Color::srgb_u8(255, 213, 0),
-        StickerColor::Orange => Color::srgb_u8(255, 89, 0),
-        StickerColor::Blue => Color::srgb_u8(0, 69, 173),
+        StickerColor::White => Color::srgb_u8(242, 238, 225),
+        StickerColor::Red => Color::srgb_u8(190, 35, 42),
+        StickerColor::Green => Color::srgb_u8(0, 130, 86),
+        StickerColor::Yellow => Color::srgb_u8(244, 205, 70),
+        StickerColor::Orange => Color::srgb_u8(232, 117, 43),
+        StickerColor::Blue => Color::srgb_u8(24, 91, 168),
     }
 }
 
@@ -4378,17 +4511,18 @@ mod tests {
         CUBE_FACE_SPAN, CanvasTouchSpace, CubeVisual, CubeVisualPool, CubeVisualRoot, OrbitRig,
         RuntimeBridge, SLICE_DRAG_QUARTER_TURN_PX, ScreenStickerCandidate, StickerVisual,
         TOUCH_MOUSE_SUPPRESSION_SECS, TouchOrbitMode, TurnAnimationPivot, VisualSyncState,
-        animate_turn_visuals, clear_cube_visuals, cube_surface_hit_from_ray, cubie_matches_turn,
-        cuboid_mesh_template, decode_face, decode_rotation, face_outward_normal, format_turn,
-        keyboard_shortcut_turn, merged_cubie_body_mesh, nearest_orbit_snap, normalize_base_path,
-        normalize_canvas_selector, normalize_touch_position, oriented_slice_drag_direction,
-        partition_body_cubies, reset_cube, rotate_sticker_visual_for_turn, set_touch_orbit_mode,
-        should_begin_mouse_orbit, should_emulate_two_finger_touch,
-        should_reset_single_touch_gesture, signed_slice_snap_quarters, slice_drag_angle_radians,
-        slice_drag_selection_from_sticker_drag, slice_start_layer, sticker_cubie_coord,
-        sticker_rotation, surface_axis_index, surface_cubies, sync_cube_visuals,
-        turn_for_signed_slice_quarters, turn_rotation_angle, virtual_cube_half_extent,
-        virtual_surface_center,
+        animate_turn_visuals, clear_cube_visuals, color_for_sticker, cube_surface_hit_from_ray,
+        cubie_matches_turn, cuboid_mesh_template, decode_face, decode_rotation,
+        face_outward_normal, format_turn, keyboard_shortcut_turn, merged_cubie_body_mesh,
+        nearest_orbit_snap, normalize_base_path, normalize_canvas_selector,
+        normalize_touch_position, oriented_slice_drag_direction, partition_body_cubies, reset_cube,
+        rotate_sticker_visual_for_turn, set_touch_orbit_mode, should_begin_mouse_orbit,
+        should_emulate_two_finger_touch, should_reset_single_touch_gesture,
+        signed_slice_snap_quarters, slice_drag_angle_radians,
+        slice_drag_selection_from_sticker_drag, slice_start_layer, sticker_color_for_visual,
+        sticker_cubie_coord, sticker_face_lighting, sticker_rotation, surface_axis_index,
+        surface_cubies, sync_cube_visuals, turn_for_signed_slice_quarters, turn_rotation_angle,
+        virtual_cube_half_extent, virtual_surface_center,
     };
     use bevy::{
         ecs::system::SystemState,
@@ -4397,7 +4531,7 @@ mod tests {
             Schedule, StandardMaterial, Time, UVec3, Vec2, Vec3, With, World,
         },
     };
-    use rubik_core::{CubeOrder, Face, RotationAmount, TurnCommand};
+    use rubik_core::{CubeOrder, Face, RotationAmount, StickerColor, TurnCommand};
 
     fn sample_sticker_candidate(face: Face, cubie: UVec3) -> ScreenStickerCandidate {
         ScreenStickerCandidate {
@@ -4528,6 +4662,71 @@ mod tests {
             let rotated_normal = sticker_rotation(face) * Vec3::Z;
             assert!(rotated_normal.abs_diff_eq(face_outward_normal(face), 0.0001));
         }
+    }
+
+    #[test]
+    fn sticker_face_lighting_tracks_current_physical_face_colors() {
+        let visuals = Face::ALL
+            .iter()
+            .copied()
+            .map(|face| StickerVisual {
+                face,
+                row: 0,
+                col: 0,
+                cubie: UVec3::ZERO,
+            })
+            .collect::<Vec<_>>();
+        let colors = [
+            StickerColor::White,
+            StickerColor::Blue,
+            StickerColor::Green,
+            StickerColor::Yellow,
+            StickerColor::Orange,
+            StickerColor::Red,
+        ];
+        let lighting = sticker_face_lighting(&visuals, &colors);
+        let expected = color_for_sticker(StickerColor::Blue).to_linear();
+
+        assert!(lighting.color(Face::Right).abs_diff_eq(
+            Vec3::new(expected.red, expected.green, expected.blue),
+            0.0001,
+        ));
+    }
+
+    #[test]
+    fn baked_sticker_color_bleeds_adjacent_face_color_near_edges() {
+        let visuals = Face::ALL
+            .iter()
+            .copied()
+            .map(|face| StickerVisual {
+                face,
+                row: 0,
+                col: 0,
+                cubie: UVec3::ZERO,
+            })
+            .collect::<Vec<_>>();
+        let colors = Face::ALL
+            .iter()
+            .copied()
+            .map(Face::solved_color)
+            .collect::<Vec<_>>();
+        let lighting = sticker_face_lighting(&visuals, &colors);
+        let center = sticker_color_for_visual(
+            StickerColor::Green,
+            Vec3::new(0.0, 0.0, CUBE_FACE_SPAN * 0.5),
+            Vec3::Z,
+            &lighting,
+            CUBE_FACE_SPAN,
+        );
+        let right_edge = sticker_color_for_visual(
+            StickerColor::Green,
+            Vec3::new(CUBE_FACE_SPAN * 0.5, 0.0, CUBE_FACE_SPAN * 0.5),
+            Vec3::Z,
+            &lighting,
+            CUBE_FACE_SPAN,
+        );
+
+        assert!(right_edge[0] > center[0]);
     }
 
     #[test]
