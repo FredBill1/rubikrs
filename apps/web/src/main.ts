@@ -195,6 +195,20 @@ app.innerHTML = `
         </section>
 
         <section class="panel">
+          <p class="panel-kicker">solver</p>
+          <div class="control-cluster">
+            <div class="action-row action-row--stacked">
+              <div class="action-row action-row--pair">
+                <button type="button" data-action="solve">solve</button>
+                <button type="button" data-action="cancel-solve">cancel</button>
+              </div>
+            </div>
+            <p class="history-line" data-solver-status>idle</p>
+            <p class="body-copy" data-solver-detail>No solve request in flight.</p>
+          </div>
+        </section>
+
+        <section class="panel">
           <p class="panel-kicker">manual turns</p>
           <div class="control-cluster">
             <div class="action-row action-row--stacked">
@@ -222,20 +236,6 @@ app.innerHTML = `
               <button type="button" data-turn="4:2">L'</button>
               <button type="button" data-turn="5:2">B'</button>
             </div>
-          </div>
-        </section>
-
-        <section class="panel">
-          <p class="panel-kicker">solver</p>
-          <div class="control-cluster">
-            <div class="action-row action-row--stacked">
-              <div class="action-row action-row--pair">
-                <button type="button" data-action="solve">solve</button>
-                <button type="button" data-action="cancel-solve">cancel</button>
-              </div>
-            </div>
-            <p class="history-line" data-solver-status>idle</p>
-            <p class="body-copy" data-solver-detail>No solve request in flight.</p>
           </div>
         </section>
 
