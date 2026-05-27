@@ -104,6 +104,8 @@ struct DirectTurnInputState {
     mouse_candidate: Option<PointerGestureCandidate>,
     touch_candidate: Option<TouchGestureCandidate>,
     queued_turn: Option<TurnCommand>,
+    active_slice_drag: Option<ActiveSliceDrag>,
+    pending_slice_snap: Option<SliceSnapRequest>,
 }
 
 #[derive(Resource, Default)]
@@ -112,6 +114,8 @@ struct VisualSyncState {
     active_animations: Vec<ActiveTurnAnimation>,
     completed_animation_revision: Option<u64>,
     temp_pivot_entities: Vec<Entity>,
+    live_slice_turn: Option<TurnCommand>,
+    live_slice_animated_stickers: Vec<usize>,
 }
 
 #[derive(Resource, Default)]
@@ -190,10 +194,12 @@ struct ActiveTurnAnimation {
     pivot_entity: Entity,
     turn: TurnCommand,
     animated_stickers: Vec<usize>,
+    start_angle_radians: f32,
     angle_radians: f32,
     axis: Vec3,
     elapsed_secs: f32,
     duration_secs: f32,
+    completion: TurnAnimationCompletion,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -210,6 +216,41 @@ struct TouchGestureCandidate {
     start_position: Vec2,
     max_distance: f32,
     sticker_candidate: Option<ScreenStickerCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliceDragInput {
+    Mouse,
+    Touch(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveSliceDrag {
+    input: SliceDragInput,
+    start_position: Vec2,
+    turn: TurnCommand,
+    drag_direction: Vec2,
+    angle_radians: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SliceSnapRequest {
+    turn: TurnCommand,
+    start_angle_radians: f32,
+    target_angle_radians: f32,
+    commit_turn: Option<TurnCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnAnimationCompletion {
+    RuntimeApplied,
+    DirectSliceSnap { commit_turn: Option<TurnCommand> },
+}
+
+#[derive(Debug, Clone)]
+struct PreparedTurnVisuals {
+    pivot_entity: Entity,
+    animated_stickers: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -303,6 +344,9 @@ struct CubeSurfaceHit {
 
 const CUBE_FACE_SPAN: f32 = 1.9;
 const POINTER_TAP_MAX_DRAG_PX: f32 = 8.0;
+const SLICE_DRAG_QUARTER_TURN_PX: f32 = 130.0;
+const SLICE_SNAP_BACK_DEGREES: f32 = 10.0;
+const SLICE_DRAG_MAX_ABS_RADIANS: f32 = std::f32::consts::TAU;
 const FACE_TAP_RADIUS_SCALE: f32 = 0.7;
 const VIRTUAL_SURFACE_INSET: f32 = 0.03;
 const TOUCH_MOUSE_SUPPRESSION_SECS: f32 = 0.12;
@@ -527,6 +571,164 @@ fn clear_touch_orbit_state(orbit: &mut OrbitRig) {
 
 fn should_emulate_two_finger_touch(shift_pressed: bool, active_touch_count: usize) -> bool {
     shift_pressed && active_touch_count == 1
+}
+
+impl ActiveSliceDrag {
+    fn update_angle(&mut self, pointer_position: Vec2) {
+        self.angle_radians =
+            slice_drag_angle_radians(self.start_position, pointer_position, self.drag_direction);
+    }
+
+    fn snap_request(self) -> SliceSnapRequest {
+        let signed_quarters = signed_slice_snap_quarters(self.angle_radians);
+        let target_angle_radians = signed_quarters as f32 * std::f32::consts::FRAC_PI_2;
+        SliceSnapRequest {
+            turn: self.turn,
+            start_angle_radians: self.angle_radians,
+            target_angle_radians,
+            commit_turn: turn_for_signed_slice_quarters(self.turn, signed_quarters),
+        }
+    }
+
+    fn snap_back_request(self) -> SliceSnapRequest {
+        SliceSnapRequest {
+            turn: self.turn,
+            start_angle_radians: self.angle_radians,
+            target_angle_radians: 0.0,
+            commit_turn: None,
+        }
+    }
+}
+
+fn slice_drag_angle_radians(
+    start_position: Vec2,
+    pointer_position: Vec2,
+    drag_direction: Vec2,
+) -> f32 {
+    let projected_pixels = (pointer_position - start_position).dot(drag_direction);
+    (-(projected_pixels / SLICE_DRAG_QUARTER_TURN_PX) * std::f32::consts::FRAC_PI_2)
+        .clamp(-SLICE_DRAG_MAX_ABS_RADIANS, SLICE_DRAG_MAX_ABS_RADIANS)
+}
+
+fn signed_slice_snap_quarters(angle_radians: f32) -> i32 {
+    let snap_back_radians = SLICE_SNAP_BACK_DEGREES.to_radians();
+    let abs_angle = angle_radians.abs();
+    if abs_angle <= snap_back_radians {
+        return 0;
+    }
+
+    if abs_angle <= std::f32::consts::FRAC_PI_2 {
+        return if angle_radians.is_sign_positive() {
+            1
+        } else {
+            -1
+        };
+    }
+
+    (angle_radians / std::f32::consts::FRAC_PI_2).round() as i32
+}
+
+fn turn_for_signed_slice_quarters(
+    base_turn: TurnCommand,
+    signed_quarters: i32,
+) -> Option<TurnCommand> {
+    let rotation = match signed_quarters.rem_euclid(4) {
+        0 => return None,
+        1 => RotationAmount::CounterClockwise,
+        2 => RotationAmount::HalfTurn,
+        3 => RotationAmount::Clockwise,
+        _ => unreachable!("quarter turn modulo is always in 0..=3"),
+    };
+
+    Some(TurnCommand {
+        rotation,
+        ..base_turn
+    })
+}
+
+fn slice_snap_duration_secs(start_angle_radians: f32, target_angle_radians: f32) -> f32 {
+    let quarter_turn_delta =
+        (target_angle_radians - start_angle_radians).abs() / std::f32::consts::FRAC_PI_2;
+    (0.06 + (quarter_turn_delta * 0.08)).clamp(0.08, 0.24)
+}
+
+fn active_slice_drag_for_input(
+    state: &mut DirectTurnInputState,
+    input: SliceDragInput,
+) -> Option<&mut ActiveSliceDrag> {
+    state
+        .active_slice_drag
+        .as_mut()
+        .filter(|drag| drag.input == input)
+}
+
+fn finish_active_slice_drag(
+    state: &mut DirectTurnInputState,
+    input: SliceDragInput,
+    canceled: bool,
+) -> bool {
+    if !state
+        .active_slice_drag
+        .is_some_and(|drag| drag.input == input)
+    {
+        return false;
+    }
+
+    if let Some(active_drag) = state.active_slice_drag.take() {
+        state.pending_slice_snap = Some(if canceled {
+            active_drag.snap_back_request()
+        } else {
+            active_drag.snap_request()
+        });
+    }
+    true
+}
+
+fn cancel_active_slice_drag(state: &mut DirectTurnInputState) -> bool {
+    let Some(active_drag) = state.active_slice_drag.take() else {
+        return false;
+    };
+    state.pending_slice_snap = Some(active_drag.snap_back_request());
+    true
+}
+
+fn build_active_slice_drag(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    order: u32,
+    input: SliceDragInput,
+    candidate: ScreenStickerCandidate,
+    start_position: Vec2,
+    current_position: Vec2,
+) -> Option<ActiveSliceDrag> {
+    let drag = current_position - start_position;
+    if drag.length() <= POINTER_TAP_MAX_DRAG_PX {
+        return None;
+    }
+
+    let turn_face = slice_face_from_sticker_drag(candidate, drag)?;
+    let start_layer = slice_start_layer(turn_face, candidate.cubie, order);
+    let turn = TurnCommand {
+        face: turn_face,
+        start_layer,
+        width: 1,
+        rotation: RotationAmount::Clockwise,
+    };
+    let drag_direction =
+        projected_turn_motion(camera, camera_transform, candidate.world_center, turn)?;
+    if drag.normalize().dot(drag_direction).abs() <= 0.2 {
+        return None;
+    }
+
+    let mut active_drag = ActiveSliceDrag {
+        input,
+        start_position,
+        turn,
+        drag_direction,
+        angle_radians: 0.0,
+    };
+    active_drag.update_angle(current_position);
+    Some(active_drag)
 }
 
 fn canvas_touch_space(config: &ShellConfig, window: &Window) -> CanvasTouchSpace {
@@ -943,6 +1145,25 @@ impl RuntimeBridge {
         Ok(())
     }
 
+    fn commit_direct_turn(&mut self, turn: TurnCommand) -> u64 {
+        match self.engine.apply_turn(turn) {
+            Ok(()) => {
+                self.turn_enqueue_count += 1;
+                self.bump_scene();
+                self.last_transition = None;
+                self.animation_active = false;
+                self.set_message(format!("Turned {}.", format_turn(turn)));
+            }
+            Err(error) => {
+                self.set_message(format!(
+                    "Failed to apply direct turn {}: {error}.",
+                    format_turn(turn)
+                ));
+            }
+        }
+        self.scene_revision
+    }
+
     fn undo(&mut self) -> Result<(), String> {
         let from_state = self.engine.state().clone();
         let turn = self.engine.undo().map_err(|error| error.to_string())?;
@@ -1096,6 +1317,7 @@ pub fn start_app(canvas_id: &str, base_path: &str) {
                 keyboard_turn_shortcuts,
                 apply_camera_transform,
                 canvas_face_tap_input,
+                direct_slice_drag_visuals,
                 animate_turn_visuals,
                 sync_cube_visuals,
             )
@@ -1314,6 +1536,8 @@ fn sync_cube_visuals(
         }
         sync_state.active_animations.clear();
         sync_state.temp_pivot_entities.clear();
+        sync_state.live_slice_turn = None;
+        sync_state.live_slice_animated_stickers.clear();
         sync_state.rendered_revision = 0;
         sync_state.completed_animation_revision = None;
         with_runtime_mut(|runtime| runtime.set_animation_active(false));
@@ -1364,6 +1588,8 @@ fn sync_cube_visuals(
         *pool = new_pool;
         sync_state.active_animations = new_animations;
         sync_state.temp_pivot_entities.clear();
+        sync_state.live_slice_turn = None;
+        sync_state.live_slice_animated_stickers.clear();
         sync_state.completed_animation_revision = None;
         sync_state.rendered_revision = if sync_state.active_animations.is_empty() {
             snapshot.scene_revision
@@ -1419,6 +1645,8 @@ fn sync_cube_visuals(
     );
     sync_state.rendered_revision = snapshot.scene_revision;
     sync_state.completed_animation_revision = None;
+    sync_state.live_slice_turn = None;
+    sync_state.live_slice_animated_stickers.clear();
     with_runtime_mut(|runtime| runtime.set_animation_active(false));
 }
 
@@ -1459,12 +1687,11 @@ fn animate_turn_visuals(
                 animation.elapsed_secs / animation.duration_secs
             };
             let eased = ease_in_out_cubic(progress);
-            pivot_transform.rotation =
-                Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
+            let angle = animation.start_angle_radians
+                + ((animation.angle_radians - animation.start_angle_radians) * eased);
+            pivot_transform.rotation = Quat::from_axis_angle(animation.axis, angle);
 
             if progress < 1.0 {
-                pivot_transform.rotation =
-                    Quat::from_axis_angle(animation.axis, animation.angle_radians * eased);
                 still_active.push(animation);
             } else {
                 completed_animations.push(animation);
@@ -1481,13 +1708,19 @@ fn animate_turn_visuals(
     }
 
     for animation in &completed_animations {
-        for index in &animation.animated_stickers {
-            let rotated = rotate_sticker_visual_for_turn(
-                order,
-                animation.turn,
-                pool.sticker_visual_states[*index],
-            );
-            pool.sticker_visual_states[*index] = rotated;
+        let visual_turn = match animation.completion {
+            TurnAnimationCompletion::RuntimeApplied => Some(animation.turn),
+            TurnAnimationCompletion::DirectSliceSnap { commit_turn } => commit_turn,
+        };
+        if let Some(visual_turn) = visual_turn {
+            for index in &animation.animated_stickers {
+                let rotated = rotate_sticker_visual_for_turn(
+                    order,
+                    visual_turn,
+                    pool.sticker_visual_states[*index],
+                );
+                pool.sticker_visual_states[*index] = rotated;
+            }
         }
     }
 
@@ -1517,12 +1750,28 @@ fn animate_turn_visuals(
         restore_resting_body_meshes(&mut meshes, &pool, &mut visibilities);
         restore_resting_sticker_meshes(&mut meshes, &pool, &mut visibilities);
 
-        let scene_revision = completed_animations[0].scene_revision;
+        let mut scene_revision = completed_animations[0].scene_revision;
+        let mut should_process_queue = false;
+        for animation in &completed_animations {
+            match animation.completion {
+                TurnAnimationCompletion::RuntimeApplied => {
+                    should_process_queue = true;
+                }
+                TurnAnimationCompletion::DirectSliceSnap {
+                    commit_turn: Some(turn),
+                } => {
+                    scene_revision = with_runtime_mut(|runtime| runtime.commit_direct_turn(turn));
+                }
+                TurnAnimationCompletion::DirectSliceSnap { commit_turn: None } => {}
+            }
+        }
         sync_state.rendered_revision = scene_revision;
         sync_state.completed_animation_revision = Some(scene_revision);
         with_runtime_mut(|runtime| {
             runtime.set_animation_active(false);
-            runtime.process_queue_head();
+            if should_process_queue {
+                runtime.process_queue_head();
+            }
         });
     }
 }
@@ -2048,10 +2297,12 @@ fn spawn_cube_visual_pool(
             pivot_entity: pivot,
             turn,
             animated_stickers: animated_sticker_indices,
+            start_angle_radians: 0.0,
             angle_radians: turn_rotation_angle(turn),
             axis: turn_rotation_axis(turn.face),
             elapsed_secs: 0.0,
             duration_secs: turn_animation_duration_secs(turn),
+            completion: TurnAnimationCompletion::RuntimeApplied,
         })
         .into_iter()
         .collect();
@@ -2099,6 +2350,64 @@ fn apply_cube_state_to_pool(
     restore_resting_sticker_meshes(meshes, pool, visibilities);
 }
 
+fn prepare_single_turn_visuals(
+    meshes: &mut ResMut<'_, Assets<Mesh>>,
+    pool: &CubeVisualPool,
+    order: u32,
+    turn: TurnCommand,
+    pivots: &mut Query<
+        '_,
+        '_,
+        &mut Transform,
+        (
+            With<TurnAnimationPivot>,
+            Without<CubieBodyVisual>,
+            Without<StickerVisual>,
+        ),
+    >,
+    visibilities: &mut Query<'_, '_, &mut Visibility>,
+    reset_pivot: bool,
+) -> Option<PreparedTurnVisuals> {
+    let pivot_entity = pool.pivot_entity?;
+    if reset_pivot {
+        if let Ok(mut pivot_transform) = pivots.get_mut(pivot_entity) {
+            *pivot_transform = Transform::default();
+        }
+    }
+
+    let (static_body_cubies, animated_body_cubies) =
+        partition_body_cubies(&pool.cubie_slots, order, Some(turn));
+    apply_body_mesh_partition(
+        meshes,
+        pool,
+        &static_body_cubies,
+        &animated_body_cubies,
+        visibilities,
+    );
+    let (static_stickers, animated_stickers, animated_sticker_indices) = partition_sticker_visuals(
+        &pool.sticker_visual_states,
+        &pool.sticker_colors,
+        order,
+        Some(turn),
+    );
+    apply_sticker_mesh_partition(
+        meshes,
+        pool,
+        &static_stickers,
+        &animated_stickers,
+        visibilities,
+    );
+
+    if animated_body_cubies.is_empty() && animated_sticker_indices.is_empty() {
+        return None;
+    }
+
+    Some(PreparedTurnVisuals {
+        pivot_entity,
+        animated_stickers: animated_sticker_indices,
+    })
+}
+
 fn begin_turn_batch_animation(
     commands: &mut Commands<'_, '_>,
     meshes: &mut ResMut<'_, Assets<Mesh>>,
@@ -2125,6 +2434,9 @@ fn begin_turn_batch_animation(
         return;
     }
 
+    sync_state.live_slice_turn = None;
+    sync_state.live_slice_animated_stickers.clear();
+
     let turns = RuntimeBridge::merge_batch_turns(order, turns);
 
     if turns.is_empty() {
@@ -2134,48 +2446,24 @@ fn begin_turn_batch_animation(
 
     if turns.len() == 1 {
         let turn = turns[0];
-        let pivot_entity = pool.pivot_entity.expect("pool has pivot");
-        if let Ok(mut pivot_transform) = pivots.get_mut(pivot_entity) {
-            *pivot_transform = Transform::default();
-        }
-        let (static_body_cubies, animated_body_cubies) =
-            partition_body_cubies(&pool.cubie_slots, order, Some(turn));
-        apply_body_mesh_partition(
-            meshes,
-            pool,
-            &static_body_cubies,
-            &animated_body_cubies,
-            visibilities,
-        );
-        let (static_stickers, animated_stickers, animated_sticker_indices) =
-            partition_sticker_visuals(
-                &pool.sticker_visual_states,
-                &pool.sticker_colors,
-                order,
-                Some(turn),
-            );
-        apply_sticker_mesh_partition(
-            meshes,
-            pool,
-            &static_stickers,
-            &animated_stickers,
-            visibilities,
-        );
-
-        if animated_body_cubies.is_empty() && animated_sticker_indices.is_empty() {
+        let Some(prepared) =
+            prepare_single_turn_visuals(meshes, pool, order, turn, pivots, visibilities, true)
+        else {
             sync_state.active_animations.clear();
             return;
-        }
+        };
 
         sync_state.active_animations = vec![ActiveTurnAnimation {
             scene_revision,
-            pivot_entity,
+            pivot_entity: prepared.pivot_entity,
             turn,
-            animated_stickers: animated_sticker_indices,
+            animated_stickers: prepared.animated_stickers,
+            start_angle_radians: 0.0,
             angle_radians: turn_rotation_angle(turn),
             axis: turn_rotation_axis(turn.face),
             elapsed_secs: 0.0,
             duration_secs: turn_animation_duration_secs(turn),
+            completion: TurnAnimationCompletion::RuntimeApplied,
         }];
         return;
     }
@@ -2370,15 +2658,194 @@ fn begin_turn_batch_animation(
             pivot_entity,
             turn,
             animated_stickers: animated_sticker_indices,
+            start_angle_radians: 0.0,
             angle_radians: turn_rotation_angle(turn),
             axis: turn_rotation_axis(turn.face),
             elapsed_secs: 0.0,
             duration_secs: turn_animation_duration_secs(turn),
+            completion: TurnAnimationCompletion::RuntimeApplied,
         });
     }
 
     sync_state.active_animations = animations;
     sync_state.temp_pivot_entities = temp_entities;
+}
+
+fn set_turn_pivot_angle(
+    pivots: &mut Query<
+        '_,
+        '_,
+        &mut Transform,
+        (
+            With<TurnAnimationPivot>,
+            Without<CubieBodyVisual>,
+            Without<StickerVisual>,
+        ),
+    >,
+    pivot_entity: Entity,
+    turn: TurnCommand,
+    angle_radians: f32,
+) {
+    if let Ok(mut pivot_transform) = pivots.get_mut(pivot_entity) {
+        pivot_transform.rotation =
+            Quat::from_axis_angle(turn_rotation_axis(turn.face), angle_radians);
+    }
+}
+
+fn clear_live_slice_visuals(
+    meshes: &mut ResMut<'_, Assets<Mesh>>,
+    pool: &CubeVisualPool,
+    sync_state: &mut VisualSyncState,
+    pivots: &mut Query<
+        '_,
+        '_,
+        &mut Transform,
+        (
+            With<TurnAnimationPivot>,
+            Without<CubieBodyVisual>,
+            Without<StickerVisual>,
+        ),
+    >,
+    visibilities: &mut Query<'_, '_, &mut Visibility>,
+) {
+    if let Some(pivot_entity) = pool.pivot_entity {
+        if let Ok(mut pivot_transform) = pivots.get_mut(pivot_entity) {
+            *pivot_transform = Transform::default();
+        }
+    }
+    restore_resting_body_meshes(meshes, pool, visibilities);
+    restore_resting_sticker_meshes(meshes, pool, visibilities);
+    sync_state.live_slice_turn = None;
+    sync_state.live_slice_animated_stickers.clear();
+}
+
+fn ensure_live_slice_visuals(
+    meshes: &mut ResMut<'_, Assets<Mesh>>,
+    pool: &CubeVisualPool,
+    sync_state: &mut VisualSyncState,
+    order: u32,
+    turn: TurnCommand,
+    pivots: &mut Query<
+        '_,
+        '_,
+        &mut Transform,
+        (
+            With<TurnAnimationPivot>,
+            Without<CubieBodyVisual>,
+            Without<StickerVisual>,
+        ),
+    >,
+    visibilities: &mut Query<'_, '_, &mut Visibility>,
+) -> Option<PreparedTurnVisuals> {
+    if sync_state.live_slice_turn == Some(turn) {
+        return Some(PreparedTurnVisuals {
+            pivot_entity: pool.pivot_entity?,
+            animated_stickers: sync_state.live_slice_animated_stickers.clone(),
+        });
+    }
+
+    let prepared =
+        prepare_single_turn_visuals(meshes, pool, order, turn, pivots, visibilities, false)?;
+    sync_state.live_slice_turn = Some(turn);
+    sync_state.live_slice_animated_stickers = prepared.animated_stickers.clone();
+    Some(prepared)
+}
+
+fn direct_slice_drag_visuals(
+    mut meshes: ResMut<'_, Assets<Mesh>>,
+    pool: Res<'_, CubeVisualPool>,
+    mut sync_state: ResMut<'_, VisualSyncState>,
+    mut direct_turn_input: ResMut<'_, DirectTurnInputState>,
+    mut pivots: Query<
+        '_,
+        '_,
+        &mut Transform,
+        (
+            With<TurnAnimationPivot>,
+            Without<CubieBodyVisual>,
+            Without<StickerVisual>,
+        ),
+    >,
+    mut visibilities: Query<'_, '_, &mut Visibility>,
+) {
+    if !sync_state.active_animations.is_empty() {
+        return;
+    }
+
+    let Some(order) = pool.order else {
+        return;
+    };
+
+    if let Some(request) = direct_turn_input.pending_slice_snap {
+        let Some(prepared) = ensure_live_slice_visuals(
+            &mut meshes,
+            &pool,
+            &mut sync_state,
+            order,
+            request.turn,
+            &mut pivots,
+            &mut visibilities,
+        ) else {
+            return;
+        };
+
+        set_turn_pivot_angle(
+            &mut pivots,
+            prepared.pivot_entity,
+            request.turn,
+            request.start_angle_radians,
+        );
+        sync_state.active_animations = vec![ActiveTurnAnimation {
+            scene_revision: with_runtime(|runtime| runtime.scene_revision),
+            pivot_entity: prepared.pivot_entity,
+            turn: request.turn,
+            animated_stickers: prepared.animated_stickers,
+            start_angle_radians: request.start_angle_radians,
+            angle_radians: request.target_angle_radians,
+            axis: turn_rotation_axis(request.turn.face),
+            elapsed_secs: 0.0,
+            duration_secs: slice_snap_duration_secs(
+                request.start_angle_radians,
+                request.target_angle_radians,
+            ),
+            completion: TurnAnimationCompletion::DirectSliceSnap {
+                commit_turn: request.commit_turn,
+            },
+        }];
+        sync_state.live_slice_turn = None;
+        sync_state.live_slice_animated_stickers.clear();
+        direct_turn_input.pending_slice_snap = None;
+        with_runtime_mut(|runtime| runtime.set_animation_active(true));
+        return;
+    }
+
+    if let Some(active_drag) = direct_turn_input.active_slice_drag {
+        let Some(prepared) = ensure_live_slice_visuals(
+            &mut meshes,
+            &pool,
+            &mut sync_state,
+            order,
+            active_drag.turn,
+            &mut pivots,
+            &mut visibilities,
+        ) else {
+            return;
+        };
+        set_turn_pivot_angle(
+            &mut pivots,
+            prepared.pivot_entity,
+            active_drag.turn,
+            active_drag.angle_radians,
+        );
+    } else if sync_state.live_slice_turn.is_some() {
+        clear_live_slice_visuals(
+            &mut meshes,
+            &pool,
+            &mut sync_state,
+            &mut pivots,
+            &mut visibilities,
+        );
+    }
 }
 
 fn orbit_camera_input(
@@ -2426,6 +2893,12 @@ fn orbit_camera_input(
     let suppress_mouse = orbit.touch_mouse_suppression_secs > 0.0;
 
     if suppress_mouse {
+        if direct_turn_input
+            .active_slice_drag
+            .is_some_and(|drag| drag.input == SliceDragInput::Mouse)
+        {
+            let _ = finish_active_slice_drag(&mut direct_turn_input, SliceDragInput::Mouse, true);
+        }
         direct_turn_input.mouse_candidate = None;
         orbit.mouse_drag_button = None;
         orbit.mouse_start_position = None;
@@ -2456,25 +2929,66 @@ fn orbit_camera_input(
         }
 
         if buttons.pressed(MouseButton::Left) {
-            if let Some(candidate) = direct_turn_input.mouse_candidate.as_mut() {
-                candidate.max_distance = candidate.max_distance.max(mouse_delta.length());
-                if let Some(position) = cursor_position {
-                    candidate.max_distance = candidate
-                        .max_distance
-                        .max(position.distance(candidate.start_position));
+            let mut updated_active_drag = false;
+            if let Some(position) = cursor_position {
+                if let Some(active_drag) =
+                    active_slice_drag_for_input(&mut direct_turn_input, SliceDragInput::Mouse)
+                {
+                    active_drag.update_angle(position);
+                    updated_active_drag = true;
                 }
+            }
 
-                if should_begin_mouse_orbit(
-                    MouseButton::Left,
-                    candidate.max_distance,
-                    candidate.sticker_candidate.is_some(),
-                ) {
-                    direct_turn_input.mouse_candidate = None;
-                    orbit.mouse_drag_button = Some(MouseButton::Left);
-                    orbit.mouse_start_yaw = orbit.yaw;
-                    orbit.mouse_start_pitch = orbit.pitch;
-                    orbit.mouse_start_position = cursor_position;
-                    orbit.snap_target = None;
+            if !updated_active_drag {
+                if let Some(candidate) = direct_turn_input.mouse_candidate.as_mut() {
+                    candidate.max_distance = candidate.max_distance.max(mouse_delta.length());
+                    if let Some(position) = cursor_position {
+                        candidate.max_distance = candidate
+                            .max_distance
+                            .max(position.distance(candidate.start_position));
+                    }
+
+                    let candidate_snapshot = *candidate;
+                    let mut active_slice_drag = None;
+                    if let (
+                        Some(position),
+                        Some(sticker_candidate),
+                        Some((camera, camera_transform)),
+                    ) = (
+                        cursor_position,
+                        candidate_snapshot.sticker_candidate,
+                        camera_context,
+                    ) {
+                        if candidate_snapshot.max_distance > POINTER_TAP_MAX_DRAG_PX {
+                            active_slice_drag = build_active_slice_drag(
+                                camera,
+                                camera_transform,
+                                order,
+                                SliceDragInput::Mouse,
+                                sticker_candidate,
+                                candidate_snapshot.start_position,
+                                position,
+                            );
+                        }
+                    }
+
+                    if let Some(active_slice_drag) = active_slice_drag {
+                        direct_turn_input.mouse_candidate = None;
+                        direct_turn_input.active_slice_drag = Some(active_slice_drag);
+                        orbit.snap_target = None;
+                        orbit.auto_spin = false;
+                    } else if should_begin_mouse_orbit(
+                        MouseButton::Left,
+                        candidate_snapshot.max_distance,
+                        candidate_snapshot.sticker_candidate.is_some(),
+                    ) {
+                        direct_turn_input.mouse_candidate = None;
+                        orbit.mouse_drag_button = Some(MouseButton::Left);
+                        orbit.mouse_start_yaw = orbit.yaw;
+                        orbit.mouse_start_pitch = orbit.pitch;
+                        orbit.mouse_start_position = cursor_position;
+                        orbit.snap_target = None;
+                    }
                 }
             }
         }
@@ -2498,7 +3012,9 @@ fn orbit_camera_input(
         }
 
         if buttons.just_released(MouseButton::Left) {
-            if orbit.mouse_drag_button == Some(MouseButton::Left) {
+            if finish_active_slice_drag(&mut direct_turn_input, SliceDragInput::Mouse, false) {
+                direct_turn_input.mouse_candidate = None;
+            } else if orbit.mouse_drag_button == Some(MouseButton::Left) {
                 orbit.mouse_drag_button = None;
                 orbit.mouse_start_position = None;
                 orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
@@ -2538,6 +3054,37 @@ fn orbit_camera_input(
             MouseScrollUnit::Pixel => event.y * 0.0022,
         };
         orbit.radius = (orbit.radius * (-zoom_delta).exp()).clamp(2.9, 9.4);
+    }
+
+    if let Some(ActiveSliceDrag {
+        input: SliceDragInput::Touch(active_touch_id),
+        ..
+    }) = direct_turn_input.active_slice_drag
+    {
+        if let Some(released_touch) = touch_frame
+            .released
+            .iter()
+            .find(|touch| touch.id == active_touch_id)
+        {
+            let _ = finish_active_slice_drag(
+                &mut direct_turn_input,
+                SliceDragInput::Touch(active_touch_id),
+                released_touch.canceled,
+            );
+            publish_touch_diagnostic(
+                if released_touch.canceled {
+                    "slice-cancel"
+                } else {
+                    "slice-release"
+                },
+                primary_window,
+                touch_space,
+                released_touch.raw_position,
+                released_touch.position,
+                cursor_position,
+                Some(true),
+            );
+        }
     }
 
     if let Some(candidate) = direct_turn_input.touch_candidate {
@@ -2595,6 +3142,12 @@ fn orbit_camera_input(
             if orbit.touch_drag_mode.is_orbiting() {
                 orbit.snap_target = nearest_orbit_snap(orbit.yaw, orbit.pitch);
             }
+            if direct_turn_input
+                .active_slice_drag
+                .is_some_and(|drag| matches!(drag.input, SliceDragInput::Touch(_)))
+            {
+                let _ = cancel_active_slice_drag(&mut direct_turn_input);
+            }
             clear_touch_orbit_state(&mut orbit);
         }
         [touch] => {
@@ -2602,7 +3155,19 @@ fn orbit_camera_input(
             orbit.snap_target = None;
             let emulate_two_finger = should_emulate_two_finger_touch(shift_pressed, 1);
 
-            if emulate_two_finger {
+            let mut updated_active_slice_drag = false;
+            if let Some(active_drag) =
+                active_slice_drag_for_input(&mut direct_turn_input, SliceDragInput::Touch(touch.id))
+            {
+                active_drag.update_angle(touch.position);
+                updated_active_slice_drag = true;
+            }
+
+            if updated_active_slice_drag {
+                direct_turn_input.touch_candidate = None;
+                clear_touch_orbit_state(&mut orbit);
+            } else if emulate_two_finger {
+                let _ = cancel_active_slice_drag(&mut direct_turn_input);
                 direct_turn_input.touch_candidate = None;
                 if !matches!(
                     orbit.touch_drag_mode,
@@ -2653,6 +3218,7 @@ fn orbit_camera_input(
                 }
 
                 let mut should_begin_touch_orbit = false;
+                let mut active_slice_drag = None;
 
                 if let Some(candidate) = direct_turn_input
                     .touch_candidate
@@ -2663,6 +3229,23 @@ fn orbit_camera_input(
                         .max_distance
                         .max(touch.position.distance(candidate.start_position));
 
+                    let candidate_snapshot = *candidate;
+                    if let (Some(sticker_candidate), Some((camera, camera_transform))) =
+                        (candidate_snapshot.sticker_candidate, camera_context)
+                    {
+                        if candidate_snapshot.max_distance > POINTER_TAP_MAX_DRAG_PX {
+                            active_slice_drag = build_active_slice_drag(
+                                camera,
+                                camera_transform,
+                                order,
+                                SliceDragInput::Touch(touch.id),
+                                sticker_candidate,
+                                candidate_snapshot.start_position,
+                                touch.position,
+                            );
+                        }
+                    }
+
                     should_begin_touch_orbit = should_begin_mouse_orbit(
                         MouseButton::Left,
                         candidate.max_distance,
@@ -2670,7 +3253,20 @@ fn orbit_camera_input(
                     );
                 }
 
-                if should_begin_touch_orbit {
+                if let Some(active_slice_drag) = active_slice_drag {
+                    direct_turn_input.touch_candidate = None;
+                    direct_turn_input.active_slice_drag = Some(active_slice_drag);
+                    clear_touch_orbit_state(&mut orbit);
+                    publish_touch_diagnostic(
+                        "slice",
+                        primary_window,
+                        touch_space,
+                        touch.raw_position,
+                        touch.position,
+                        cursor_position,
+                        Some(true),
+                    );
+                } else if should_begin_touch_orbit {
                     direct_turn_input.touch_candidate = None;
                     set_touch_orbit_mode(&mut orbit, TouchOrbitMode::SingleFinger { id: touch.id });
                     orbit.touch_start_yaw = orbit.yaw;
@@ -2705,6 +3301,7 @@ fn orbit_camera_input(
         [first, second, ..] => {
             orbit.auto_spin = false;
             orbit.snap_target = None;
+            let _ = cancel_active_slice_drag(&mut direct_turn_input);
             direct_turn_input.touch_candidate = None;
             if orbit.touch_drag_mode != TouchOrbitMode::MultiFinger {
                 set_touch_orbit_mode(&mut orbit, TouchOrbitMode::MultiFinger);
@@ -2768,6 +3365,12 @@ fn canvas_face_tap_input(
     sync_state: Res<'_, VisualSyncState>,
 ) {
     if !sync_state.active_animations.is_empty() {
+        return;
+    }
+
+    if direct_turn_input.active_slice_drag.is_some()
+        || direct_turn_input.pending_slice_snap.is_some()
+    {
         return;
     }
 
@@ -3760,16 +4363,17 @@ fn update_runtime(f: impl FnOnce(&mut RuntimeBridge) -> Result<(), String>) -> b
 mod tests {
     use super::{
         CUBE_FACE_SPAN, CanvasTouchSpace, CubeVisual, CubeVisualPool, CubeVisualRoot, OrbitRig,
-        RuntimeBridge, ScreenStickerCandidate, StickerVisual, TOUCH_MOUSE_SUPPRESSION_SECS,
-        TouchOrbitMode, TurnAnimationPivot, VisualSyncState, animate_turn_visuals,
-        clear_cube_visuals, cube_surface_hit_from_ray, cubie_matches_turn, cuboid_mesh_template,
-        decode_face, decode_rotation, face_outward_normal, format_turn, keyboard_shortcut_turn,
-        merged_cubie_body_mesh, nearest_orbit_snap, normalize_base_path, normalize_canvas_selector,
-        normalize_touch_position, partition_body_cubies, reset_cube,
+        RuntimeBridge, SLICE_DRAG_QUARTER_TURN_PX, ScreenStickerCandidate, StickerVisual,
+        TOUCH_MOUSE_SUPPRESSION_SECS, TouchOrbitMode, TurnAnimationPivot, VisualSyncState,
+        animate_turn_visuals, clear_cube_visuals, cube_surface_hit_from_ray, cubie_matches_turn,
+        cuboid_mesh_template, decode_face, decode_rotation, face_outward_normal, format_turn,
+        keyboard_shortcut_turn, merged_cubie_body_mesh, nearest_orbit_snap, normalize_base_path,
+        normalize_canvas_selector, normalize_touch_position, partition_body_cubies, reset_cube,
         rotate_sticker_visual_for_turn, set_touch_orbit_mode, should_begin_mouse_orbit,
         should_emulate_two_finger_touch, should_reset_single_touch_gesture,
-        slice_face_from_sticker_drag, slice_start_layer, sticker_cubie_coord, sticker_rotation,
-        surface_axis_index, surface_cubies, sync_cube_visuals, turn_rotation_angle,
+        signed_slice_snap_quarters, slice_drag_angle_radians, slice_face_from_sticker_drag,
+        slice_start_layer, sticker_cubie_coord, sticker_rotation, surface_axis_index,
+        surface_cubies, sync_cube_visuals, turn_for_signed_slice_quarters, turn_rotation_angle,
         virtual_cube_half_extent, virtual_surface_center,
     };
     use bevy::{
@@ -4142,6 +4746,48 @@ mod tests {
         assert_eq!(orbit.touch_mouse_suppression_secs, 0.0);
         assert_eq!(orbit.touch_start_position, None);
         assert!(TOUCH_MOUSE_SUPPRESSION_SECS > 0.0);
+    }
+
+    #[test]
+    fn slice_drag_projection_maps_screen_motion_to_turn_angle() {
+        let angle = slice_drag_angle_radians(
+            Vec2::ZERO,
+            Vec2::new(SLICE_DRAG_QUARTER_TURN_PX, 0.0),
+            Vec2::X,
+        );
+
+        assert!((angle + std::f32::consts::FRAC_PI_2).abs() < 0.0001);
+    }
+
+    #[test]
+    fn slice_snap_thresholds_follow_release_rules() {
+        assert_eq!(signed_slice_snap_quarters(9.0_f32.to_radians()), 0);
+        assert_eq!(signed_slice_snap_quarters(10.0_f32.to_radians()), 0);
+        assert_eq!(signed_slice_snap_quarters(11.0_f32.to_radians()), 1);
+        assert_eq!(signed_slice_snap_quarters(89.0_f32.to_radians()), 1);
+        assert_eq!(signed_slice_snap_quarters(-89.0_f32.to_radians()), -1);
+        assert_eq!(signed_slice_snap_quarters(120.0_f32.to_radians()), 1);
+        assert_eq!(signed_slice_snap_quarters(140.0_f32.to_radians()), 2);
+        assert_eq!(signed_slice_snap_quarters(-140.0_f32.to_radians()), -2);
+    }
+
+    #[test]
+    fn signed_slice_quarters_convert_to_supported_turn_commands() {
+        let base = TurnCommand::outer(Face::Front, RotationAmount::Clockwise);
+
+        assert_eq!(
+            turn_for_signed_slice_quarters(base, 1).map(|turn| turn.rotation),
+            Some(RotationAmount::CounterClockwise)
+        );
+        assert_eq!(
+            turn_for_signed_slice_quarters(base, -1).map(|turn| turn.rotation),
+            Some(RotationAmount::Clockwise)
+        );
+        assert_eq!(
+            turn_for_signed_slice_quarters(base, 2).map(|turn| turn.rotation),
+            Some(RotationAmount::HalfTurn)
+        );
+        assert_eq!(turn_for_signed_slice_quarters(base, 4), None);
     }
 
     #[test]
