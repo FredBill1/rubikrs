@@ -352,7 +352,6 @@ const CUBE_FACE_SPAN: f32 = 1.9;
 const POINTER_TAP_MAX_DRAG_PX: f32 = 8.0;
 const SLICE_DRAG_QUARTER_TURN_PX: f32 = 130.0;
 const SLICE_SNAP_BACK_DEGREES: f32 = 10.0;
-const SLICE_DRAG_MAX_ABS_RADIANS: f32 = std::f32::consts::TAU;
 const FACE_TAP_RADIUS_SCALE: f32 = 0.7;
 const VIRTUAL_SURFACE_INSET: f32 = 0.03;
 const TOUCH_MOUSE_SUPPRESSION_SECS: f32 = 0.12;
@@ -612,8 +611,7 @@ fn slice_drag_angle_radians(
     drag_direction: Vec2,
 ) -> f32 {
     let projected_pixels = (pointer_position - start_position).dot(drag_direction);
-    (-(projected_pixels / SLICE_DRAG_QUARTER_TURN_PX) * std::f32::consts::FRAC_PI_2)
-        .clamp(-SLICE_DRAG_MAX_ABS_RADIANS, SLICE_DRAG_MAX_ABS_RADIANS)
+    -(projected_pixels / SLICE_DRAG_QUARTER_TURN_PX) * std::f32::consts::FRAC_PI_2
 }
 
 fn signed_slice_snap_quarters(angle_radians: f32) -> i32 {
@@ -4773,6 +4771,17 @@ mod tests {
         );
 
         assert!((angle + std::f32::consts::FRAC_PI_2).abs() < 0.0001);
+    }
+
+    #[test]
+    fn slice_drag_angle_is_not_capped_at_full_rotation() {
+        let angle = slice_drag_angle_radians(
+            Vec2::ZERO,
+            Vec2::new(SLICE_DRAG_QUARTER_TURN_PX * 9.0, 0.0),
+            Vec2::X,
+        );
+
+        assert!((angle + (std::f32::consts::FRAC_PI_2 * 9.0)).abs() < 0.0001);
     }
 
     #[test]
