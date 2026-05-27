@@ -1,5 +1,11 @@
-// rubik-solver — thin adapter layer over rcube-rs and min2phase (Kociemba)
-// All solving logic lives in rcube-rs and the vendored min2phase; this crate provides:
+// rubik-solver — routing and wasm adapter layer over the Rust solver crates.
+// Solving paths:
+//   N=2    ida2x2
+//   N=3    Kociemba/min2phase
+//   N=4..8 rubik-nxn-solver
+//   N>=9   legacy rcube-rs path
+//
+// This crate provides:
 // 1. wasm-bindgen JSON interface (solve_request_json)
 // 2. Solver module setup (console_error_panic_hook)
 // 3. SolveError / SolveRequest / SolveResponse types
@@ -34,14 +40,38 @@ pub fn request_cancel() {
 }
 
 pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
+    let order = state.order.get();
+
+    if order == 2 {
+        return ida2x2::solve(state);
+    }
+    if order == 3 {
+        return kociemba::solve(state);
+    }
+
     let token = Arc::new(AtomicBool::new(false));
     *cancel_mutex().lock().expect("lock") = Some(Arc::clone(&token));
 
-    let turns =
-        rcube_rs::solve(state, Some(&token)).map_err(|msg| SolveError::InvalidState(msg))?;
+    let result = if (rubik_nxn_solver::MIN_NXN_SOLVER_ORDER
+        ..=rubik_nxn_solver::MAX_NXN_SOLVER_ORDER)
+        .contains(&order)
+    {
+        rubik_nxn_solver::solve(state, Some(&token)).map_err(map_nxn_error)
+    } else {
+        solve_legacy_large(state, &token)
+    };
 
     // Clear the cancel token (drop the Arc)
     *cancel_mutex().lock().expect("lock") = None;
+
+    result
+}
+
+fn solve_legacy_large(
+    state: &CubeState,
+    token: &AtomicBool,
+) -> Result<Vec<TurnCommand>, SolveError> {
+    let turns = rcube_rs::solve(state, Some(token)).map_err(|msg| SolveError::InvalidState(msg))?;
 
     let simplified = simplify::simplify_turns(&turns, state.order.get());
 
@@ -64,6 +94,14 @@ pub fn solve(state: &CubeState) -> Result<Vec<TurnCommand>, SolveError> {
     }
 
     Ok(simplified)
+}
+
+fn map_nxn_error(error: rubik_nxn_solver::NxnSolveError) -> SolveError {
+    match error {
+        rubik_nxn_solver::NxnSolveError::InvalidOrder(message) => SolveError::InvalidOrder(message),
+        rubik_nxn_solver::NxnSolveError::InvalidState(message) => SolveError::InvalidState(message),
+        rubik_nxn_solver::NxnSolveError::Cancelled => SolveError::Cancelled,
+    }
 }
 
 #[derive(Debug, Clone)]

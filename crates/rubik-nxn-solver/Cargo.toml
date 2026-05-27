@@ -1,0 +1,15 @@
+[package]
+name = "rubik-nxn-solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+phase-search-4x4 = ["dep:cubing", "dep:twsearch"]
+
+[dependencies]
+rubik-core = { path = "../rubik-core" }
+rcube-rs = { path = "../rcube-rs" }
+cubing = { version = "0.15.2", optional = true }
+twsearch = { version = "0.10.0", default-features = false, optional = true }
