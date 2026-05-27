@@ -6,7 +6,7 @@ Pointer and touch drags on a sticker used to resolve only on release: the Rust a
 
 ## Decision
 
-Direct slice manipulation remains in `crates/rubik-app` rather than TypeScript. The Bevy runtime now tracks an active slice drag after the drag passes the tap threshold on a sticker. The selected slice reuses the existing turn pivot and mesh partitioning path, but the pivot angle is driven by the pointer displacement projected onto the selected turn's screen-space motion.
+Direct slice manipulation remains in `crates/rubik-app` rather than TypeScript. The Bevy runtime now tracks an active slice drag after the drag passes the tap threshold on a sticker. The selected slice reuses the existing turn pivot and mesh partitioning path, but the pivot angle is driven by the pointer displacement projected onto the visible sticker row or column axis that selected the slice. The older projected turn tangent is still used to preserve clockwise/counter-clockwise sign, but no longer defines the fastest drag direction.
 
 On release, the active drag creates a snap request:
 

@@ -253,6 +253,12 @@ struct PreparedTurnVisuals {
     animated_stickers: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SliceDragSelection {
+    turn_face: Face,
+    projected_drag_axis: Vec2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TouchOrbitMode {
     #[default]
@@ -706,16 +712,18 @@ fn build_active_slice_drag(
         return None;
     }
 
-    let turn_face = slice_face_from_sticker_drag(candidate, drag)?;
-    let start_layer = slice_start_layer(turn_face, candidate.cubie, order);
+    let selection = slice_drag_selection_from_sticker_drag(candidate, drag)?;
+    let start_layer = slice_start_layer(selection.turn_face, candidate.cubie, order);
     let turn = TurnCommand {
-        face: turn_face,
+        face: selection.turn_face,
         start_layer,
         width: 1,
         rotation: RotationAmount::Clockwise,
     };
-    let drag_direction =
+    let clockwise_motion =
         projected_turn_motion(camera, camera_transform, candidate.world_center, turn)?;
+    let drag_direction =
+        oriented_slice_drag_direction(selection.projected_drag_axis, clockwise_motion);
     if drag.normalize().dot(drag_direction).abs() <= 0.2 {
         return None;
     }
@@ -3472,11 +3480,11 @@ fn slice_turn_from_sticker_drag(
         return None;
     }
 
-    let turn_face = slice_face_from_sticker_drag(candidate, drag)?;
-    let start_layer = slice_start_layer(turn_face, candidate.cubie, order);
+    let selection = slice_drag_selection_from_sticker_drag(candidate, drag)?;
+    let start_layer = slice_start_layer(selection.turn_face, candidate.cubie, order);
 
     let clockwise = TurnCommand {
-        face: turn_face,
+        face: selection.turn_face,
         start_layer,
         width: 1,
         rotation: RotationAmount::Clockwise,
@@ -3487,38 +3495,45 @@ fn slice_turn_from_sticker_drag(
     };
 
     let drag_direction = drag.normalize();
-    let clockwise_score = drag_direction.dot(projected_turn_motion(
-        camera,
-        camera_transform,
-        candidate.world_center,
-        clockwise,
-    )?);
-    let counter_clockwise_score = drag_direction.dot(projected_turn_motion(
-        camera,
-        camera_transform,
-        candidate.world_center,
-        counter_clockwise,
-    )?);
-    if clockwise_score.max(counter_clockwise_score) <= 0.2 {
+    let clockwise_motion =
+        projected_turn_motion(camera, camera_transform, candidate.world_center, clockwise)?;
+    let selected_drag_direction =
+        oriented_slice_drag_direction(selection.projected_drag_axis, clockwise_motion);
+    let score = drag_direction.dot(selected_drag_direction);
+    if score.abs() <= 0.2 {
         return None;
     }
 
-    Some(if clockwise_score >= counter_clockwise_score {
+    Some(if score >= 0.0 {
         clockwise
     } else {
         counter_clockwise
     })
 }
 
-fn slice_face_from_sticker_drag(candidate: ScreenStickerCandidate, drag: Vec2) -> Option<Face> {
+fn slice_drag_selection_from_sticker_drag(
+    candidate: ScreenStickerCandidate,
+    drag: Vec2,
+) -> Option<SliceDragSelection> {
     let col_alignment = drag.dot(candidate.projected_col_axis);
     let row_alignment = drag.dot(candidate.projected_row_axis);
-    let selected_axis = if col_alignment.abs() >= row_alignment.abs() {
-        -candidate.row_axis
+    let (selected_axis, projected_drag_axis) = if col_alignment.abs() >= row_alignment.abs() {
+        (-candidate.row_axis, candidate.projected_col_axis)
     } else {
-        candidate.col_axis
+        (candidate.col_axis, candidate.projected_row_axis)
     };
-    axis_face(selected_axis)
+    Some(SliceDragSelection {
+        turn_face: axis_face(selected_axis)?,
+        projected_drag_axis,
+    })
+}
+
+fn oriented_slice_drag_direction(projected_drag_axis: Vec2, clockwise_motion: Vec2) -> Vec2 {
+    if projected_drag_axis.dot(clockwise_motion) >= 0.0 {
+        projected_drag_axis
+    } else {
+        -projected_drag_axis
+    }
 }
 
 fn cube_surface_hit(
@@ -4368,13 +4383,14 @@ mod tests {
         animate_turn_visuals, clear_cube_visuals, cube_surface_hit_from_ray, cubie_matches_turn,
         cuboid_mesh_template, decode_face, decode_rotation, face_outward_normal, format_turn,
         keyboard_shortcut_turn, merged_cubie_body_mesh, nearest_orbit_snap, normalize_base_path,
-        normalize_canvas_selector, normalize_touch_position, partition_body_cubies, reset_cube,
-        rotate_sticker_visual_for_turn, set_touch_orbit_mode, should_begin_mouse_orbit,
-        should_emulate_two_finger_touch, should_reset_single_touch_gesture,
-        signed_slice_snap_quarters, slice_drag_angle_radians, slice_face_from_sticker_drag,
-        slice_start_layer, sticker_cubie_coord, sticker_rotation, surface_axis_index,
-        surface_cubies, sync_cube_visuals, turn_for_signed_slice_quarters, turn_rotation_angle,
-        virtual_cube_half_extent, virtual_surface_center,
+        normalize_canvas_selector, normalize_touch_position, oriented_slice_drag_direction,
+        partition_body_cubies, reset_cube, rotate_sticker_visual_for_turn, set_touch_orbit_mode,
+        should_begin_mouse_orbit, should_emulate_two_finger_touch,
+        should_reset_single_touch_gesture, signed_slice_snap_quarters, slice_drag_angle_radians,
+        slice_drag_selection_from_sticker_drag, slice_start_layer, sticker_cubie_coord,
+        sticker_rotation, surface_axis_index, surface_cubies, sync_cube_visuals,
+        turn_for_signed_slice_quarters, turn_rotation_angle, virtual_cube_half_extent,
+        virtual_surface_center,
     };
     use bevy::{
         ecs::system::SystemState,
@@ -4760,6 +4776,39 @@ mod tests {
     }
 
     #[test]
+    fn top_slice_live_drag_uses_the_visible_sticker_axis() {
+        let diagonal_right_down =
+            Vec2::new(25.0_f32.to_radians().cos(), 25.0_f32.to_radians().sin());
+        let mut candidate = sample_sticker_candidate(Face::Front, UVec3::new(0, 2, 2));
+        candidate.projected_col_axis = diagonal_right_down;
+        candidate.projected_row_axis = Vec2::Y;
+
+        let selection =
+            slice_drag_selection_from_sticker_drag(candidate, diagonal_right_down * 40.0)
+                .expect("diagonal front-face drag should select the top slice");
+
+        assert_eq!(selection.turn_face, Face::Up);
+        assert!(
+            selection
+                .projected_drag_axis
+                .abs_diff_eq(diagonal_right_down, 0.0001)
+        );
+
+        let old_projected_clockwise_motion = Vec2::new(-0.1, -0.99).normalize();
+        let oriented_drag_direction = oriented_slice_drag_direction(
+            selection.projected_drag_axis,
+            old_projected_clockwise_motion,
+        );
+        let angle = slice_drag_angle_radians(
+            Vec2::ZERO,
+            diagonal_right_down * SLICE_DRAG_QUARTER_TURN_PX,
+            oriented_drag_direction,
+        );
+
+        assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 0.0001);
+    }
+
+    #[test]
     fn slice_snap_thresholds_follow_release_rules() {
         assert_eq!(signed_slice_snap_quarters(9.0_f32.to_radians()), 0);
         assert_eq!(signed_slice_snap_quarters(10.0_f32.to_radians()), 0);
@@ -4813,15 +4862,12 @@ mod tests {
     #[test]
     fn horizontal_drag_on_front_sticker_selects_the_up_slice() {
         let candidate = sample_sticker_candidate(Face::Front, UVec3::new(1, 2, 2));
-        let face = slice_face_from_sticker_drag(candidate, Vec2::new(36.0, 0.0));
+        let selection = slice_drag_selection_from_sticker_drag(candidate, Vec2::new(36.0, 0.0))
+            .expect("front drag should map to up");
 
-        assert_eq!(face, Some(Face::Up));
+        assert_eq!(selection.turn_face, Face::Up);
         assert_eq!(
-            slice_start_layer(
-                face.expect("front drag should map to up"),
-                candidate.cubie,
-                4
-            ),
+            slice_start_layer(selection.turn_face, candidate.cubie, 4),
             1
         );
     }
@@ -4829,15 +4875,12 @@ mod tests {
     #[test]
     fn vertical_drag_on_front_sticker_selects_the_right_slice() {
         let candidate = sample_sticker_candidate(Face::Front, UVec3::new(2, 1, 2));
-        let face = slice_face_from_sticker_drag(candidate, Vec2::new(0.0, -32.0));
+        let selection = slice_drag_selection_from_sticker_drag(candidate, Vec2::new(0.0, -32.0))
+            .expect("front drag should map to right");
 
-        assert_eq!(face, Some(Face::Right));
+        assert_eq!(selection.turn_face, Face::Right);
         assert_eq!(
-            slice_start_layer(
-                face.expect("front drag should map to right"),
-                candidate.cubie,
-                4
-            ),
+            slice_start_layer(selection.turn_face, candidate.cubie, 4),
             1
         );
     }
